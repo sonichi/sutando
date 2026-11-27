@@ -149,6 +149,23 @@ def outcome(bridge_state, qid: str) -> str:
     return said if said in ("posted", "dropped", "unsure") else ""
 
 
+def withdraw(bridge_state, qid: str) -> bool:
+    """Take back the queued card `qid` before any send of it was tried: settled as dropped, its entry removed.
+    False when it is not queued, or a send was already tried (that one stands, whatever became of it)."""
+    if not re.match(r"^[0-9a-f]{32}$", str(qid or "")):
+        return False
+    path = Path(bridge_state).joinpath(*OUTBOX) / (qid + ".json")
+    record = _read(path)
+    if not record or record.get("attempted"):
+        return False
+    try:
+        _settle(bridge_state, qid, "dropped")
+        path.unlink(missing_ok=True)
+    except OSError:
+        return False        # left queued: the bridge posts it or drops it as before
+    return True
+
+
 def _forget_old_keys(folder: Path) -> None:
     """Drop markers older than KEYS_KEEP_S: long past any restart that could repeat their card."""
     horizon = time.time() - KEYS_KEEP_S

@@ -29,6 +29,7 @@ import json
 import re
 import subprocess
 import sys
+from collections import deque
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -92,7 +93,11 @@ clean_text = _clean
 
 def extract_recent_turns(transcript: Path, max_turns: int = 12, max_chars: int = 6000) -> str:
     """Last `max_turns` user/assistant turns as markdown, newest last, ≤ max_chars."""
-    turns: list[tuple[str, str]] = []  # (role, text)
+    if max_turns < 0 or max_chars < 0:
+        raise ValueError("turn and character limits must be nonnegative")
+    if max_turns == 0 or max_chars == 0:
+        return ""
+    turns: deque[tuple[str, str]] = deque(maxlen=max_turns)
     with transcript.open(encoding="utf-8", errors="replace") as fh:
         for raw in fh:
             raw = raw.strip()
@@ -117,15 +122,21 @@ def extract_recent_turns(transcript: Path, max_turns: int = 12, max_chars: int =
             # so anything that survived _clean() is a real human message.
             turns.append((role, text))
 
-    turns = turns[-max_turns:]
     rendered: list[str] = []
     used = 0
     for role, text in reversed(turns):  # budget from newest backwards
-        piece = f"**{role}:** {text}"
-        if used + len(piece) > max_chars and rendered:
+        prefix = f"**{role}:** "
+        piece = prefix + text
+        required = len(piece) + (2 if rendered else 0)
+        if used + required > max_chars:
+            if not rendered:
+                marker = " […truncated]"
+                piece = (piece[:max_chars - len(marker)] + marker
+                         if max_chars >= len(prefix) + len(marker) else "…")
+                rendered.append(piece)
             break
         rendered.append(piece)
-        used += len(piece)
+        used += required
     return "\n\n".join(reversed(rendered))
 
 
@@ -156,8 +167,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("transcript", nargs="?", help="path to a Claude Code .jsonl transcript")
     ap.add_argument("--latest", action="store_true", help="use the newest transcript for this repo")
-    ap.add_argument("--turns", type=int, default=12)
-    ap.add_argument("--chars", type=int, default=6000)
+    ap.add_argument("--turns", type=int, default=12,
+                    help="maximum recent turns; 0 emits no context")
+    ap.add_argument("--chars", type=int, default=6000,
+                    help="maximum markdown characters, excluding the final stdout newline; 0 emits no context")
     args = ap.parse_args()
 
     try:

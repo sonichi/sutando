@@ -85,8 +85,14 @@ def worker_on_record(record: Path, alive: bool) -> None:
         {"attempt": attempt, "pid": pid, "start": holder_lock.start_time(os.getpid())}))
 
 
+PEOPLE = {"acct-a": "alice@example.com", "acct-b": "bob@work.io", "acct-c": "carol@example.org",
+          "acct-a1": "alma@example.net", "acct-a2": "adam@example.net"}
+
+
 def key_of(account_id: str) -> str:
-    return hashlib.sha256(account_id.encode()).hexdigest()[:16]
+    """The desktop's store key: the workspace id and the person's email."""
+    ident = f"{account_id}|{PEOPLE[account_id]}" if account_id in PEOPLE else account_id
+    return hashlib.sha256(ident.encode()).hexdigest()[:16]
 
 
 def task(said, *, tier="owner", user=OWNER, kind="dm", room=DM, **extra):
@@ -143,6 +149,7 @@ class Base(unittest.TestCase):
         for d in (self.ws, self.home, self.app):
             d.mkdir()
         self.store = self.app / "accounts" / "codex"
+        self.agent_homes = []      # local Codex agents' homes on this computer
         self.fake, self.launch, self.restarts, self.outputs = Fake(), Launch(), [], []
         self.restart_rc, self.restart_writes = 0, None
         self.ready_ok, self.live_answer, self.ready_since = True, None, []
@@ -150,6 +157,7 @@ class Base(unittest.TestCase):
         for target, name, value in ((acc, "_owner_dm", lambda ws, core: DM),
                                     (acc, "runtime", lambda: self.RUNTIME),
                                     (acc, "codex_home", lambda: self.home),
+                                    (acc, "local_codex_homes", lambda user_home=None: list(self.agent_homes)),
                                     (connections, "read_rows", lambda ws=None: [CORE])):
             patch = mock.patch.object(target, name, value)
             patch.start()
@@ -284,6 +292,29 @@ class CodexCard(Base):
         self.assertNotIn("Retry", [b["label"] for b in self.fake.cards()[-1]["buttons"]])
         self.assertTrue(self.fake.calls[0][1]["body"].startswith(lead))
         self.assertEqual(card["buttons"][-1]["label"], "Add another account")
+
+    def test_the_quota_card_says_the_limit_alone_never_that_the_core_is_not_signed_in(self):
+        # 2026-11-25: at the limit the card read "... The core (Claude Code) is not signed in." over the account it
+        # showed below: a probe at the limit may read a signed-in core as signed out.
+        lead = "The core has reached its usage limit (resets 3:05 PM), so I can't answer until then."
+        for runtime in ("claude", "codex"):
+            for signed in (True, False, None):
+                cur = {"runtime": runtime, "signed_in": signed, "shown": "alice@example.com" if signed else "", "key": ""}
+                body, card = acc.menu_card(cur, [], lead=lead, retry=True)
+                self.assertTrue(card["text"].startswith(lead), (runtime, signed))
+                for said in (card["text"], body):
+                    self.assertNotIn("not signed in", said, (runtime, signed))
+                    self.assertNotIn("I'm using", said, (runtime, signed))
+                # The app lists it with what the core waits on: out of usage, not an account menu.
+                self.assertEqual(card["account_controls"], {"runtime": runtime, "core": True, "limit": True})
+                self.assertEqual(card["state"], "pending", "the bar lists pending/error cards only")
+        # The account menu the owner asks for still names the account, or says plainly that none is signed in.
+        menu = acc.menu_card({"runtime": "claude", "signed_in": False, "shown": "", "key": ""}, [])[1]
+        self.assertIn("The core (Claude Code) is not signed in.", menu["text"])
+        self.assertNotIn("limit", menu["account_controls"])
+        self.assertEqual(menu["state"], "info", "the owner's own menu waits on nobody")
+        self.assertEqual(acc.menu_card({"runtime": "codex", "signed_in": False, "shown": "", "key": ""}, [],
+                                       signed_out=True)[1]["state"], "pending")
 
     def test_the_quota_notice_with_no_owner_dm_posts_nothing(self):
         self.signed_in(A)
@@ -480,7 +511,7 @@ class Taps(Base):
         for key in (first, second):
             with self.subTest(key=key):
                 self.ws.joinpath(*acc.RUNNING).unlink(missing_ok=True)
-                rc, out = self.tap(by_key[key], event="$card2")
+                rc, out = self.tap(by_key[key], event="$card2", source_message_id=f"$tap-{key}")
                 self.assertEqual((rc, out["status"]), (0, "started"), out)
                 argv = self.launch.calls[-1][0]
                 self.assertEqual(argv[argv.index("--key") + 1], key)
@@ -507,23 +538,152 @@ class Taps(Base):
         self.assertEqual(self.launch.calls, [])
 
     def test_a_second_switch_while_one_runs_is_refused(self):
-        self.tap(self.use_b)
-        rc, out = self.tap(self.use_b)
+        self.tap(self.use_b, source_message_id="$tap1")
+        rc, out = self.tap(self.use_b, source_message_id="$tap2")
         self.assertEqual(out["say"], acc.BUSY)
         self.assertEqual(len(self.launch.calls), 1)
 
     def test_a_switch_whose_worker_died_no_longer_blocks_a_tap(self):
-        self.tap(self.use_b)
+        self.tap(self.use_b, source_message_id="$tap1")
         record = self.ws.joinpath(*acc.RUNNING)
         worker_on_record(record, alive=True)
-        self.assertEqual(self.tap(self.use_b)[1]["say"], acc.BUSY, "a running worker still holds the switch")
+        self.assertEqual(self.tap(self.use_b, source_message_id="$tap2")[1]["say"], acc.BUSY,
+                         "a running worker still holds the switch")
         worker_on_record(record, alive=False)
         before = json.loads(record.read_text())["attempt"]
-        rc, out = self.tap(self.use_b)
+        rc, out = self.tap(self.use_b, source_message_id="$tap3")
         self.assertEqual((rc, out["status"]), (0, "started"))
         self.assertTrue(out["say"].startswith(acc.STOPPED + " I'm using alice@example.com."), out["say"])
         self.assertIn("Switching the core to bob@work.io", out["say"])
         self.assertNotEqual(json.loads(record.read_text())["attempt"], before, "the dead attempt's record is replaced")
+
+
+class RemoteTaps(Base):
+    """A "Use" tap from the web or a phone is the same task as one from the desktop: the owner's card
+    reply, carrying only the choice. It acts once per tap message, and every outcome is audited."""
+
+    def setUp(self):
+        super().setUp()
+        self.signed_in(A)
+        self.keep(B)
+        self.post()
+        self.use_b = "Use bob@work.io"
+
+    def audited(self):
+        path = self.ws / "state" / "recovery" / "audit.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def test_a_tap_delivered_again_starts_no_second_switch(self):
+        rc, out = self.tap(self.use_b, source_message_id="$phone-tap")
+        self.assertEqual((rc, out["status"]), (0, "started"))
+        self.ws.joinpath(*acc.RUNNING).unlink()     # the first switch has finished and failed
+        rc, out = self.tap(self.use_b, source_message_id="$phone-tap")
+        self.assertEqual((rc, out["status"], out["say"]), (0, "say", acc.ACTED))
+        self.assertEqual(len(self.launch.calls), 1)
+        rc, out = self.tap(self.use_b, source_message_id="$phone-tap-2")
+        self.assertEqual(out["status"], "started", "a new tap still acts")
+
+    def test_each_tap_is_audited_with_ids_and_no_address(self):
+        self.tap(self.use_b, source_message_id="$t1")
+        self.tap(self.use_b, source_message_id="$t2")
+        self.tap(self.use_b, source_message_id="$t1")
+        rows = self.audited()
+        self.assertEqual([r["outcome"] for r in rows], ["started", "busy", "refused:tap_acted_on"])
+        self.assertEqual({r["action_id"] for r in rows}, {f"switch_account:{key_of('acct-b')}"})
+        self.assertEqual(rows[0]["sender"], OWNER)
+        self.assertEqual((rows[0]["room"], rows[0]["event"], rows[0]["tap"]), (DM, "$card1", "$t1"))
+        self.assertNotIn("bob@", json.dumps(rows))
+
+    def test_a_refused_tap_is_audited(self):
+        (self.store / f"{key_of('acct-b')}.json").unlink()
+        self.tap(self.use_b, source_message_id="$t1")
+        self.assertEqual([r["outcome"] for r in self.audited()], ["refused:gone"])
+
+    def test_a_key_the_card_did_not_offer_is_audited(self):
+        path = self.ws / "task.txt"
+        path.write_text(task("x", reply_to_event="$card1"))
+        with mock.patch.object(acc.ac, "click_verdict", return_value=acc.ac.Click(
+                acc.ac.COMMAND, acc.ac.parse_reply(acc.ac.reply(acc.KIND, acc.TARGET, "0" * 16)))):
+            rc, out = self.run_(["reply", "--task-file", str(path)])
+        self.assertEqual((rc, out["say"]), (2, acc.GONE))
+        self.assertEqual([r["outcome"] for r in self.audited()][-1], "refused:gone")
+        self.assertEqual(self.launch.calls, [])
+
+    def test_the_tap_ledger_and_audit_never_stop_a_tap(self):
+        with mock.patch("file_lock.locked_file", side_effect=OSError("ro")):
+            acc.release_tap(self.ws, "$t1")     # an unwritable ledger is left as it is
+        import builtins
+        real = builtins.__import__
+
+        def no_hitl(name, *a, **k):
+            if name == "hitl":
+                raise ImportError(name)
+            return real(name, *a, **k)
+        with mock.patch.object(builtins, "__import__", no_hitl):
+            acc.audit(self.ws, {}, "-", "started", 0)
+        self.assertEqual(self.audited(), [])
+
+    def test_add_says_it_needs_the_computer_that_runs_the_core(self):
+        rc, out = self.tap("Add another account")
+        self.assertIn("needs the computer that runs the core", out["say"])
+        self.assertEqual(self.launch.calls, [])
+
+
+def legacy_key(account_id: str) -> str:
+    """The key an earlier engine filed an account under: the workspace id alone."""
+    return hashlib.sha256(account_id.encode()).hexdigest()[:16]
+
+
+class LegacyStore(Base):
+    """A store and a card made before the key followed the desktop's rule (workspace id and email)."""
+
+    def setUp(self):
+        super().setUp()
+        self.store.mkdir(parents=True)
+        for acct, text, label in (("acct-a", A, "alice@example.com"), ("acct-b", B, "bob@work.io")):
+            (self.store / f"{legacy_key(acct)}.json").write_text(json.dumps({"label": label, "auth": text}))
+        self.signed_in(A)
+
+    def test_a_legacy_saved_account_is_offered_once_under_its_current_key(self):
+        self.post()
+        buttons = {b["label"]: b["command"].rsplit(":", 1)[1] for b in self.fake.cards()[-1]["buttons"]
+                   if b["label"].startswith("Use ")}
+        self.assertEqual(buttons, {"Use bob@work.io": key_of("acct-b")}, "the account in use is not offered")
+        self.assertEqual([s["key"] for s in acc.saved(self.store, key_of("acct-a")) if s["current"]], [key_of("acct-a")])
+        self.assertEqual(len(acc.saved(self.store)), 2, "a legacy file and its new copy are one account")
+
+    def test_a_card_made_before_the_change_asks_for_a_fresh_one(self):
+        """Review on #6837: the workspace-only key was shared by everyone in the workspace, so the file behind an
+        old button may since hold another person; such a button never switches."""
+        with mock.patch.object(acc, "saved", lambda store, current_key="": [
+                {"key": legacy_key("acct-b"), "label": "bob@work.io", "current": False}]):
+            self.post()
+        # A later save by another person of bob's workspace replaced the old file.
+        dana = auth("dana@work.io", "pro", "acct-b", SECRET_C)
+        (self.store / f"{legacy_key('acct-b')}.json").write_text(json.dumps({"label": "dana@work.io", "auth": dana}))
+        rc, out = self.tap("Use bob@work.io")
+        self.assertEqual((rc, out["status"], out["say"]), (2, "refused", acc.OLD_CARD))
+        self.assertEqual((self.launch.calls, self.live()), ([], A), "nothing started, nothing written")
+        state, words = acc.do_switch(self.ws, legacy_key("acct-b"), restart=self.restart, ready=self.ready,
+                                     live=self.live_account, held=lambda home, key: False)
+        self.assertEqual((state, self.live(), self.restarts), ("error", A, []), words)
+        # A fresh card names each person once, under their own key, and switches.
+        self.post()
+        buttons = {b["label"]: b["command"].rsplit(":", 1)[1] for b in self.fake.cards()[-1]["buttons"]
+                   if b["label"].startswith("Use ")}
+        self.assertEqual(buttons, {"Use dana@work.io": acc.identity(dana)[0]})
+
+    def test_the_holder_check_applies_to_an_account_filed_under_the_old_key(self):
+        agent = self.home.parent / "agent-home"
+        agent.mkdir()
+        (agent / "auth.json").write_text(B)
+        state, words = acc.do_switch(self.ws, key_of("acct-b"), restart=self.restart, ready=self.ready,
+                                     live=self.live_account, held=lambda home, key: acc.held_elsewhere(home, key, [agent]))
+        self.assertEqual((state, self.live(), self.restarts), ("error", A, []))
+        self.assertIn("another Codex on this computer is signed in with that account", words)
+        state, words = acc.do_switch(self.ws, key_of("acct-b"), restart=self.restart, ready=self.ready,
+                                     live=self.live_account, held=lambda home, key: False)
+        self.assertEqual((state, self.live()), ("done", B), words)
 
 
 class Switch(Base):
@@ -555,6 +715,32 @@ class Switch(Base):
         last = self.fake.cards()[-1]
         self.assertEqual((last["id"], last["state"]), (acc.NOTE_ID, "done"))
         self.assertFalse(self.ws.joinpath(*acc.RUNNING).exists())
+
+    def test_a_saved_login_another_codex_here_holds_is_never_copied(self):
+        """2026-11-25: a switch to a saved account read "Codex isn't signed in anymore" within two minutes: a local
+        Codex agent held the same login, and its refresh ended the core's copy."""
+        agent = self.home.parent / "agent-home"
+        agent.mkdir()
+        (agent / "auth.json").write_text(B)
+        self.agent_homes = [agent]
+        rc, out = self.switch()
+        self.assertEqual((rc, out["outcome"]), (1, "error"))
+        self.assertEqual(out["say"], "Couldn't switch to bob@work.io: another Codex on this computer is signed in "
+                                     "with that account, and two copies of one sign-in end each other when either "
+                                     "refreshes. Sign in to it here with \"Add another account\" instead. Nothing changed.")
+        self.assertEqual((self.live(), self.restarts), (A, []), "nothing written, no restart")
+
+    def test_an_agent_sharing_the_cores_own_login_file_is_not_another_holder(self):
+        agent = self.home.parent / "agent-home"
+        agent.mkdir()
+        os.symlink(self.home / "auth.json", agent / "auth.json")     # the desktop's default: the agent links the core's
+        other = self.home.parent / "other-home"
+        other.mkdir()
+        (other / "auth.json").write_text(C)
+        self.agent_homes = [agent, other, self.home.parent / "gone"]
+        rc, out = self.switch()
+        self.assertEqual((rc, out["outcome"]), (0, "done"))
+        self.assertEqual(self.live(), B)
 
     def test_a_restart_that_did_not_happen_puts_the_previous_sign_in_back(self):
         self.restart_rc = 4
@@ -860,6 +1046,9 @@ class Edges(Base):
         rc, out = self.tap(use)
         self.assertEqual((rc, out["status"]), (1, "failed"))
         self.assertFalse(self.ws.joinpath(*acc.RUNNING).exists(), "a failed start clears its own record")
+        self.launch = Launch()
+        rc, out = self.tap(use)
+        self.assertEqual(out["status"], "started", "a start that changed nothing leaves the tap free to act")
 
     def test_reply_without_a_core_row_and_to_another_target(self):
         self.signed_in(A)
@@ -1005,9 +1194,26 @@ class Identity(unittest.TestCase):
     def test_key_and_label_follow_the_desktop_rule(self):
         self.assertEqual(acc.identity(A), (key_of("acct-a"), "alice@example.com"))
         no_id = json.dumps({"tokens": {"id_token": jwt({"sub": "user-1", "email": "x@y.z"})}})
-        self.assertEqual(acc.identity(no_id), (key_of("user-1"), "x@y.z"))
+        self.assertEqual(acc.identity(no_id), (key_of("x@y.z"), "x@y.z"))
+        no_email = json.dumps({"tokens": {"account_id": "ws-1", "id_token": jwt({"sub": "user-1"})}})
+        self.assertEqual(acc.identity(no_email)[0], key_of("ws-1|user-1"))
+        # Two people in one ChatGPT workspace are two accounts: keyed by the workspace alone one copy replaced the other.
+        same_ws = [auth(e, "team", "ws-shared", "s") for e in ("p@x.io", "q@x.io")]
+        self.assertNotEqual(acc.identity(same_ws[0])[0], acc.identity(same_ws[1])[0])
+        self.assertEqual(acc.identity(same_ws[0])[0], key_of("ws-shared|p@x.io"))
         for bad in ("", "{", json.dumps({"OPENAI_API_KEY": "sk"}), json.dumps({"tokens": {}})):
             self.assertIsNone(acc.identity(bad))
+
+    def test_local_codex_homes_are_read_from_each_agents_conf(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / ".config" / "ag2-sparrow"
+            for name, conf in (("a", "AGENT_ID=@a:s\nCODEX_HOME='/x/a home'\n"), ("b", "CODEX_HOME=\n"),
+                               ("c", "MODEL=x\n"), ("d", "CODEX_HOME=relative\n")):
+                (root / "agents" / name).mkdir(parents=True)
+                (root / "agents" / name / "codex-local.conf").write_text(conf)
+            (root / "codex-local.conf").write_text('CODEX_HOME="/x/top"\n')
+            self.assertEqual(acc.local_codex_homes(Path(tmp)), [Path("/x/top"), Path("/x/a home")])
+            self.assertEqual(acc.local_codex_homes(Path(tmp) / "none"), [])
 
     def test_masking(self):
         self.assertEqual(acc.masked_label("alice@example.com"), "alice@example.com")

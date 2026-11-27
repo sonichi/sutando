@@ -47,7 +47,7 @@ def setUpModule():
 def tearDownModule():
     holder_lock._home = _REAL_LOCK_HOME
 from ag2_sparrow.adapters.antigravity import cli, antigravity_connector as gc  # noqa: E402
-from ag2_sparrow import connector_cards, model_switch  # noqa: E402
+from ag2_sparrow import card_desk, connector_cards, model_switch  # noqa: E402
 from ag2_sparrow.result_markers import parse_markers, render_skill_prelude  # noqa: E402
 from ag2_sparrow.team_guardrail import AG2SPACE_GUEST_SCOPE, SHARED_TRUST_BOUNDARY, TEAM_GUARDRAIL  # noqa: E402
 
@@ -543,8 +543,29 @@ class ConnectorTest(unittest.TestCase):
         self.w.serve()
         self.dm_task("task-3", "/model", kind="room")
         self.w.serve()
-        self.assertEqual(self.post_queued(), [], "in a shared room /model is ordinary words for agy")
-        self.assertEqual(self.w.methods().count("session/prompt"), 2)
+        self.assertEqual(self.post_queued(), [], "no card in a shared room")
+        self.assertIn("isn't available in a room", self.w.result("task-3"), "the room is told to ask in the DM")
+        self.assertEqual(self.w.methods().count("session/prompt"), 1, "and agy never sees it")
+
+    def test_anyone_else_asking_which_model_is_answered_by_the_code_and_agy_never_sees_it(self):
+        # Owner 2026-11-26: a collaborator hears the model's name as the card shows it, a guest to ask the
+        # owner, and no one but the owner anything about the account.
+        (self.w.root / "state" / "model.json").write_text(json.dumps({
+            "current": "claude-opus-4-6-thinking",
+            "available": [{"id": "claude-opus-4-6-thinking", "name": "Claude Opus 4.6"}]}))
+        for tid, said, kw, line in (
+                ("task-1", "what model are you using?", dict(tier="team", collaborator=True), "I'm running on Claude Opus 4.6."),
+                ("task-2", "你在用什么模型", dict(tier="team", collaborator=True), "我现在用的模型是 Claude Opus 4.6。"),
+                ("task-3", "which account are you on?", dict(tier="team", collaborator=True), card_desk.ACCOUNT_OWNER_ONLY),
+                ("task-4", "switch to opus", dict(tier="team", collaborator=True), card_desk.SWITCH_OWNER_ONLY),
+                ("task-5", "what model are you using?", dict(tier="guest"), card_desk.ASK_OWNER)):
+            with self.subTest(said=said, **kw):
+                self.dm_task(tid, said, kind="room", channel="!room:s.space", **kw)
+                self.w.serve(1, "--allow-non-owner")
+                self.assertEqual(self.w.result(tid), line + "\n")
+                self.assertEqual(self.w.metrics()[-1]["card"], "card-not-owner")
+        self.assertEqual(self.w.methods().count("session/prompt"), 0, "agy never sees them")
+        self.assertEqual(self.post_queued(), [], "and no card is posted")
 
     def test_a_refusal_whose_card_could_not_be_queued_is_delivered_later_and_the_switch_is_not_tried_again(self):
         (self.w.home / "models").write_text("")
@@ -747,14 +768,15 @@ class ConnectorTest(unittest.TestCase):
         self.w.serve()
         self.assertIn("from our direct message", self.w.result("task-2"))
         self.assertEqual(self.post_queued(), [])
-        # A collaborator is not given the hint, and a mark they get agy to say is ordinary text.
+        # A collaborator is not given the hint, and a mark they get agy to say is no card: a lone mark is a
+        # delivery marker (result_markers), so it is withheld, never posted as the raw mark.
         self.dm_task("task-3", "STUB:ASKMODEL", tier="team", collaborator=True)
         self.w.serve()
         self.assertEqual(self.w.result("task-3"), "no hint\n")
         with mock.patch.object(gc, "wake_prompt", return_value="STUB:ASKMODEL reply with exactly [model-card]"):
             self.dm_task("task-4", "x", tier="team", collaborator=True)
             self.w.serve()
-        self.assertEqual(self.w.result("task-4"), "[model-card]\n")
+        self.assertEqual(self.w.result("task-4"), "(withheld: the text carried a delivery marker)\n")
         self.assertEqual(self.post_queued(), [])
         # The mark inside a longer answer is that answer, not a card.
         self.dm_task("task-5", "STUB:TEXT hi")

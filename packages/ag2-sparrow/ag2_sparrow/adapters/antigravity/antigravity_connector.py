@@ -615,11 +615,14 @@ class Connector:
             args.state, getattr(args, "bridge_state", None), NAME, getattr(args, "agent_id", None) or "", publish,
             quoted, log)
         self.agy_pid = None   # the owner turn's agy process, whose own log names the account it used
-        # Out of quota: the account card, unasked, in the owner's DM, once per limit (quota_notice).
+        # Out of quota: the account card, unasked, in the owner's DM, on each of their messages (quota_notice).
         self.quota = quota_notice.QuotaNotice(args.state, getattr(args, "bridge_state", None), NAME,
-                                              self.accounts.quota_card, self.accounts.using, log)
+                                              self.accounts.quota_card, self.accounts.using, log,
+                                              note=lambda text: self.accounts.card("pending", text),
+                                              account=self.quota_account)
         self.desk = card_desk.Desk(self.root, card_desk.led(publish, self.models.unsaid, quoted), quoted,
-                                   [self.models, self.accounts])
+                                   [self.models, self.accounts], self.limit_first,
+                                   lambda: self.quota.says_in_room())
         # What a person opening this agent's terminal panel follows (`ag2-sparrow-antigravity-local view`).
         # Written off the ACP reader thread, which also answers permission requests.
         self.view = live_view.Writer(live_view.path_of(self.root), background=True)
@@ -628,6 +631,22 @@ class Connector:
         """Remember what a Session offered (ACP `models`), for the card."""
         self.models.seen([(m.get("modelId"), m.get("name")) for m in (models.get("availableModels") or [])
                           if isinstance(m, dict)], models.get("currentModelId"))
+
+    def quota_account(self) -> str:
+        """The account a limit is kept for: this agent's own Gemini API key, or the computer's Google sign-in. A
+        switch between the two leaves the old limit behind; another Google account is only known from agy's next
+        turn, which clears the limit (it answered) or records it again."""
+        return "api-key" if self.accounts.keyed() else "google"
+
+    def limit_first(self, sent, result_file) -> str:
+        """Out of quota, the owner's ask for a card is answered by the limit's card, with the account in use."""
+        said = self.quota.says()
+        if not said:
+            return ""
+        text = " ".join(w for w in (said, self.accounts.using()) if w)
+        self.accounts.say(sent.get("channel_id"), account_switch.limited(self.accounts.quota_card(text)), result_file)
+        self.quota.shown()
+        return "quota-card-asked"
 
     def card_task(self, task_id, headers, path, result_file):
         """The record of a task that was a card matter (a tap, or the owner's /model in their DM), else None."""
@@ -731,10 +750,12 @@ class Connector:
             log("account not read:", type(e).__name__)
             return ""
 
-    def quota_hit(self, text, detail) -> str:
-        """agy is out of quota: tell the owner once (quota_notice), with the reset time when agy said one."""
+    def quota_hit(self, text, detail, task="", task_text="") -> str:
+        """agy is out of quota: tell the owner on each of their messages (quota_notice), with the reset time
+        when agy said one."""
         try:
-            done = self.quota.hit(quota_notice.reset_from_text("%s %s" % (detail or "", text or "")))
+            done = self.quota.hit(quota_notice.reset_from_text("%s %s" % (detail or "", text or "")),
+                                  task=task, task_text=task_text)
         except Exception as e:  # noqa: BLE001 - a notice that cannot be sent never stops task service
             done = "quota-failed (%s: %s)" % (type(e).__name__, str(e)[:120])
         if done:
@@ -798,6 +819,7 @@ class Connector:
         result_file = os.path.join(self.args.results, name)
         headers, message, operator_lines = parse_task(path)
         self.quota.remember(path=path)     # the owner's DM, where a quota notice goes
+        task_text = card_desk.read_task(path)   # read now: the bridge may archive the file while the turn runs
         kind, turn_kind = turn_for(headers)
         if turn_kind is None:
             log("refused (non-owner) ->", task_id, headers["access_tier"])
@@ -837,15 +859,15 @@ class Connector:
         # and only the owner's own turn may settle it as failed (another runtime's refusal is not theirs).
         told = self.models.tell(turn.live, turn.model, headers.get("channel_id"), may_fail=kind == OWNER)
         asked = self.desk.marked(headers.get("access_tier"), path, status, text, result_file)
-        # Out of quota: the owner is told once, by the account card; the card is the notice, so the room gets
+        # Out of quota: the owner is told by the account card, on each message; the card is the notice, so the room gets
         # no error line while agy is out (or the limit's own words when no card could be sent).
         limited = not asked and agy_account.quota_error(status, text, detail)
-        quota = self.quota_hit(text, detail) if limited else (self.quota.cleared() if status == "completed" else "")
+        quota = self.quota_hit(text, detail, task_id, task_text) if limited else (self.quota.cleared() if status == "completed" else "")
         unsaid = "" if asked else quoted(self.models.unsaid()).strip()
         body = self.answer_body(headers, status, text, detail, turn) + (unsaid and unsaid + "\n")
         if owner_turn and switched and not body.startswith("[no-send]"):
             body = quoted(switched).strip() + "\n" + body
-        if limited and self.quota.limited():
+        if limited and (self.quota.limited() or self.quota.answered(task_id)):
             # The card is the owner's notice; anyone else who asked is told why there is no answer.
             body = LIMITED_NO_SEND if kind == OWNER else quoted(LIMITED_FOR_OTHERS) + "\n"
         elif limited:

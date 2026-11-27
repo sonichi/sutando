@@ -27,7 +27,7 @@ from pathlib import Path
 from ... import claude_model_switch, connect_common as cm, signin_watch, task_io, tmux_pane_keys, tmux_probe
 from ...file_lock import locked_file
 from ... import claude_local_accepter as accepter, claude_local_card as card, claude_local_records as records
-from . import detector, hmac_policy, hold, inbox, quota_card, trust
+from . import account_remote, detector, hmac_policy, hold, inbox, quota_card, trust
 from .shape import (AUTOARM_VAR, HITL_ID_PREFIX, LAUNCHER_LOCK, LOCAL, MIN_TMUX, SESSION_NAME, SOCKET_NAME,
                     SOCKET_PATH_MAX, SUPERVISOR_LOCK)
 
@@ -42,6 +42,7 @@ INNER_STOP_S = 120.0
 TITLE_CHANGED = "title changed"
 MODEL_ACCEPT_S = 20.0
 SIGNIN_CHECK_S = 5.0       # how often the sign-in file's stat is looked at
+ACCOUNT_SWITCH_CHECK_S = 15.0   # how often a switch to a saved account is checked for a watcher a restart ended
 # The names that may be typed, Claude Code's two texts and its input-box check are the core's
 # (src/claude_model_switch.py, bundled verbatim): one source for the skill and for this adapter.
 MODEL_RE, MODEL_SET, MODEL_CONFIRM = claude_model_switch.MODEL_RE, claude_model_switch.MODEL_SET, claude_model_switch.MODEL_CONFIRM
@@ -505,6 +506,7 @@ class Launcher:
         self.observation = detector.derive(self.observation, text, plugin, self.clock(),
                                            own=quota_card.own_ui(self.root, text))
         self.quota(text, str((gen or {}).get("nonce") or ""))
+        self.account_switches()
         stall = self.observation["stall"]
         if (rec.get("stall") or None) != stall:
             if rec.get("stall"):
@@ -515,7 +517,7 @@ class Launcher:
     def new_quota_incident(self) -> None:
         """A session being created (an account switch restarts it) may be on an account at its limit too."""
         try:
-            quota_card.new_session(self.root)
+            quota_card.new_session(self.root, self.cfg)
         except Exception as e:  # noqa: BLE001 - advisory
             self.log("quota: new session not recorded (%s: %s)" % (type(e).__name__, str(e)[:120]))
 
@@ -532,6 +534,19 @@ class Launcher:
         if done and done != self.quota_said:
             self.log("quota: %s" % done)
         self.quota_said = done or self.quota_said
+
+    def account_switches(self) -> None:
+        """A switch to a saved account still being watched for whose watcher a restart ended gets a new one
+        (account_remote.recover), checked every ACCOUNT_SWITCH_CHECK_S. Never stops the supervisor."""
+        now = self.clock()
+        if now < getattr(self, "account_switch_next", 0.0):
+            return
+        self.account_switch_next = now + ACCOUNT_SWITCH_CHECK_S
+        try:
+            if account_remote.recover(self.root):
+                self.log("account switch: its watcher restarted")
+        except Exception as e:  # noqa: BLE001 - advisory
+            self.log("account switch: not recovered (%s: %s)" % (type(e).__name__, str(e)[:120]))
 
     def raise_card(self, rec: dict, kind: str, failed_check: str) -> dict:
         """One card per incident; the id lives in the supervisor record so a restart resumes it."""
@@ -657,7 +672,9 @@ class Launcher:
             return "nothing to stop"
         started = self.clock()
         self.log("stopping (%s): /exit to pane %s" % (why, gen["pane_id"]))
-        rc = self.fenced(gen, title, "send-keys -t %s /exit Enter" % tmux_pane_keys.tmux_quote(gen["pane_id"]))
+        # A viewer's scroll can leave the pane in copy mode, where /exit would be swallowed: leave it first.
+        pane = tmux_pane_keys.tmux_quote(gen["pane_id"])
+        rc = self.fenced(gen, title, "copy-mode -q -t %s ; send-keys -t %s /exit Enter" % (pane, pane))
         if rc != 0:
             return self.unsent(gen, title, rc, "/exit") or self.stopped(started)
         deadline = time.monotonic() + CLAUDE_GRACE_S

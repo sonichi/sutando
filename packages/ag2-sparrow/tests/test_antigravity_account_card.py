@@ -280,7 +280,7 @@ class AccountCardTest(unittest.TestCase):
         folder = Path(str(self.w.root) + ".bridge") / "state" / "agent-cards" / "outbox"
         return [json.loads(p.read_text()) for p in sorted(folder.iterdir())] if folder.is_dir() else []
 
-    def test_a_quota_error_queues_one_account_card_to_the_owner_dm_and_a_second_limit_tick_nothing(self):
+    def test_a_quota_error_queues_an_account_card_to_the_owner_dm_on_each_message_and_before_any_card_asked_for(self):
         self.dm("task-q1", "STUB:QUOTA hi")
         self.serve()
         (queued,) = self.outbox()
@@ -295,12 +295,52 @@ class AccountCardTest(unittest.TestCase):
         self.assertEqual(self.w.result("task-q1"), gc.LIMITED_NO_SEND, "the card is the notice: no error line")
         self.dm("task-q2", "STUB:QUOTA again")
         self.serve()
-        self.assertEqual(len(self.outbox()), 1, "a second limit tick queues nothing")
-        self.assertEqual(len(self.posted("$q1")), 1)
-        self.dm("task-q3", "STUB:LIMIT429 and again", kind="room")
+        self.assertEqual([q["card"]["text"] for q in self.outbox()], [card["text"]] * 2, "each message, its card")
+        self.assertEqual(self.w.result("task-q2"), gc.LIMITED_NO_SEND)
+        self.assertEqual(len(self.posted("$q1")), 2)
+        # Asked in a room: the card goes to the DM, the room gets no error line.
+        self.dm("task-q3", "STUB:QUOTA and again", kind="room")
         self.serve()
-        self.assertEqual((self.outbox(), self.posted("$q3")), ([], []), "nothing more once the card is posted")
+        (there,) = self.outbox()
+        self.assertNotIn("I'm using", there["card"]["text"], "in a room the card names no account")
+        self.assertEqual(("account_controls" in there["card"], there["card"].get("buttons")), (False, None),
+                         "and switches none")
         self.assertEqual(self.w.result("task-q3"), gc.LIMITED_NO_SEND)
+        # The owner asks for a card while out: the limit's card answers first, with the same words.
+        self.posted("$q3")
+        for n, asked in enumerate(("/account", "/model", "what account are you using")):
+            self.dm("task-a%d" % n, asked)
+            self.serve()
+            (shown,) = self.posted("$a%d" % n)
+            self.assertEqual((shown["text"], shown["account_controls"]), (card["text"], card["account_controls"]), asked)
+
+    def test_after_a_restart_at_the_limit_the_first_ask_gets_only_the_limits_card_and_a_switch_ends_it(self):
+        # RC6 acceptance (Dots): the first "account", "model" or "/model" after the agent restarted, at the limit.
+        self.dm("task-q1", "STUB:QUOTA hi")
+        self.serve()
+        (limit,) = self.posted("$q1")
+        for n, ask in enumerate(("account", "model", "/model")):
+            self.connector = None            # a restart: a new connector, reading what the last one kept
+            self.dm("task-r%d" % n, ask)
+            self.serve()
+            (shown,) = self.posted("$r%d" % n)
+            self.assertEqual((shown["text"], shown["account_controls"]), (limit["text"], limit["account_controls"]), ask)
+        # The owner switched to this agent's own API key: the limit was the Google sign-in's, not this one's.
+        self.keychain["saved"] = True
+        self.connector = None
+        self.dm("task-m", "/model")
+        self.serve()
+        self.assertNotIn("quota-card-asked", json.dumps(self.w.metrics()[-1]))
+        self.assertEqual([c for c in self.posted("$m") if "usage limit" in c["text"]], [], "no limit card for it")
+        self.dm("task-a", "account")
+        self.serve()
+        (card,) = self.posted("$a")
+        self.assertNotIn("usage limit", card["text"])
+        self.assertEqual(card["account_controls"], {"runtime": "antigravity", "agent": AGENT})
+        self.dm("task-t", "STUB:TEXT hi")
+        self.serve()
+        self.assertNotEqual(self.w.result("task-t"), gc.LIMITED_NO_SEND)
+        self.assertEqual(self.posted("$t"), [], "a turn, and no card")
 
     def test_a_collaborator_who_asks_while_agy_is_at_its_limit_is_told_why_there_is_no_answer(self):
         # Review of #6713: once the owner's card was queued, anyone else who asked got no reply at all.
@@ -330,11 +370,13 @@ class AccountCardTest(unittest.TestCase):
         self.assertIn("internal error", self.w.result("task-f"))
         self.assertNotIn("usage limit", self.w.result("task-f"))
 
-    def test_a_quota_error_with_no_owner_dm_seen_sends_no_card_and_says_the_limit_in_the_room(self):
+    def test_a_quota_error_with_no_owner_dm_seen_is_told_by_the_card_in_the_room_it_was_asked_in(self):
         self.dm("task-q", "STUB:QUOTA hi", kind="room")
         self.serve()
-        self.assertEqual(self.outbox(), [])
-        self.assertIn("Antigravity has reached its usage limit", self.w.result("task-q"))
+        (queued,) = self.outbox()
+        self.assertIn("Antigravity has reached its usage limit", queued["card"]["text"])
+        self.assertNotIn("I'm using", queued["card"]["text"])
+        self.assertEqual(self.w.result("task-q"), gc.LIMITED_NO_SEND)
 
     # ── signed out: a card with the sign-in, not a line of words ──
     def test_signed_out_in_the_owner_dm_posts_the_sign_in_card_instead_of_the_error_line(self):

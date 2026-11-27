@@ -33,7 +33,10 @@ chmod +x "$TMP/bin/pinned-python3"
 
 STAGE="$TMP/repo"; mkdir -p "$STAGE"
 ln -s "$REPO/src" "$STAGE/src"
-ln -s "$REPO/scripts" "$STAGE/scripts"
+# The installer pins the CORE's config dir, which the stubbed helper names.
+# shellcheck source=lib/core-config-dir-stub.sh
+source "$REPO/tests/lib/core-config-dir-stub.sh"
+stage_core_config_scripts "$REPO" "$STAGE"
 INSTALLER="$STAGE/src/install-credential-proxy-launchd.sh"
 
 CFG="$TMP/claude-home"
@@ -41,7 +44,7 @@ mkdir -p "$CFG/skills/quota-tracker/scripts"
 echo "// proxy target (test artifact)" > "$CFG/skills/quota-tracker/scripts/credential-proxy.ts"
 PLIST="$TMP/home/Library/LaunchAgents/com.sutando.credential-proxy.plist"
 
-RUN=(env HOME="$TMP/home" PATH="$TMP/bin:$PATH" CLAUDE_CONFIG_DIR="$CFG" SUTANDO_NODE=
+RUN=(env HOME="$TMP/home" PATH="$TMP/bin:$PATH" TEST_CORE_CONFIG_DIR="$CFG" CLAUDE_CONFIG_DIR="$CFG" SUTANDO_NODE=
      SUTANDO_PY="$TMP/bin/pinned-python3")
 
 "${RUN[@]}" bash "$INSTALLER" install > /dev/null 2>&1

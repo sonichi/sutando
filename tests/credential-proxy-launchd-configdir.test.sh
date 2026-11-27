@@ -14,7 +14,10 @@ printf '#!/bin/sh\nexit 0\n' > "$TMP/bin/launchctl"; chmod +x "$TMP/bin/launchct
 # tree: exercises the checkout-missing-skill path in dev (not bundled) mode.
 STAGE="$TMP/repo"; mkdir -p "$STAGE"
 ln -s "$REPO/src" "$STAGE/src"
-ln -s "$REPO/scripts" "$STAGE/scripts"
+# The installer pins the CORE's config dir, which the stubbed helper names.
+# shellcheck source=lib/core-config-dir-stub.sh
+source "$REPO/tests/lib/core-config-dir-stub.sh"
+stage_core_config_scripts "$REPO" "$STAGE"
 INSTALLER="$STAGE/src/install-credential-proxy-launchd.sh"
 WRAPPER="$STAGE/src/launchd/credential-proxy-wrapper.sh"
 
@@ -27,8 +30,8 @@ EXPECTED="$CFG/skills/quota-tracker/scripts/credential-proxy.ts"
 
 PLIST="$TMP/home/Library/LaunchAgents/com.sutando.credential-proxy.plist"
 
-# 1. Install with the namespaced CLAUDE_CONFIG_DIR (interactive env).
-out="$(env HOME="$TMP/home" PATH="$TMP/bin:$PATH" CLAUDE_CONFIG_DIR="$CFG" SUTANDO_NODE= \
+# 1. Install with the namespaced CLAUDE_CONFIG_DIR as the core's.
+out="$(env HOME="$TMP/home" PATH="$TMP/bin:$PATH" TEST_CORE_CONFIG_DIR="$CFG" CLAUDE_CONFIG_DIR="$CFG" SUTANDO_NODE= \
       bash "$INSTALLER" install 2>&1)"
 [ -f "$PLIST" ]
 check $? "installer renders the plist for a checkout-missing-skill install"
@@ -53,7 +56,7 @@ check $? "without the pin, resolution falls back to ~/.claude (the bug class)"
 
 # A loaded-but-old plist must read as drift. SUTANDO_NODE alone cannot see it:
 # it is empty on both sides of a dev host, so that comparison passes.
-IS_CURRENT=(env HOME="$TMP/home" PATH="$TMP/bin:$PATH" CLAUDE_CONFIG_DIR="$CFG" SUTANDO_NODE=)
+IS_CURRENT=(env HOME="$TMP/home" PATH="$TMP/bin:$PATH" TEST_CORE_CONFIG_DIR="$CFG" CLAUDE_CONFIG_DIR="$CFG" SUTANDO_NODE=)
 
 # 5. The plist just installed IS current.
 "${IS_CURRENT[@]}" bash "$INSTALLER" is-current

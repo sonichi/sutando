@@ -21,7 +21,7 @@ isolate_os_environ()
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from claude_code_fixtures import cli, ConnectBase, hold_consumer, inbox, unhold  # noqa: E402
-from ag2_sparrow import connector_cards, model_switch  # noqa: E402
+from ag2_sparrow import card_desk, connector_cards, model_switch  # noqa: E402
 
 from ag2_sparrow.adapters.claude_code import model_card  # noqa: E402
 
@@ -117,8 +117,29 @@ class Claim(Base):
         for t, said in (("task-o", "which model is best for coding?"), ("task-w", "/models please")):
             rc, out = self.claim(self.task(t, said))
             self.assertEqual((rc, out.get("admission")), (0, "owner"), t)
-        rc, out = self.claim(self.task("task-g", "/model", tier="owner", kind="room"))
-        self.assertEqual((rc, out.get("admission")), (0, "owner"), "/model outside the DM is ordinary text")
+        rc, out = self.claim(self.task("task-g", "/model", kind="room"))
+        self.assertEqual(rc, 1, "the owner's /model in a room is answered here, never by the session")
+        self.assertNotIn("admission", out)
+        self.assertIn("isn't available in a room", (self.results / "task-g.txt").read_text())
+        rc, out = self.claim(self.task("task-gt", "/model", tier="team", kind="room", extra="collaborator: true\n"))
+        self.assertEqual(rc, 1, "anyone else's /model in a room is answered here too, never by the session")
+        self.assertEqual((self.results / "task-gt.txt").read_text(), card_desk.SWITCH_OWNER_ONLY + "\n")
+        self.assertEqual(self.queued(), [], "and no card is posted there")
+        self.assertNotIn("wanted", self.state())
+
+    def test_a_collaborator_asking_which_model_is_told_its_name_and_never_the_account(self):
+        # Owner 2026-11-26: the model's name as the card shows it, from code; the account only to the owner.
+        model_switch.ModelSwitch(str(Path(self.root) / "state"), self.root, None, "x", None, lambda s: s,
+                                 lambda *a: None).save(current="sonnet[1m]", confirmed="sonnet[1m]")
+        rc, out = self.claim(self.task("task-q", "what model are you using?", tier="team", kind="room",
+                                       extra="collaborator: true\n"))
+        self.assertEqual(rc, 1, "answered here, never by the session")
+        self.assertEqual((self.results / "task-q.txt").read_text(), "I'm running on Sonnet (1M context).\n")
+        rc, out = self.claim(self.task("task-a", "which account are you on?", tier="team", kind="room",
+                                       extra="collaborator: true\n"))
+        self.assertEqual(rc, 1)
+        self.assertEqual((self.results / "task-a.txt").read_text(), card_desk.ACCOUNT_OWNER_ONLY + "\n")
+        self.assertEqual(self.queued(), [])
 
     def test_a_card_that_cannot_be_consulted_never_holds_a_task_back(self):
         with mock.patch.object(model_card, "card_matter", side_effect=RuntimeError("broken")):

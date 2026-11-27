@@ -88,10 +88,10 @@ LOCAL_STATE_FILES = ("claude-local-plugin.json", "claude-local-supervisor.json",
 # What claude-local's cards keep beside them: the model, account and quota cards' records, the detached
 # switch's log and lock. Unnamed, each refuses the start.
 LOCAL_FEATURE_FILES = ("model.json", "account.json", "model-apply.log", "model-apply.lock", "quota-card.json",
-                       "quota-room.json", "quota-seen.json")
-# Their directories: the cards this agent posted (issued_cards' ledger) and the card-mark answers kept for
-# a staging retry (adapters/claude_code/model_card.py). When present, each must be a plain directory.
-STATE_OPTIONAL_DIRS = frozenset(("agent-cards", "card-marks"))
+                       "quota-room.json", "quota-seen.json", "account-remote.log")
+# Their directories: the cards this agent posted (issued_cards' ledger), the card-mark answers kept for a
+# staging retry, and the account switches asked of the desktop app (account_remote). Each a plain directory.
+STATE_OPTIONAL_DIRS = frozenset(("agent-cards", "card-marks", "account-remote"))
 STATE_ALLOWED = frozenset(("format", "claims", "settled-ids", "rate.jsonl", "done", "collaborator-turns.json")
                           + LOCAL_STATE_FILES + LOCAL_FEATURE_FILES) | STATE_OPTIONAL_DIRS
 # Optional records the adapters rewrite in place: when present, each must be a plain file.

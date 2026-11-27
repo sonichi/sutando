@@ -180,10 +180,12 @@ HELD_WAIT_S = held_start.WAIT_S
 # one refused because its login no longer works. Only these are read: an error's words never decide either.
 USAGE_LIMIT_INFO, UNAUTHORIZED_INFO = "usagelimitexceeded", "unauthorized"
 LIMITED_NO_SEND = "[no-send] Codex is at its usage limit; the owner was sent the account card\n"
+LIMITED_FOR_OTHERS = "Codex has reached its usage limit, so I can't answer right now. Its owner has been told."
 # Still refused after the app-server was restarted on the login on disk: the owner is shown the account card.
-SIGNED_OUT = "Codex isn't signed in anymore."
-SIGNED_OUT_ELSEWHERE = ("Codex isn't signed in anymore. My owner can switch its account by sending /account in "
-                        "our direct message.")
+SIGNED_OUT = account_switch.LAPSED
+SIGNED_OUT_ELSEWHERE = ("Codex's sign-in on this computer no longer works. My owner can sign in again by sending "
+                        "/account in our direct message.")
+LOGIN_REFUSED = "login-refused.json"     # under the state dir: a stat of the refused login file, no secret
 SHARED_LOGIN = "The core shares this login, so it uses the new account after its next restart."
 
 
@@ -211,6 +213,7 @@ def unauthorized(error) -> bool:
 MODEL_REFUSED_INFO = "modelnotfound"
 _MODEL_REFUSED = re.compile(r"\bmodel\b.{0,80}\bis not supported\b", re.IGNORECASE)
 PICKED = ("model-picked", "model-pending", "model-same")
+CARD_RETRY_S = 5.0   # a card line to someone other than the owner that could not be written is tried again
 HOLD_S = 600.0       # a message waiting for a model pick is answered in words after this long
 RELEASED_KEEP = 20   # tasks remembered as having waited once, until each is answered
 
@@ -242,6 +245,24 @@ def limit_reset(snapshot, now=None) -> "float | None":
         if isinstance(used, (int, float)) and used >= 100 and isinstance(at, (int, float)) and at > now:
             found.append(float(at))
     return max(found) if found else None
+
+
+USAGE_READ_S = 10.0     # `account/rateLimits/read`: a usage read before a card ask waits no longer than this
+
+
+def usage_state(answer, now=None) -> "dict | None":
+    """From an `account/rateLimits/read` answer: the snapshot when it says the account is out of usage now (a
+    window used up, a limit it names as reached, or ordinary usage not allowed); {} when every window it gives
+    has usage left; None when it does not say (no window with a number, or an answer of another shape)."""
+    if not isinstance(answer, dict) or not isinstance(answer.get("rateLimits"), dict):
+        return None
+    snapshot = answer["rateLimits"]
+    if (limit_reset(snapshot, now) is not None or snapshot.get("rateLimitReachedType")
+            or answer.get("ordinaryUsageAllowed") is False):
+        return snapshot
+    used = [w.get("usedPercent") for w in (snapshot.get(n) for n in ("primary", "secondary")) if isinstance(w, dict)]
+    used = [u for u in used if isinstance(u, (int, float)) and not isinstance(u, bool)]
+    return {} if used and all(u < 100 for u in used) else None
 OWNER_ONLY, SHARED = "owner-only", "shared"   # third line of a thread file; absent: an older file, unknown
 SHARED_SUFFIX = ".shared"               # a collaborator's thread where the kept thread is not known to be shared
 RESUME_MARKER = "resume-thread-taken"   # under state/: the --resume-thread id already carried over
@@ -464,11 +485,13 @@ class Connector:
         state = getattr(args, "state", None)
         self.view = live_view.Writer(live_view.path_of(os.path.dirname(state))) if state else None
         self.rerouted = ""        # the model Codex moved the current turn to, when it said so
+        self.card_retry_at = {}   # task id -> when a card line that could not be written is tried again
         self._models = self._accounts = self._quota = None
         self.rate_limits = {}
         # The current turn's error when it said the account is out of usage, or its login no longer works.
         self.turn_limit = self.turn_unauth = None
         self.turn_worked = False
+        self.turn_login = None    # the stat of the login file the current attempt was sent on
         self.auth_note = ""       # what was done about the login for the current task, for its metrics row
         self.turn_ran_on = None   # the model the current turn was asked to run on (None: the thread's own)
 
@@ -493,7 +516,8 @@ class Connector:
                 self.args.state, getattr(self.args, "bridge_state", None), "Codex", self.card_answer, quoted, log,
                 read=self.account_label, begin=self.begin_login,
                 cancel=lambda login: self.rpc.request("account/login/cancel", {"loginId": login}),
-                opener=lambda url: open_page(url), runtime="codex")
+                opener=lambda url: open_page(url), runtime="codex", lapsed=self.login_refused,
+                limit=lambda: self.quota.says())
         return self._accounts
 
     @property
@@ -502,7 +526,8 @@ class Connector:
         if self._quota is None:
             self._quota = quota_notice.QuotaNotice(
                 self.args.state, getattr(self.args, "bridge_state", None), "Codex",
-                lambda text: self.accounts.card("pending", text, ask=True), self.accounts.using, log)
+                lambda text: self.accounts.card("pending", text, ask=True), self.accounts.using, log,
+                note=lambda text: self.accounts.card("pending", text), account=lambda: self.signin_account or "")
         return self._quota
 
     def saw_rate_limits(self, params, tell=True) -> str:
@@ -514,13 +539,14 @@ class Connector:
         self.rate_limits = snap
         return self.quota_hit() if tell and limit_reset(snap) is not None else ""
 
-    def quota_hit(self, error=None) -> str:
-        """Codex is out of usage: tell the owner once (quota_notice), with the reset time when it said one."""
+    def quota_hit(self, error=None, task: str = "", task_text: str = "") -> str:
+        """Codex is out of usage: tell the owner (quota_notice), with the reset time when it said one: once
+        for the limit, and once more for each message of theirs (`task`) it refuses after that."""
         at = limit_reset(self.rate_limits)
         reset = quota_notice.reset_from_epoch(at) if at else \
             quota_notice.reset_from_text((error or {}).get("message") if isinstance(error, dict) else "")
         try:
-            done = self.quota.hit(reset, at)
+            done = self.quota.hit(reset, at, task=task, task_text=task_text)
         except Exception as e:  # noqa: BLE001 - a notice that cannot be sent never stops task service
             done = "quota-failed (%s: %s)" % (type(e).__name__, str(e)[:120])
         if done:
@@ -529,11 +555,84 @@ class Connector:
 
     @property
     def desk(self):
-        return card_desk.Desk(self.root, self.card_answer, quoted, [self.models, self.accounts])
+        return card_desk.Desk(self.root, self.card_answer, quoted, [self.models, self.accounts], self.limit_first,
+                              lambda: self.quota.says_in_room())
+
+    def limit_first(self, sent, result_file) -> str:
+        """Out of usage, the owner's ask for a card is answered by the limit's card (the account card, which says it).
+        With no limit on record (none was refused yet since a restart), the server is asked first."""
+        if not self.quota.says():
+            snapshot = self.usage_now()
+            if not snapshot:
+                return ""
+            self.rate_limits = snapshot
+            at = limit_reset(snapshot)
+            self.quota.asked_limit(quota_notice.reset_from_epoch(at) if at else "", at)
+            if not self.quota.says():
+                return ""
+        self.accounts.offer(sent, result_file)
+        self.quota.shown()
+        return "quota-card-asked"
+
+    def usage_now(self) -> "dict | None":
+        """The account's usage as the server reads it now (usage_state); None when it cannot be read."""
+        try:
+            return usage_state(self.rpc.request("account/rateLimits/read", {}, timeout=USAGE_READ_S))
+        except Exception as e:  # noqa: BLE001 - advisory: the card asked for is shown as before
+            log("usage not read:", "%s: %s" % (type(e).__name__, str(e)[:120]))
+            return None
+
+    def usage_at_start(self) -> str:
+        """Before the first task: a limit the account is at already is known (and told, once per limit) without
+        waiting for a turn to be refused, and one kept from before that the server says is over is cleared."""
+        snapshot = self.usage_now()
+        if snapshot:
+            self.rate_limits = snapshot
+            return self.quota_hit()
+        if snapshot == {}:
+            done = self.quota.cleared()
+            if done:
+                log("quota:", done, "(the server says the account has usage)")
+            return done
+        return ""
 
     def card_answer(self, result_file, body):
         """A card matter's answer, led by a model outcome this turn could only say in words."""
         return card_desk.led(write_atomic, self.models.unsaid, quoted)(result_file, body)
+
+    def _login_stamp(self):
+        """The stat of the login file (through a link), never its contents; None when there is none."""
+        try:
+            st = os.stat(os.path.join(signin_watch.codex_home(), signin_watch.CODEX_AUTH))
+        except OSError:
+            return None
+        return [st.st_ino, st.st_size, st.st_mtime_ns]
+
+    def note_login_refused(self, refused: bool) -> None:
+        """Keep (or drop) Codex's own refusal of the login the last attempt was sent on, tied to that very file:
+        any rewrite of it (a new sign-in, a refresh by a copy sharing it) is a login nobody has refused yet."""
+        path = os.path.join(self.args.state, LOGIN_REFUSED)
+        # The login the refused attempt was sent on: a switch while it ran is a login nobody has refused.
+        stamp = self.turn_login if refused else None
+        if stamp is None and not os.path.lexists(path):
+            return      # nothing kept: an ordinary turn writes nothing here
+        try:
+            if stamp is None:
+                os.unlink(path)
+            else:
+                write_atomic(path, json.dumps({"login": stamp}) + "\n")
+        except OSError as e:     # one already gone is the state wanted
+            if not isinstance(e, FileNotFoundError):
+                log("login refusal not kept:", type(e).__name__)
+
+    def login_refused(self) -> bool:
+        """Whether Codex refused the login now on disk as unauthorized, even after a restart (a turn said so)."""
+        try:
+            with open(os.path.join(self.args.state, LOGIN_REFUSED), encoding="utf-8") as f:
+                kept = json.load(f).get("login")
+        except (OSError, ValueError, AttributeError):
+            return False
+        return kept is not None and kept == self._login_stamp()
 
     def account_label(self) -> str:
         """The account the server is signed in with, as the card names it; '' when it is signed out."""
@@ -1020,6 +1119,7 @@ class Connector:
         self.turn_limit = self.turn_unauth = None
         self.auth_note = ""
         for attempt in (1, 2):
+            self.turn_login = None      # set by open_turn's last sign-in check, for a refusal of that login
             try:
                 turn = self.open_turn(headers, caps, prompt)
             except IntegrationsUnknown as e:
@@ -1062,7 +1162,10 @@ class Connector:
         sent, _ = agent_card.reply_words(task_text or "")
         if agent_card.owner_may_act(sent) is None and self.accounts.usable():
             try:
-                card = self.accounts.card("pending", SIGNED_OUT, ask=True, signed_out=True)
+                # The refused login may already be replaced (a switch while the turn ran): the card then
+                # says what the login now on disk is.
+                text, refused = (SIGNED_OUT, True) if self.login_refused() else self.accounts.status()
+                card = self.accounts.card("pending", text, ask=True, signed_out=refused)
                 self.accounts.say(sent.get("channel_id"), card, result_path)
                 return "signed-out-card"
             except Exception as e:  # noqa: BLE001 - the line below still tells the owner
@@ -1098,8 +1201,11 @@ class Connector:
                 staged = stage_own_attachments(headers, self.scratch_cwd, getattr(self.args, "media_root", None))
                 turn_prompt = with_staged_paths(prompt, staged)
             turn = turn_prompt, self.turn_model(caps), self.turn_cwd(caps)
+            # Read before the last check: a login written after it is never taken for the one sent on.
+            login = self._login_stamp()
             state = self.signin_ready()
             if state == CURRENT:
+                self.turn_login = login
                 self.signin_told = False
                 return turn
             if state == UNKNOWN or left <= 0:
@@ -1221,6 +1327,7 @@ class Connector:
         waiting = self.held().get("task", "")
         names = [n for n in os.listdir(self.args.inbox)
                  if n.startswith("task-") and n.endswith(".txt") and n[:-4] not in seen and n[:-4] != waiting
+                 and self.card_retry_at.get(n[:-4], 0) <= time.time()
                  and not os.path.exists(os.path.join(self.args.results, n))]
         names.sort(key=lambda n: (os.stat(os.path.join(self.args.inbox, n)).st_mtime, n))
         return names
@@ -1232,6 +1339,8 @@ class Connector:
         idle_since = time.time()
         metrics_path = os.path.join(self.args.state, "metrics.jsonl")
         held = {}       # task id -> (since when, its file's name, its tier): waiting for the selected account
+        if getattr(self.args, "state", None):
+            self.usage_at_start()       # a restart on an account out of usage: its first ask gets the limit's card
         while not stop_requested():
             try:    # a card's ledger entry, or a sign-in given up, never stops task service
                 connector_cards.absorb(self.args.bridge_state, self.root)
@@ -1291,7 +1400,14 @@ class Connector:
                 idle_since = time.time()
                 continue
             result_path = os.path.join(self.args.results, name)
-            carded = self.card_task(task_id, headers, path, result_path)
+            try:
+                carded = self.card_task(task_id, headers, path, result_path)
+            except card_desk.Undelivered as e:
+                # Never Codex's, never done: served again after CARD_RETRY_S.
+                seen.discard(task_id)
+                self.card_retry_at[task_id] = time.time() + CARD_RETRY_S
+                log("card line not written, retrying in %ss ->" % CARD_RETRY_S, task_id, str(e))
+                continue
             if carded:
                 # The owner picked in the DM the waiting message came in: it is answered next, on the pick.
                 if carded["card"] in PICKED and headers.get("channel_id") == self.held().get("room"):
@@ -1316,11 +1432,14 @@ class Connector:
             t_sent = time.time()
             status, text, err = self.run_task(headers, prompt, policy.capabilities)
             t_done = time.time()
-            # Out of usage: the owner is told once, by the account card; the card is the notice, so the room
+            # Out of usage: the owner is told by the account card, on each message; the card is the notice, so the room
             # gets no error line while it is out (or the limit's own words when no card could be sent).
             limit = self.turn_limit if status != "completed" else None
             signed_out = status != "completed" and self.turn_unauth is not None
-            quota = self.quota_hit(limit) if limit is not None else (self.quota.cleared() if status == "completed" else "")
+            if signed_out or status == "completed":
+                self.note_login_refused(signed_out)
+            quota = self.quota_hit(limit, task_id, task_text) if limit is not None else (
+                self.quota.cleared() if status == "completed" else "")
             if self.view:
                 self.view.done(status)
             if status == WAITING or (status == NOT_READY and self.signin_told):
@@ -1334,8 +1453,10 @@ class Connector:
                 self.signin_told = True
             out = self.result_body(status, text, err)
             if limit is not None:
-                out = LIMITED_NO_SEND if self.quota.limited() else quoted(quota_notice.words(
+                out = LIMITED_NO_SEND if self.quota.limited() or self.quota.answered(task_id) else quoted(quota_notice.words(
                     "Codex", quota_notice.reset_from_text(limit.get("message") if isinstance(limit, dict) else ""), ""))
+                if policy.kind != OWNER and out == LIMITED_NO_SEND:
+                    out = quoted(LIMITED_FOR_OTHERS) + "\n"      # anyone else who asked is told why there is no answer
             elif signed_out and self.turn_worked:
                 out = out.rstrip("\n") + "\n\n" + quoted(SIGNED_OUT_ELSEWHERE).strip()
             # The account's refusal is not the model's failure: no pick is called failed over it.
