@@ -157,6 +157,7 @@ class TestRestartSafety(unittest.TestCase):
                 mock.patch.object(mod, "WORKSPACE_DIR", Path(td)), \
                 mock.patch.object(mod, "run_all_checks", return_value=checks), \
                 mock.patch.object(mod, "fix_down_bridges", return_value=[]), \
+                mock.patch.object(mod, "stale_restart_allowed", return_value=(True, "")), \
                 mock.patch.object(mod, "fix_conversation_server", return_value="restarted (stale code)") as fix, \
                 mock.patch.object(mod.subprocess, "Popen"), \
                 mock.patch("time.sleep", lambda *_: None):

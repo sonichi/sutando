@@ -153,7 +153,8 @@ class OrphanSurfacesOnServicePaths(unittest.TestCase):
         hc._proc_lstarts = lambda pat: lstarts
         row = hc.check_port(port, "voice-agent", probe=True)
         calls = []
-        saved = (hc.fix_launchd, hc.run_all_checks, sys.argv)
+        saved = (hc.fix_launchd, hc.run_all_checks, sys.argv, hc.stale_restart_allowed)
+        hc.stale_restart_allowed = lambda repo: (True, "")
         hc.fix_launchd = lambda label: (calls.append(label), "restarted")[1]
         hc.run_all_checks = lambda: [row]
         sys.argv = ["health-check.py", "--fix"]
@@ -162,7 +163,7 @@ class OrphanSurfacesOnServicePaths(unittest.TestCase):
         except SystemExit:
             pass
         finally:
-            hc.fix_launchd, hc.run_all_checks, sys.argv = saved
+            hc.fix_launchd, hc.run_all_checks, sys.argv, hc.stale_restart_allowed = saved
         return row, calls
 
     def test_fix_boundary_probe_timeout_withholds_restart(self) -> None:

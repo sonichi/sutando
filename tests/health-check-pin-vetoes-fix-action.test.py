@@ -84,6 +84,8 @@ def run_fix(service, armed):
     row = hc.check_port(port, service, probe=True)
     calls = []
     orig_fix, orig_all, orig_argv = hc.fix_launchd, hc.run_all_checks, sys.argv
+    orig_guard = hc.stale_restart_allowed
+    hc.stale_restart_allowed = lambda repo: (True, "")
     hc.fix_launchd = lambda label: (calls.append(label), "restarted")[1]
     hc.run_all_checks = lambda: [row]
     sys.argv = ["health-check.py", "--fix"]
@@ -93,6 +95,7 @@ def run_fix(service, armed):
         pass
     finally:
         hc.fix_launchd, hc.run_all_checks, sys.argv = orig_fix, orig_all, orig_argv
+        hc.stale_restart_allowed = orig_guard
     return row, calls
 
 
