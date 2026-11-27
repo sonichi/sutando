@@ -22,7 +22,9 @@ Owner-facing cron output goes through a channel-bound result instead (a task
 with a destination header, or a proactive result routed to the owner's channel);
 `--allow-undeliverable` publishes anyway. A skip-marked body for such a task is
 published straight into the month's `results/archive/`: the same missing bridge is
-the one that would otherwise retire it, so a live copy stays in `results/` forever.
+the one that would otherwise retire it, so a live copy stays in `results/` forever. For the same
+reason its task file is moved into `tasks/archive/<YYYY-MM>/`, or the session watcher's startup
+sweep would re-emit the answered task and a silence monitor would read it as overdue.
 
 CLI exit codes: 0 published; 2 refused or misused (nothing written); 3 published, but the
 directory could not be synced afterwards (`PublishedUnconfirmed`), so the body is visible and a
@@ -38,7 +40,7 @@ from pathlib import Path
 
 __all__ = ["STAGED_SUFFIX", "PublishedUnconfirmed", "EXIT_PUBLISHED_UNCONFIRMED", "stage_text",
            "is_staged_for", "publish_staged", "publish_text", "undeliverable_reason", "retired_path",
-           "result_labels_for", "main"]
+           "retire_task_file", "result_labels_for", "main"]
 
 STAGED_SUFFIX = ".tmp"
 EXIT_PUBLISHED_UNCONFIRMED = 3
@@ -267,6 +269,30 @@ def retired_path(path: str | Path, text: str) -> Path | None:
     return dest
 
 
+def retire_task_file(path: str | Path, log=print) -> bool:
+    """Move the task file behind an unrouted cron result published for `path` into `tasks/archive/<YYYY-MM>/`.
+
+    A skip-marked body is archived unsent, so no bridge reads it and none archives its task either;
+    left in `tasks/` the task reads as unanswered. True when the file left the live queue. False when
+    there was nothing to move (task already archived, or routed) or the move failed, which is logged:
+    the result is published by then, so a lingering task file must not fail the command."""
+    task_id = _unrouted_cron_task(path)
+    if task_id is None:
+        return False
+    _, _, archive, wsd = _helpers()
+    try:
+        workspace = wsd.resolve_workspace(migrate=False).resolve()
+        home = _task_home(task_id, workspace)
+        src = archive.find_task_file(home["tasks"], task_id)
+        if src is None:
+            return False
+        return archive.archive_file(src, "tasks", task_id, tasks_dir=Path(home["tasks"]) / "archive",
+                                    results_dir=Path(home["results"]) / "archive", log=log)
+    except OSError as exc:
+        log(f"result_publish: warning: {task_id}'s task file stays in tasks/: {exc}")
+        return False
+
+
 def _labels_module():
     try:
         from . import result_labels
@@ -365,6 +391,7 @@ def _main(argv: list[str]) -> int:
     if dest is not None:
         # Nothing delivers a retired body, so it carries no Activity labels.
         publish_text(dest, text)
+        retire_task_file(path, log=lambda m: print(m, file=sys.stderr))
         print(f"result_publish: published {Path(path).name} to {dest.parent} instead of results/: "
               "a cron task with no channel_id or chat_id has no bridge, so nothing would retire "
               "this skipped body from the live directory")
