@@ -620,7 +620,8 @@ class Connector:
                                               self.accounts.quota_card, self.accounts.using, log,
                                               note=lambda text: self.accounts.card("pending", text))
         self.desk = card_desk.Desk(self.root, card_desk.led(publish, self.models.unsaid, quoted), quoted,
-                                   [self.models, self.accounts], self.limit_first)
+                                   [self.models, self.accounts], self.limit_first,
+                                   lambda: self.quota.says_in_room())
         # What a person opening this agent's terminal panel follows (`ag2-sparrow-antigravity-local view`).
         # Written off the ACP reader thread, which also answers permission requests.
         self.view = live_view.Writer(live_view.path_of(self.root), background=True)

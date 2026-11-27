@@ -213,7 +213,8 @@ def desk(root, cfg: dict, publish) -> card_desk.Desk:
     from . import account_card, quota_card
     return card_desk.Desk(root, publish, quoted, [switcher(root, cfg, publish=publish)]
                           + account_card.cards(root, cfg, publish, log),
-                          lambda sent, result_file: quota_card.asked(root, cfg, sent, result_file, publish, log))
+                          lambda sent, result_file: quota_card.asked(root, cfg, sent, result_file, publish, log),
+                          lambda: quota_card.asked_in_room(root))
 
 
 MARKED_DIR = "card-marks"

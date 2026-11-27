@@ -27,8 +27,10 @@ class Desk:
     `asked_for(words, sent, result_file)`, `offer(sent, result_file)`, `expired(sent, result_file)`
     and `usable()`."""
 
-    def __init__(self, root, publish, quoted, cards, limit=None):
+    def __init__(self, root, publish, quoted, cards, limit=None, room_limit=None):
         self.root, self.publish, self.quoted, self.cards = root, publish, quoted, list(cards)
+        # `room_limit()`: the limit in force as said in a shared room, '' for none; it answers before IN_ROOM.
+        self.room_limit = room_limit
         # `limit(sent, result_file)`: out of usage, the owner's ask for any card is answered by the limit's
         # card first; it returns what it did, '' when no limit is in force. A tap still acts.
         self.limit = limit
@@ -102,6 +104,13 @@ class Desk:
             named = getattr(card, "named_in", None)
             asks = getattr(card, "asks", None)
             if ask.lower() == card.ASK or (named and named(said)) or (asks and asks(said)):
+                try:
+                    out = (self.room_limit() if self.room_limit else "") or ""
+                except Exception:  # noqa: BLE001 - the room is told what it was before
+                    out = ""
+                if out:     # out of usage: the limit is the answer, here too
+                    self.publish(result_file, self.quoted(out) + "\n")
+                    return "quota-in-room"
                 self.publish(result_file, self.quoted(IN_ROOM_ZH if _CJK.search(said) else IN_ROOM) + "\n")
                 return "card-in-room"
         return ""

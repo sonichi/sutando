@@ -157,6 +157,10 @@ class QuotaNotice:
             return ""
         return words(self.name, str(rec.get("reset") or ""), "")
 
+    def says_in_room(self) -> str:
+        """`says`, in the words for a shared room."""
+        return room_words(self.name, str(self.load().get("reset") or "")) if self.says() else ""
+
     def cleared(self) -> str:
         """The runtime answered: the limit is over, and a later one is a new card."""
         if not self.load().get("since"):

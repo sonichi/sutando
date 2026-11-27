@@ -344,7 +344,7 @@ def _tell_tasks(root, cfg: dict, bridge: str, limited: list, text: str, log, rec
         if card is None:
             card = account_card.AccountCard(root, cfg, lambda result_file, body: None, log)
             said = _card_words(card, limited, text, log)
-            rec = dict(rec, said=said)
+            rec = dict(rec, said=said, said_room=room_words(text))
         # In a room that is not the owner's DM the card names no account and switches none.
         built = (account_switch.limited(card.card("pending", said, ask=True)) if in_dm else
                  card.card("pending", room_words(text)))
@@ -420,6 +420,12 @@ def asked(root, cfg: dict, sent, result_file, publish, log) -> str:
     return "quota-card-asked"
 
 
+def asked_in_room(root) -> str:
+    """The limit in force as said in a shared room, '' when none is."""
+    rec = load(root)
+    return str(rec.get("said_room") or "") if rec.get("since") and rec.get("gone") is None else ""
+
+
 def _tell_incident(root, cfg: dict, bridge: str, limited: list, text: str, log, rec: dict, at: float) -> str:
     """The one unasked card of the incident, in the owner's DM."""
     if not rec.get("told") and not rec.get("qid") and rec.get("covers"):
@@ -466,7 +472,7 @@ def _tell_incident(root, cfg: dict, bridge: str, limited: list, text: str, log, 
     if not card_desk.usable(bridge):
         return "quota-not-posted"
     card = account_card.AccountCard(root, cfg, lambda result_file, body: None, log)
-    rec = dict(rec, said=_card_words(card, limited, text, log))
+    rec = dict(rec, said=_card_words(card, limited, text, log), said_room=room_words(text))
     built = account_switch.limited(card.card("pending", rec["said"], ask=True))
     try:
         qid = connector_cards.queue(bridge, to, *built, key=rec["key"], at_ns=rec["at"], again=bool(rec.get("again")))

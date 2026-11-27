@@ -529,8 +529,10 @@ class LimitMenu(NoticeBase):
             self.task("task-ask%d" % n, ask)
             self.assertEqual(model_card.card_matter(self.root, "task-ask%d" % n, self.cfg)[0], "quota-card-asked", ask)
             self.assertIn("LIMIT WORDS", self.queued()[-1]["card"]["text"])
+        self.assertEqual(quota_card.asked_in_room(self.root), there["card"]["text"], "a room is told the same words")
         quota_card.save(self.root, {})
         self.assertEqual(quota_card.asked(self.root, self.cfg, {"channel_id": DM}, "r.txt", None, None), "")
+        self.assertEqual(quota_card.asked_in_room(self.root), "")
 
     def test_a_task_card_whose_send_was_unsure_is_queued_again_under_its_own_id(self):
         quota_card.remember_room(self.root, DM)
