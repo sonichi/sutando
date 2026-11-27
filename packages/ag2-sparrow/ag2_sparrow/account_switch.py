@@ -7,7 +7,8 @@ in words (/account, the card's mark) is a new card; a sign-in that ends with no 
 
 The connector supplies the runtime's part: `read()` names the account in use ('' when signed out),
 `begin()` starts a sign-in and gives its id and page, `cancel(id)` gives one up, `opener(url)` shows the
-page on this computer. Nothing here sees a credential; what is kept, in `state/account.json`, is the
+page on this computer. A connector may also set `remote` (its "Add account" and "Sign out", a sign-in the
+owner finishes on another device), which then answers those taps. Nothing here sees a credential; what is kept, in `state/account.json`, is the
 pending sign-in's id, the room it was asked in and when.
 """
 from __future__ import annotations
@@ -102,6 +103,9 @@ class AccountSwitch:
 
     def __init__(self, state_dir, bridge_state, name, publish, quoted, log, read, begin, cancel, opener, runtime="",
                  lapsed=None):
+        # `remote`: a connector's sign-in the owner finishes on another device ("Add account", "Sign out"),
+        # set by that connector after it makes the card; None offers neither.
+        self.remote = None
         self.state_dir, self.bridge_state, self.name, self.runtime = state_dir, bridge_state, name, runtime
         # `lapsed()`: the runtime itself refused this login (unauthorized even after a restart), not merely read
         # no account; asked again on every card, so an earlier answer is never carried into a later one.
@@ -165,6 +169,9 @@ class AccountSwitch:
         if ask:
             buttons.append(agent_card.button("Switch account", "reply", reply="Switch account",
                                              command=agent_card.reply("account", "agent", "switch")))
+            if self.remote is not None:
+                buttons.append(agent_card.button("Add account", "reply", reply="Add account",
+                                                 command=agent_card.reply("account", "agent", "add")))
         if url:
             buttons.append(agent_card.button("Open sign-in page", "url", url=url))
         built = agent_card.build(CARD if ask else NOTE, state, title="Account", body="Account of %s" % self.name,
@@ -201,12 +208,16 @@ class AccountSwitch:
         is checked, and its card built, before anything is opened or kept: a page that is not a plain
         https address is given up at once, so a retry cannot open a browser again and again."""
         room, tapped = str(sent.get("channel_id") or ""), card_desk.tapped_event(sent)
+        if self.remote is not None and verb in ("add", "use", "discard", "signout"):
+            return self.remote.tapped(verb, sent, result_file)
         if verb != "switch":
             self.publish(result_file, self.quoted("I couldn't match that button. Send /account for a new card.") + "\n")
             return "account-unknown"
         waiting = self.pending()
         if waiting:
             self.give_up(waiting)
+        if self.remote is not None:
+            self.remote.stop()      # one sign-in at a time: a device-code one still waiting ends
         before = self.using()       # read now: the sign-in may change it before the card is built
         try:
             started = self.begin()
