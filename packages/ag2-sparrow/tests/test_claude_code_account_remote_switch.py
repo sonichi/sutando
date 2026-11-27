@@ -254,15 +254,15 @@ class Tap(Remote):
         self.assertIn(ac.UNMATCHED, said[0])
         self.assertFalse(self.request().exists())
 
-    def use_directly(self, **over):
+    def use_directly(self, event="$own", **over):
         self.configure(BRIDGE_STATE_DIR=str(self.bridge), AGENT_ID=AGENT, **over)
         card = ac.AccountCard(self.root, self.cfg(), lambda *a: None, print)
         _, issued = connector_cards._core()
         built = card.card("pending", "x", ask=True)[1]
         built["buttons"].insert(0, {"label": "Use " + A, "kind": "reply", "reply": "Use " + A,
                                     "command": "card:account:agent:" + ac.saved_key(A)})
-        issued.record(Path(self.root), "$own", built, room=DM, lane="")
-        return card.tapped(ac.saved_key(A), {"channel_id": DM, "reply_to_event": "$own"}, None)
+        issued.record(Path(self.root), event, built, room=DM, lane="")
+        return card.tapped(ac.saved_key(A), {"channel_id": DM, "reply_to_event": event}, None)
 
     def test_no_config_dir_of_its_own_or_the_cores_is_refused_in_one_line(self):
         fallback = ac.app_data_dirs({})[0]
@@ -286,6 +286,23 @@ class Tap(Remote):
             with self.assertRaises(OSError):
                 cc.other_agents_dirs(cc.LOCAL, strict=True)
             self.assertEqual(cc.other_agents_dirs(cc.LOCAL), [], "the sign-in's own reading is as before")
+
+    def test_a_peer_config_that_cannot_be_read_or_parsed_refuses_the_switch(self):
+        from ag2_sparrow.adapters.claude_code import cli as cc
+        root = cc.cm.config_root()
+        for name, make in (("peer-dir.conf", lambda p: p.mkdir(parents=True)),
+                           ("peer-bad.conf", lambda p: p.write_text("CLAUDE_CONFIG_DIR='unterminated\n"))):
+            peer = root / "peers" / name
+            peer.parent.mkdir(parents=True, exist_ok=True)
+            make(peer)
+            self.assertEqual([b["label"] for b in self.posted("$p" + name)["buttons"]], ["Switch account"], name)
+            self.assertEqual(self.use_directly("$u" + name, CLAUDE_CONFIG_DIR=str(self.config)), "account-refused", name)
+            self.assertEqual(self.queued()[-1]["card"]["text"], "Could not switch: " + ac.OTHERS_UNKNOWN)
+            self.assertFalse(self.request().exists())
+            self.assertEqual(cc.other_agents_dirs(cc.LOCAL), [], "other callers read leniently, as before")
+            (peer.rmdir() if peer.is_dir() else peer.unlink())
+        (root / "peers" / "peer.conf").write_text("CLAUDE_CONFIG_DIR=%s\n" % (self.home / "elsewhere"))
+        self.assertEqual(cc.other_agents_dirs(cc.LOCAL, strict=True), [str(self.home / "elsewhere")])
 
     def test_an_account_no_longer_saved_and_a_request_that_cannot_be_written(self):
         self.index(self.appdata, {})
@@ -474,6 +491,27 @@ class Watch(Remote):
             self.assertEqual(rm.settle_late(self.root), [], "a receipt that turns up unreadable waits")
         with mock.patch.object(rm, "receive", side_effect=[None, rm.RETRY, None, None]):
             self.assertEqual(rm.watch(self.root, nonce, sleep=lambda s: None), rm.UNTOLD)
+
+    def test_a_receipt_with_its_nonce_but_not_the_contracts_shape_is_said_uncertain(self):
+        n = "88888888-8888-4888-8888-888888888888"
+        bad = ({}, {"ok": "yes", "label": A}, {"ok": None}, {"ok": True}, {"ok": True, "label": 5},
+               {"ok": True, "label": " "}, {"ok": True, "label": A, "verified": "no"},
+               {"ok": False, "verified": 1}, {"unknown": "yes", "ok": False}, {"unknown": False})
+        for data in bad:
+            self.assertEqual(rm._parsed(json.dumps(dict(data, nonce=n)), n), {"nonce": n, "unreadable": True}, data)
+        good = ({"ok": True, "label": A}, {"ok": True, "label": A, "verified": False}, {"ok": False},
+                {"ok": False, "error": "locked"}, {"unknown": True}, {"unknown": True, "ok": False, "error": "x"},
+                {"unknown": False, "ok": False})
+        for data in good:
+            self.assertNotIn("unreadable", rm._parsed(json.dumps(dict(data, nonce=n)), n), data)
+        self.assertEqual(rm.told(rm._parsed(json.dumps({"nonce": n, "ok": True, "label": A}), n), A)[1],
+                         rm.UNVERIFIED % A, "an older app's success: usable, shown as not yet tried")
+        nonce = self.begun()
+        self.claim_it(nonce)
+        (self.config / (rm.RESULT % nonce)).write_text(json.dumps({"v": 2, "nonce": nonce, "label": A}))
+        (self.config / (rm.CLAIMED % nonce)).unlink()
+        said = rm.watch(self.root, nonce)
+        self.assertEqual(said, rm.UNREAD_ON % ac.account_switch.masked(SARAH), "no `ok`: never 'Could not switch'")
 
     def test_a_receipt_read_whole_but_not_an_answer_is_said_so(self):
         nonce = self.begun()

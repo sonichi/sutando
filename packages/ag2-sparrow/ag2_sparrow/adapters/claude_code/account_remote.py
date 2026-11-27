@@ -223,9 +223,24 @@ def _parsed(text, nonce: str) -> dict:
         data = json.loads(text) if text else None
     except ValueError:
         data = None
-    if not isinstance(data, dict) or data.get("nonce") != nonce:
+    if not isinstance(data, dict) or data.get("nonce") != nonce or not usable(data):
         return {"nonce": nonce, "unreadable": True}      # not an answer: how the switch ended is not known
     return {k: data.get(k) for k in ("nonce", "ok", "label", "error", "unknown", "verified") if k in data}
+
+
+def usable(data: dict) -> bool:
+    """Whether a receipt's answer has the contract's shape: `unknown`, when there, a bool, and true is an answer
+    by itself; else `ok` a bool, a success naming its account (`label`, a string), `verified` when there a bool.
+    A success without `verified` (an older app) is usable, and shown as not yet tried."""
+    if "unknown" in data and not isinstance(data["unknown"], bool):
+        return False
+    if data.get("unknown") is True:
+        return True
+    if not isinstance(data.get("ok"), bool):
+        return False
+    if "verified" in data and not isinstance(data["verified"], bool):
+        return False
+    return not data["ok"] or (isinstance(data.get("label"), str) and bool(data["label"].strip()))
 
 
 RETRY = "retry"     # receive(): a receipt there that could not be read or kept just now; both files stay
