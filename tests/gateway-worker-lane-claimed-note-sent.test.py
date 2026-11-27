@@ -136,8 +136,13 @@ def main() -> int:
         kept = sorted(p.name for p in (ws / "results").glob("proactive-*"))
         check(kept == [NOTE], f"d) the note is back under its own name for a later pass, got {kept}")
         # The shape is read from the signature: *args and unreadable ones take the body.
+        class NoSignature:      # a callable whose signature cannot be read
+            __signature__ = "not a signature"
+
+            def __call__(self, *a):
+                return True
         check(gb._takes_body(lambda path, text: True) and gb._takes_body(lambda *a: True)
-              and not gb._takes_body(lambda path: True) and gb._takes_body(print),
+              and not gb._takes_body(lambda path: True) and gb._takes_body(NoSignature()),
               "d) path-only, two-argument, *args and unreadable signatures are told apart")
     finally:
         L.is_worker_note_lane = saved_lane
