@@ -7,12 +7,20 @@
   d) the core's settings and newly trusted folders reach the worker on the next launch
   e) an entry the core gained is linked, one it lost is unlinked, a worker's real entry is kept
   f) a worker id that could leave the folder is refused
+  g) the core's file-backed sign-in never reaches a worker: only SHARED entries are linked, a stale
+     link to the core's .credentials.json is removed, a worker's own .credentials.json is kept
+  h) the worker's .claude.json is private (0600); a damaged one is refused, not replaced
+  i) the launcher keeps the core's folder only for a worker with no folder of its own; one whose
+     folder cannot be made ready is refused (bash-level, with the helper stubbed to fail)
 
 Run: python3 tests/worker-own-claude-folder.test.py
 """
 from __future__ import annotations
 
 import json
+import os
+import stat
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -96,8 +104,104 @@ def main() -> int:
         check(F.launch(core, bad) == core, f"f) {bad!r} starts in the core's folder")
     check(F.main(["x", "launch", str(core), WORKER]) == 0 and F.main(["x", "nope"]) == 2
           and F.main(["x", "ensure", str(core / "absent"), WORKER]) == 1, "f) the command line answers 0, 2 and 1")
+    file_auth_isolation()
+    private_account_file()
+    launcher_refuses_a_failed_folder()
     print("\n%d failure(s)" % len(FAILS) if FAILS else "\nall passed")
     return 1 if FAILS else 0
+
+
+def file_auth_isolation() -> None:
+    core = core_folder()
+    dummy = '{"claudeAiOauth": {"accessToken": "dummy-not-a-token"}}'
+    (core / ".credentials.json").write_text(dummy)
+    (core / ".credentials.source.json").write_text("{}")
+    (core / "statsig").mkdir()
+    own = F.ensure(core, WORKER)
+    names = {p.name for p in own.iterdir()}
+    check(".credentials.json" not in names and ".credentials.source.json" not in names,
+          f"g) the core's file-backed sign-in is neither linked nor copied, got {sorted(names)}")
+    check(not any(p.is_symlink() and p.name not in F.SHARED for p in own.iterdir()),
+          "g) only allowlisted entries are links")
+    check(not any(p.is_file() and not p.is_symlink() and p.read_text() == dummy for p in own.rglob("*")
+                  if not p.is_symlink()), "g) no file in the worker's folder carries the core's credential")
+    check("statsig" not in names and (own / "skills").is_symlink(), "g) an entry not in SHARED stays the core's alone")
+
+    os.symlink(core / ".credentials.json", own / ".credentials.json")      # an older version's link
+    os.symlink(core / ".credentials.source.json", own / "creds-alias")
+    F.launch(core, WORKER)
+    check(not os.path.lexists(own / ".credentials.json") and not os.path.lexists(own / "creds-alias"),
+          "g) a refresh removes a stale link to the core's credential file, under any name")
+    check((core / ".credentials.json").read_text() == dummy, "g) the core's own credential file is untouched")
+
+    (own / ".credentials.json").write_text('{"worker": "own"}')
+    F.launch(core, WORKER)
+    check(not (own / ".credentials.json").is_symlink()
+          and (own / ".credentials.json").read_text() == '{"worker": "own"}',
+          "g) the worker's own regular .credentials.json is kept across a refresh")
+
+
+def private_account_file() -> None:
+    core = core_folder()
+    own = F.ensure(core, WORKER)
+    mode = stat.S_IMODE((own / ".claude.json").stat().st_mode)
+    check(mode == 0o600, f"h) a new .claude.json is 0600, got {oct(mode)}")
+    os.chmod(own / ".claude.json", 0o644)
+    F.ensure(core, WORKER)
+    check(stat.S_IMODE((own / ".claude.json").stat().st_mode) == 0o600, "h) a refresh makes a 0644 one private again")
+    (own / ".claude.json").write_text("{not json")
+    try:
+        F.launch(core, WORKER)
+        check(False, "h) a damaged .claude.json is refused")
+    except ValueError as e:
+        check("move it aside" in str(e), f"h) a damaged .claude.json is refused with a fix, got {e}")
+    check((own / ".claude.json").read_text() == "{not json", "h) the damaged file is left as it was")
+    check(F.main(["x", "launch", str(core), WORKER]) == 1, "h) the command line answers 1 for it")
+    (own / ".claude.json").write_text("[]")
+    check(F.main(["x", "launch", str(core), WORKER]) == 1, "h) a .claude.json that is not an object is refused")
+    os.unlink(own / ".claude.json")
+    os.symlink(core / ".claude.json", own / ".claude.json")
+    F.launch(core, WORKER)
+    check(not (own / ".claude.json").is_symlink() and "oauthAccount" not in read(own / ".claude.json"),
+          "h) a .claude.json linked to the core's is replaced by the worker's own, without the core's account")
+    other = core.with_name(".claude-core-workers") / "w2"
+    other.parent.mkdir(exist_ok=True)
+    other.write_text("not a folder")
+    check(F.main(["x", "launch", str(core), "w2"]) == 1, "h) a worker path that is not a folder is a failure, not 'none'")
+
+
+def _resolve(core: Path, worker: str, py: str) -> "subprocess.CompletedProcess[str]":
+    lib = REPO / "skills" / "worker-pool" / "scripts" / "worker-claude-folder.sh"
+    return subprocess.run(["bash", "-c", '. "$1"; worker_claude_folder "$2" "$3" "$4" "$5"', "x",
+                           str(lib), str(REPO), py, str(core), worker], capture_output=True, text=True)
+
+
+def launcher_refuses_a_failed_folder() -> None:
+    core = core_folder()
+    stub = core.parent / "failing-python"
+    stub.write_text("#!/bin/sh\necho 'stub: refresh failed' >&2\nexit 1\n")
+    stub.chmod(0o755)
+    r = _resolve(core, WORKER, str(stub))
+    check(r.returncode == 0 and r.stdout.strip() == str(core),
+          f"i) no folder of its own + failing helper: the core's folder, got {r.returncode} {r.stdout!r}")
+    r = _resolve(core, WORKER, "")
+    check(r.returncode == 0 and r.stdout.strip() == str(core), "i) no folder of its own + no Python: the core's folder")
+    own = F.ensure(core, WORKER)
+    r = _resolve(core, WORKER, str(stub))
+    check(r.returncode == 1 and r.stdout == "", f"i) its own folder + failing helper: refused, got {r.returncode} {r.stdout!r}")
+    check("stub: refresh failed" in r.stderr and str(own) in r.stderr and "core's account" in r.stderr,
+          "i) the refusal says what failed and how to fix it")
+    r = _resolve(core, WORKER, "")
+    check(r.returncode == 1 and r.stdout == "", "i) its own folder + no Python to refresh it: refused")
+    r = _resolve(core, WORKER, sys.executable)
+    check(r.returncode == 0 and r.stdout.strip() == str(own), "i) its own folder + working helper: its own folder")
+    (own / ".claude.json").write_text("{damaged")
+    r = _resolve(core, WORKER, sys.executable)
+    check(r.returncode == 1 and "move it aside" in r.stderr, "i) a damaged .claude.json refuses the launch with the fix")
+    launcher = (REPO / "skills" / "worker-pool" / "scripts" / "launch-worker-session.sh").read_text()
+    block = launcher.split("worker_claude_folder \"$REPO\"", 1)[1].split("resolve_claude_settings_args", 1)[0]
+    check("worker-claude-folder.sh" in launcher and "exit 1" in block.split("fi", 1)[0],
+          "i) the launcher exits before launching when the folder is refused")
 
 
 if __name__ == "__main__":

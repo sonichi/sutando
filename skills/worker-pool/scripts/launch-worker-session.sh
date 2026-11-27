@@ -185,11 +185,16 @@ if [ -n "$WORKER_PY" ] && [ -n "${SUTANDO_WORKSPACE_DIR:-}" ]; then
   [ -n "$_own_model" ] && SESSION_ARGS+=(--model "$_own_model")
 fi
 # A worker given a Claude folder of its own starts in it, so its account and model are its own.
-# None made (the default), or the helper failing: the core's folder, as before.
-if [ -n "$WORKER_PY" ] && [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
-  _own_ccd="$("$WORKER_PY" "$REPO/skills/worker-pool/scripts/worker_claude_folder.py" launch \
-      "$CLAUDE_CONFIG_DIR" "${SUTANDO_WORKER_ID:-$SUTANDO_INSTANCE_ID}" 2>/dev/null)" || _own_ccd=""
-  if [ -n "$_own_ccd" ] && [ -d "$_own_ccd" ] && [ "$_own_ccd" != "$CLAUDE_CONFIG_DIR" ]; then
+# None made (the default): the core's folder, as before. One made that cannot be made ready: refuse,
+# never fall back to the core's folder and so the core's account.
+if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+  . "$REPO/skills/worker-pool/scripts/worker-claude-folder.sh"
+  if ! _own_ccd="$(worker_claude_folder "$REPO" "$WORKER_PY" "$CLAUDE_CONFIG_DIR" \
+      "${SUTANDO_WORKER_ID:-$SUTANDO_INSTANCE_ID}")"; then
+    echo "  ⚠ worker session $SESSION not started: its own Claude folder is not ready (see above)." >&2
+    exit 1
+  fi
+  if [ "${_own_ccd%/}" != "${CLAUDE_CONFIG_DIR%/}" ]; then
     export CLAUDE_CONFIG_DIR="$_own_ccd"
     echo "  ✓ CLAUDE_CONFIG_DIR=$_own_ccd (this worker's own)"
   fi

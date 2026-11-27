@@ -79,7 +79,7 @@ def _launch_argv(extra_env: dict, pgrep_stub: str = PGREP_STUB,
         shutil.copytree(REPO / "src", root / "src", symlinks=True)
         shutil.copytree(REPO / "scripts", root / "scripts", symlinks=True)
         (root / "skills" / "worker-pool" / "scripts").mkdir(parents=True)
-        for name in ("launch-worker-session.sh", "worker-mcp-credential.sh"):
+        for name in ("launch-worker-session.sh", "worker-mcp-credential.sh", "worker-claude-folder.sh"):
             shutil.copy2(REPO / "skills" / "worker-pool" / "scripts" / name,
                          root / "skills" / "worker-pool" / "scripts" / name)
         delivery_script = root / "skills" / "worker-pool" / "scripts" / "pool_delivery.py"
@@ -270,7 +270,7 @@ def _worker_env(extra_env: dict, td: Path) -> list[str]:
         shutil.copytree(REPO / "src", root / "src", symlinks=True)
         shutil.copytree(REPO / "scripts", root / "scripts", symlinks=True)
     (root / "skills" / "worker-pool" / "scripts").mkdir(parents=True, exist_ok=True)
-    for name in ("launch-worker-session.sh", "worker-mcp-credential.sh"):
+    for name in ("launch-worker-session.sh", "worker-mcp-credential.sh", "worker-claude-folder.sh"):
         shutil.copy2(REPO / "skills" / "worker-pool" / "scripts" / name,
                      root / "skills" / "worker-pool" / "scripts" / name)
     ws = td / "ws"; ws.mkdir(exist_ok=True)
