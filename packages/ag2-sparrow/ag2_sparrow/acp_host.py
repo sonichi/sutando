@@ -29,6 +29,7 @@ import uuid
 from pathlib import Path
 
 from . import agent_triggers
+from .bounded_file_read import read_regular_bytes
 from .acp_client import AUTH_REQUIRED, AcpError, AcpGone, AcpTimeout
 from .file_lock import locked_file
 from .local_task_protocol import parse_attachments
@@ -336,27 +337,76 @@ def quoted(text):
     return out if not delivery_markers(out) else "(withheld: the text carried a delivery marker)"
 
 
-def owner_text(text, cwd):
+def owner_text(text, cwd, stage=None):
     """`text` as the owner's turn publishes it: its delivery markers act, as a Claude Code or Codex result's
     do ([channel:], [thread], [reply:], [dm-only], [no-send]), except that an attach marker acts only for a
     regular file under the working directory, rewritten to that file's absolute resolved path (the bridge
     resolves a relative one against its own directory); any other is neutralised and said not attached.
-    Checked again by the guard: if any attach still names a file outside, the whole text is `quoted`."""
+    With `stage` (path -> (staged path, '') or (None, why)), the file is sent as the copy `stage` made, in a
+    folder the bridge already sends from (`stage_attachment`); a copy it refuses is said not attached.
+    Checked again by the guard: if any attach still names a file neither under the working directory nor
+    staged, the whole text is `quoted`."""
     text = text or ""
     code, spans = _code_lines(text), [(m.start(), m.end()) for m in _SPAN_RE.finditer(text)]
+    staged = set()
 
     def attach(m):
         if text.count("\n", 0, m.start()) in code or any(a <= m.start() < b for a, b in spans):
             return m.group(0)   # shown in code, never issued: left as written
         path = resolved(cwd, m.group(1).strip()) if m.group(1).strip() else None
-        if path and not at_or_above_home(cwd) and under(cwd, path) and os.path.isfile(path):
+        if not (path and not at_or_above_home(cwd) and under(cwd, path) and os.path.isfile(path)):
+            return neutralize_markers(m.group(0)) + " (not attached: only a file under the working directory is sent)"
+        if stage is None:
             return "[file: %s]" % path
-        return neutralize_markers(m.group(0)) + " (not attached: only a file under the working directory is sent)"
+        copy, why = stage(path)
+        if copy is None:
+            return neutralize_markers(m.group(0)) + " (not attached: %s)" % why
+        staged.add(copy)
+        return "[file: %s]" % copy
     out = _ATTACH_RE.sub(attach, text)
-    if any(a.kind == "attach" and not (under(cwd, a.value) and os.path.isfile(a.value))
+    if any(a.kind == "attach" and a.value not in staged and not (stage is None and under(cwd, a.value)
+                                                                and os.path.isfile(a.value))
            for a in delivery_markers(out)):
         return quoted(text)
     return out
+
+
+def stage_attachment(path, cwd, dest, max_bytes):
+    """(the 0600 copy of `path` made in a new 0700 folder of its own under `dest`, keeping its file name, '') or
+    (None, why): for an owner's attach that the bridge sends only from its results folder. Read through one
+    descriptor that does not follow a link, of a regular file still under `cwd` and at most `max_bytes`."""
+    def still_under(_info):
+        return "" if resolved(cwd, path) == path and under(cwd, path) else "it left the working directory"
+    data, why = read_regular_bytes(path, max_bytes, follow=False, verify=still_under)
+    if data is None:
+        return None, ("over %d MB" % (max_bytes // (1024 * 1024)) if why.startswith("over ") else why or "missing")
+    os.makedirs(dest, mode=0o700, exist_ok=True)
+    folder = tempfile.mkdtemp(dir=dest)
+    copy = os.path.join(folder, os.path.basename(path))
+    try:
+        _write_copy(copy, data, 0o600)
+    except OSError as e:
+        shutil.rmtree(folder, ignore_errors=True)
+        return None, "could not be copied (%s)" % (e.strerror or e)
+    return os.path.realpath(copy), ""
+
+
+def prune_staged(dest, max_age_s, now=None):
+    """Remove the folders `stage_attachment` made under `dest` whose last change is older than `max_age_s`: the
+    bridge sends a staged copy (or retries it) soon after the result is written and never removes it."""
+    now = time.time() if now is None else now
+    try:
+        names = os.listdir(dest)
+    except OSError:
+        return
+    for name in names:
+        folder = os.path.join(dest, name)
+        try:
+            st = os.lstat(folder)
+        except OSError:
+            continue
+        if stat.S_ISDIR(st.st_mode) and now - st.st_mtime > max_age_s:
+            shutil.rmtree(folder, ignore_errors=True)
 
 
 # ── the task's own attachments ───────────────────────────────────────────────
@@ -457,8 +507,8 @@ def _stage(folder, base, data, used):
         return name, copy
 
 
-def _write_copy(path, data):
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o400)
+def _write_copy(path, data, mode=0o400):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), mode)
     with os.fdopen(fd, "wb") as f:
         f.write(data)
 

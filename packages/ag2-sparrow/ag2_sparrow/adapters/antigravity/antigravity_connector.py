@@ -97,6 +97,10 @@ READ_ASK = "read_file(*)"
 ATTACHMENTS_DIR = "attachments"
 MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
 MAX_ATTACHMENTS = 16
+# Under results/, the bridge's one sendable folder: copies of the files the owner's turn attaches, one folder each,
+# removed a week after (the bridge sends, or retries, a result's files soon after it is written).
+SENT_FILES_DIR = ".sent-files"
+SENT_FILES_MAX_AGE_S = 7 * 24 * 3600
 _UNSAFE_NAME = re.compile(r"[^A-Za-z0-9._-]")
 # Who gets the AG2 Space MCP server as this agent (owners' rule, 2026-11-21): turn_policy's owner and attested
 # collaborator (Team) verdicts. Anyone else gets none and `mcp(*)` stays denied.
@@ -843,6 +847,12 @@ class Connector:
         tools = sspace_grant(headers, kind)
         return (lambda init: self.sspace_servers(init, tools)) if tools else None
 
+    def stage_sent_file(self, path):
+        """The owner's attach of `path` (a file under the working directory), copied to where the bridge sends it."""
+        dest = os.path.join(self.args.results, SENT_FILES_DIR)
+        acp_host.prune_staged(dest, SENT_FILES_MAX_AGE_S)
+        return acp_host.stage_attachment(path, self.args.cwd, dest, acp_host.MAX_MEDIA_BYTES)
+
     def answer_body(self, headers, status, text, detail, turn=None):
         """What Sparrow posts: the turn's own text, the owner's with its markers acting (`acp_host.owner_text`),
         anyone else's quoted so no delivery marker in it acts; NO_REPLY or a
@@ -856,7 +866,7 @@ class Connector:
                 return "[no-send] %s chose not to post\n" % self.name
             if said:
                 if headers.get("access_tier") == "owner":
-                    return acp_host.owner_text(said, self.args.cwd) + "\n"
+                    return acp_host.owner_text(said, self.args.cwd, self.stage_sent_file) + "\n"
                 return quoted(said) + "\n"
             if not message:
                 return "[no-send] %s handled the event without posting\n" % self.name

@@ -44,12 +44,12 @@ import os
 import sys
 from pathlib import Path
 
-from ._dirs import agent_workspace_dir as _agent_workspace_dir, result_dir as _result_dir
+from ._dirs import result_dir as _result_dir
 
 
 # Transport default: only the RESULT_DIR is sendable (where the agent writes
-# files to return), and an installed agent's own workspace (_dirs.agent_workspace_dir).
-# Any richer policy (sutando's notes/docs/etc.) is INJECTED by the embedding app via register_extra_roots() — the package ships no app-specific
+# files to return). Any richer policy (sutando's notes/docs/etc.) is INJECTED by
+# the embedding app via register_extra_roots() — the package ships no app-specific
 # paths.
 _BASE_ROOTS: tuple[str, ...] = (str(_result_dir()),)
 _EXTRA_ROOTS: list[str] = []
@@ -61,10 +61,7 @@ def register_extra_roots(*roots) -> None:
 
 
 def _allowed_roots() -> tuple[str, ...]:
-    # An installed agent's own workspace (the folder its connector's prompt names as sendable) is
-    # resolved per call: the bridge may start before the installer creates it.
-    workspace = _agent_workspace_dir()
-    return _BASE_ROOTS + tuple(_EXTRA_ROOTS) + ((str(workspace),) if workspace else ())
+    return _BASE_ROOTS + tuple(_EXTRA_ROOTS)
 
 # Prefix forms — files whose realpath starts with any of these strings
 # are deliverable. Covers temp-file artifacts the agent generates

@@ -17,6 +17,7 @@ import json
 import os
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1891,8 +1892,13 @@ class MediaAndMarkersTest(unittest.TestCase):
         self.w.serve()
         said = self.w.result("task-1")
         acts = parse_markers(said).actions
-        self.assertEqual([(a.kind, a.value) for a in acts],
-                         [("attach", os.path.realpath(self.w.cwd / "out.txt"))])
+        self.assertEqual([a.kind for a in acts], ["attach"])
+        # Sent as a 0600 copy under results/, the folder the bridge sends from, keeping its name.
+        staged = Path(acts[0].value)
+        results = os.path.realpath(self.w.root / "results" / gc.SENT_FILES_DIR)
+        self.assertEqual((staged.name, staged.parent.parent), ("out.txt", Path(results)))
+        self.assertEqual((staged.read_text(), stat.S_IMODE(staged.stat().st_mode)), ("made", 0o600))
+        self.assertEqual((self.w.cwd / "out.txt").read_text(), "made", "copied, not moved")
         self.assertIn("not attached: only a file under the working directory is sent", said)
 
     def test_owner_text_refuses_links_out_missing_files_and_leaves_code_alone(self):
