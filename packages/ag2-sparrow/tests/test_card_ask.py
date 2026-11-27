@@ -75,6 +75,19 @@ TABLE = (
 
 
 class Policy(unittest.TestCase):
+    def test_a_switch_is_told_from_a_question(self):
+        for said, switch in (("switch account", True), ("换模型", True), ("/account", True), ("change your model", True),
+                             ("which model", False), ("你在用哪个账号和模型", False), ("hi", False)):
+            self.assertEqual(card_ask.switches(said), switch, said)
+
+    def test_a_pick_named_in_words(self):
+        for said in ("switch to opus", "Switch to Claude Sonnet 4.5", "change the model to gemini 2.5 pro",
+                     "use opus please", "换成 sonnet", "切换到 gpt-5.1 吧", "use o3"):
+            self.assertTrue(card_ask.names_a_pick(said), said)
+        for said in ("switch to dark mode", "use claude to write this", "go to the store", "", None,
+                     "switch to opus " + "x" * card_ask.ASK_MAX):
+            self.assertFalse(card_ask.names_a_pick(said), said)
+
     def test_the_table(self):
         for said, cards in TABLE:
             with self.subTest(said=said):
@@ -127,10 +140,10 @@ class Desk(unittest.TestCase):
         self.desk = card_desk.Desk(str(self.tmp), lambda path, body: self.written.append(body), lambda s: s,
                                    [self.model] + self.accounts)
 
-    def task(self, said, tier="owner", kind="dm"):
+    def task(self, said, tier="owner", kind="dm", extra=""):
         path = self.tmp / "task.txt"
         path.write_text("id: task-1\nsource: ag2space\nchannel_id: !dm:s.space\nchannel_kind: %s\n"
-                        "user_id: @owner:s.space\naccess_tier: %s\ntask: %s\n" % (kind, tier, said))
+                        "user_id: @owner:s.space\n%saccess_tier: %s\ntask: %s\n" % (kind, extra, tier, said))
         return self.desk.task(str(path), str(self.tmp / "result.txt"))
 
     def offers(self):
@@ -161,9 +174,9 @@ class Desk(unittest.TestCase):
                 self.assertEqual(self.task(said), "")
         self.assertEqual((self.offers(), self.written), ((0, [0, 0]), []))
 
-    def test_anyone_else_or_another_account_goes_on_to_the_model(self):
-        self.assertEqual(self.task("你在用哪个账号和模型", tier="team"), "")
+    def test_another_account_goes_on_to_the_model(self):
         self.assertEqual(self.task("我的 GitHub 账号"), "")
+        self.assertEqual(self.task("我的 GitHub 账号", tier="team"), "")
         self.assertEqual(self.offers(), (0, [0, 0]))
         self.assertEqual(self.written, [])
 
@@ -179,13 +192,102 @@ class Desk(unittest.TestCase):
         self.assertEqual(self.offers(), (0, [0, 0]))
         self.assertEqual(self.by_card, [])
 
-    def test_in_a_room_anyone_else_asking_goes_on_to_the_model(self):
-        # A guest's or team member's "what model are you using" is not the owner's switch: no line, no card.
+    def answered(self, said, tier, kind="room", extra=""):
+        self.written.clear()
+        self.assertEqual(self.task(said, tier=tier, kind=kind, extra=extra), "card-not-owner", said)
+        line, = self.written
+        return line.rstrip("\n")
+
+    def test_team_asking_which_model_is_told_its_name_only(self):
+        # Owner 2026-11-26: a team member (a collaborator too) asking which model is told its name, in their
+        # language, by the code, never the model; nothing about the account.
+        self.model.current_name = lambda: "Claude Sonnet 4.5"
+        for said, extra, line in (("what model are you using?", "", "I'm running on Claude Sonnet 4.5."),
+                                  ("你在用什么模型", "collaborator: true\n", "我现在用的模型是 Claude Sonnet 4.5。"),
+                                  ("which account and model are you on?", "", "I'm running on Claude Sonnet 4.5."),
+                                  ("你在用哪个账号和模型", "", "我现在用的模型是 Claude Sonnet 4.5。")):
+            with self.subTest(said=said):
+                self.assertEqual(self.answered(said, "team", extra=extra), line)
+        self.assertEqual(self.answered("what model are you using?", "team", kind="dm"),
+                         "I'm running on Claude Sonnet 4.5.", "in a DM too")
+        self.assertEqual((self.offers(), self.by_card), ((0, [0, 0]), []))
+
+    def test_team_with_no_model_known_is_told_so_without_a_guess(self):
+        self.model.current_name = lambda: ""
+        self.assertEqual(self.answered("what model are you using?", "team"), card_desk.MODEL_UNKNOWN)
+        self.assertEqual(self.answered("你在用什么模型", "team"), card_desk.MODEL_UNKNOWN_ZH)
+
+        def broken():
+            raise RuntimeError("unreadable")
+        self.model.current_name = broken
+        self.assertEqual(self.answered("which model", "team"), card_desk.MODEL_UNKNOWN)
+        del self.model.current_name     # a card that cannot say at all
+        self.assertEqual(self.answered("which model", "team"), card_desk.MODEL_UNKNOWN)
+
+    def test_team_asking_about_the_account_is_told_it_is_only_for_the_owner(self):
+        self.model.current_name = lambda: "Opus"
+        for said, line in (("which account are you on?", card_desk.ACCOUNT_OWNER_ONLY),
+                           ("who are you signed in as?", card_desk.ACCOUNT_OWNER_ONLY),
+                           ("你在用什么账号", card_desk.ACCOUNT_OWNER_ONLY_ZH)):
+            for kind in ("room", "dm"):
+                with self.subTest(said=said, kind=kind):
+                    self.assertEqual(self.answered(said, "team", kind=kind), line)
+
+    def test_a_switch_by_anyone_but_the_owner_switches_nothing(self):
+        self.model.current_name = lambda: "Opus"
+        picked = []
+        self.model.named_in = lambda words: "haiku" if "haiku" in words else ""
+        self.model.asked_for = lambda *a: picked.append(a) or "model-picked"
+        for said, team, guest in (("/model", card_desk.SWITCH_OWNER_ONLY, card_desk.ASK_OWNER),
+                                  ("/account opus", card_desk.SWITCH_OWNER_ONLY, card_desk.ASK_OWNER),
+                                  ("switch account", card_desk.SWITCH_OWNER_ONLY, card_desk.ASK_OWNER),
+                                  ("switch to haiku", card_desk.SWITCH_OWNER_ONLY, card_desk.ASK_OWNER),
+                                  ("switch to opus", card_desk.SWITCH_OWNER_ONLY, card_desk.ASK_OWNER),
+                                  ("换成 sonnet", card_desk.SWITCH_OWNER_ONLY_ZH, card_desk.ASK_OWNER_ZH),
+                                  ("换模型", card_desk.SWITCH_OWNER_ONLY_ZH, card_desk.ASK_OWNER_ZH)):
+            with self.subTest(said=said):
+                self.assertEqual(self.answered(said, "team"), team)
+                self.assertEqual(self.answered(said, "guest"), guest)
+        self.assertEqual((picked, self.offers(), self.by_card), ([], (0, [0, 0]), []))
+
+    def test_a_guest_is_told_to_ask_the_owner_and_nothing_else(self):
+        self.model.current_name = lambda: "Claude Sonnet 4.5"
+        for said, line in (("what model are you using?", card_desk.ASK_OWNER),
+                           ("which account are you on?", card_desk.ASK_OWNER),
+                           ("你在用哪个账号和模型", card_desk.ASK_OWNER_ZH)):
+            for kind in ("room", "dm"):
+                with self.subTest(said=said, kind=kind):
+                    self.assertEqual(self.answered(said, "guest", kind=kind), line)
+                    self.assertNotIn("Sonnet", line)
+
+    def test_no_reply_to_anyone_but_the_owner_names_the_account(self):
+        # Whatever the account card would say (who is signed in, the email, the plan): never in these lines.
+        self.model.current_name = lambda: "Opus"
+        for card in self.accounts:
+            card.using = lambda: "susan@example.com (Max plan)"
         for tier in ("team", "guest"):
-            for said in ("你在用哪个账号和模型", "switch account", "/model", "what model are you using?"):
-                with self.subTest(tier=tier, said=said):
-                    self.assertEqual(self.task(said, tier=tier, kind="room"), "")
+            for said in ("which account are you on?", "你在用哪个账号和模型", "/account", "switch account",
+                         "who are you signed in as?", "what's your email?"):
+                self.written.clear()
+                self.task(said, tier=tier, kind="room")
+                for line in self.written:
+                    self.assertNotIn("@", line, (tier, said))
+                    self.assertNotIn("Max", line, (tier, said))
+
+    def test_anyone_else_s_other_words_still_reach_the_model(self):
+        for tier in ("team", "guest"):
+            for said in ("hi there", "Can you model this?", "which model is best for coding?", "use claude to write this",
+                         "switch to dark mode", "我的 GitHub 账号", "create an account on GitHub"):
+                for kind in ("room", "dm"):
+                    with self.subTest(tier=tier, said=said, kind=kind):
+                        self.assertEqual(self.task(said, tier=tier, kind=kind), "")
         self.assertEqual((self.offers(), self.written, self.by_card), ((0, [0, 0]), [], []))
+
+    def test_an_ambient_or_unknown_tier_is_left_as_it_was(self):
+        for tier in ("ambient", "", "nobody"):
+            with self.subTest(tier=tier):
+                self.assertEqual(self.task("what model are you using?", tier=tier, kind="room"), "")
+        self.assertEqual(self.written, [])
 
     def test_a_pick_named_in_a_room_gets_the_line_and_picks_nothing(self):
         self.model.named_in = lambda words: "haiku" if "haiku" in words else ""
@@ -200,6 +302,19 @@ class Desk(unittest.TestCase):
             with self.subTest(said=said):
                 self.assertEqual(self.task(said, kind="room"), "")
         self.assertEqual((self.offers(), self.written), ((0, [0, 0]), []))
+
+    def test_the_model_s_name_is_read_as_the_card_names_it(self):
+        state = self.tmp / "state"
+        state.mkdir()
+        log = lambda *a: None  # noqa: E731
+        codex = model_switch.ModelSwitch(str(state), str(self.tmp), None, "Codex", None, lambda s: s, log)
+        self.assertEqual(codex.current_name(), "", "no model known yet: not guessed")
+        codex.seen([("gpt-5.1", "GPT-5.1"), ("o3", "o3")], "gpt-5.1")
+        self.assertEqual(codex.current_name(), "GPT-5.1")
+        claude = model_card.ClaudeModels(str(state), str(self.tmp), None, "Claude Code", None, lambda s: s, log,
+                                         allowed=model_card.ALLOWED)
+        claude.seen(model_card.CHOICES, "sonnet[1m]")
+        self.assertEqual(claude.current_name(), "Sonnet (1M context)")
 
     def test_a_task_naming_no_channel_kind_is_not_a_room(self):
         self.assertFalse(card_desk.in_room({"channel_kind": ""}))
