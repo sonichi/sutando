@@ -569,16 +569,67 @@ class EventChannelWiringTests(unittest.TestCase):
     def test_set_owner_and_room_wires_decisions_then_hitl_then_taskify_and_posts_cards(self):
         from ag2_sparrow.event_consumer import TaskifyHandler
         from ag2_sparrow.human_action import DecisionHandler
+        from ag2_sparrow.outcome_reactions import OutcomeReactionHandler
         os.environ["SPARROW_HA_OWNER"] = OWNER
         os.environ["SPARROW_HA_ROOM"] = "!cards:ag2.space"
         handler, posters = self._wire()
         chain = self._chain(handler)
         self.assertEqual([type(h) for h in chain],
-                         [DecisionHandler, rgb._ClaudeLocalClicks, rgb._HitlClicks, TaskifyHandler])
+                         [DecisionHandler, rgb._ClaudeLocalClicks, rgb._HitlClicks, OutcomeReactionHandler,
+                          TaskifyHandler])
         self.assertEqual(chain[0]._owner, OWNER, "decisions are judged against the configured owner")
         self.assertEqual(chain[1].owner, OWNER, "claude-local clicks keep the configured owner")
         self.assertEqual(rgb._hitl_owner(), OWNER, "the HITL claimant resolves the same owner")
         self.assertEqual(posters, ["!cards:ag2.space"])
+
+    def test_real_bridge_chain_routes_cards_hitl_and_outcomes_without_tasks(self):
+        from ag2_sparrow import correlation_log, event_consumer, event_inbox, human_action
+        os.environ["SPARROW_HA_OWNER"] = OWNER
+        os.environ.pop("SPARROW_HA_ROOM", None)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state, tasks = root / "state", root / "tasks"
+            state.mkdir()
+            tasks.mkdir()
+            store = human_action.ActionStore(str(state / "human-actions"))
+            Path(store.dir).mkdir()
+            store.update({"action_id": "ha_wiring", "status": "pending",
+                          "card_event_id": "$approval", "questions": [
+                              {"question": "Proceed?", "options": [{"label": "Yes"}]}]})
+            mgr = HitlManager(HitlStore(default_store(root)))
+            req = mgr.create(HumanRequirement(
+                kind="permission", runtime="claude", message="Run fixture",
+                guard="hook:wiring", device={"id": "fixture", "name": "fixture"},
+                actions=[Action(id="allow", kind="allow_once", label="Allow")]))
+            def reaction(eid, target, key):
+                return {"type": "reaction.added", "event_id": eid, "room_id": "!fixture:s.space",
+                        "actor_id": OWNER, "reactor_id": OWNER, "reactor_relation": "owner",
+                        "target_event_id": target, "key": key, "ts": 1,
+                        "task_id": "task-1234567890abcdef12",
+                        "content": {"m.relates_to": {"event_id": target, "key": key}}}
+            card = reaction("$card-click", "$approval", "1️⃣")
+            click = reaction("$hitl-click", "$hitl", "👍")
+            click["type"] = "message.created"
+            click["content"]["space.ag2.hitl.action"] = {
+                "hitl_id": req.id, "expected_revision": req.revision,
+                "action_id": "allow", "guard": req.guard}
+            own = reaction("$own-reaction", "$agent-reply", "❤️")
+            with mock.patch.object(rgb, "_STATE", state), mock.patch.object(rgb, "TASKS_DIR", tasks), \
+                    mock.patch.object(rgb, "_req", side_effect=AssertionError("unexpected network")):
+                handler, _ = self._wire()
+                inbox = event_inbox.EventInbox(str(state / "fixture-inbox.db"))
+                for cursor, ev in enumerate((card, click, own), 1):
+                    ev["cursor"] = cursor
+                    self.assertTrue(inbox.insert(ev))
+                result = event_consumer.EventConsumer(inbox, handler).drain()
+            self.assertEqual(result["consumed"], 3)
+            self.assertEqual(inbox.unconsumed(), [])
+            self.assertEqual(store.get("ha_wiring")["decision"]["answers"], {"Proceed?": "Yes"})
+            self.assertEqual(mgr.get(req.id).chosen_action, "allow")
+            signals = correlation_log.read("outcome_signal", path=state / "correlation.jsonl")
+            self.assertEqual([s["source_event_id"] for s in signals], ["$own-reaction"])
+            self.assertEqual(signals[0]["task_id"], own["task_id"])
+            self.assertEqual(list(tasks.iterdir()), [])
 
     def test_set_owner_without_a_room_posts_no_cards(self):
         from ag2_sparrow.human_action import DecisionHandler
@@ -589,12 +640,14 @@ class EventChannelWiringTests(unittest.TestCase):
         self.assertEqual(posters, [])
 
     def test_unset_owner_wires_only_the_hitl_claimants(self):
+        from ag2_sparrow.outcome_reactions import OutcomeReactionHandler
         from ag2_sparrow.event_consumer import TaskifyHandler
         os.environ.pop("SPARROW_HA_OWNER", None)
         os.environ["SPARROW_HA_ROOM"] = "!cards:ag2.space"
         handler, posters = self._wire()
         chain = self._chain(handler)
-        self.assertEqual([type(h) for h in chain], [rgb._ClaudeLocalClicks, rgb._HitlClicks, TaskifyHandler])
+        self.assertEqual([type(h) for h in chain],
+                         [rgb._ClaudeLocalClicks, rgb._HitlClicks, OutcomeReactionHandler, TaskifyHandler])
         self.assertIsNone(chain[0].owner, "claude-local clicks read the owner at each click")
         self.assertEqual(posters, [], "no owner, no decision cards")
 
