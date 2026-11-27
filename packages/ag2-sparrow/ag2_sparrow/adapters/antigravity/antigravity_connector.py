@@ -769,26 +769,12 @@ class Connector:
                                        media=acp_host.Media(images=media.images), model=self.models.wanted())
 
     def renew_sign_in(self) -> bool:
-        """Start agy and open a Session, with no prompt: agy renews its Google sign-in as it starts, which a usage
-        read alone never does, so the first ask after a long idle is answered too. Nothing reaches the model.
-        True when agy started and opened the Session."""
-        client = None
-        try:
-            client = self.client_factory(self.args.acp_argv, cwd=self.args.cwd, env=self.args.child_env,
-                                         stderr_path=os.path.join(self.args.state, STDERR_NAME),
-                                         on_permission=lambda params: {"outcome": {"outcome": "cancelled"}},
-                                         on_update=lambda update: None)
-            client.initialize(self.args.rpc_timeout)
-            client.call("session/new", {"cwd": self.args.cwd, "mcpServers": []}, self.args.rpc_timeout)
-            log("usage: agy started to renew its sign-in")
-            return True
-        except Exception as e:  # noqa: BLE001 - not renewed: the usage is said to be unavailable
-            log("usage: sign-in not renewed:", "%s: %s" % (type(e).__name__, str(e)[:120]))
-            return False
-        finally:
-            if client is not None:
-                with contextlib.suppress(Exception):
-                    client.close()
+        """Start agy and open a Session, with no prompt (acp_host.start_only): agy renews its Google sign-in as it
+        starts, which a usage read alone never does, so the first ask after a long idle is answered too. Nothing
+        reaches the model. True when agy started and opened the Session."""
+        renewed = acp_host.start_only(self.client_factory, self.args, STDERR_NAME, log)
+        log("usage: agy started to renew its sign-in" if renewed else "usage: sign-in not renewed")
+        return renewed
 
     def use_app_gemini_key(self, client, init, argv):
         """Owner and collaborator turns only: agy on the Gemini API key saved in the app (gemini_key). The auth
