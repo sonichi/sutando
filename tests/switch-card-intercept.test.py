@@ -54,6 +54,41 @@ class Phrases(unittest.TestCase):
             self.assertIsNone(sci.kind_of(words), words)
 
 
+class Questions(unittest.TestCase):
+    """The owner's own words (Susan 2026-11-26 10:32/10:35): one card per thing asked, in order."""
+
+    def test_questions_get_their_cards(self):
+        for words, kinds in (("现在用的什么账号和什么模型", ["account", "model"]),
+                             ("你在用什么模型", ["model"]), ("你在用什么模型？", ["model"]),
+                             ("what model are you using?", ["model"]), ("which account are you on", ["account"]),
+                             ("what model and account are you using", ["account", "model"]),
+                             ("你用的是什么 model", ["model"]), ("用的哪个账号", ["account"]),
+                             ("你现在用的哪个 core", ["runtime"]), ("which core are you running", ["runtime"])):
+            self.assertEqual(sci.kinds_of(words), kinds, words)
+
+    def test_bare_requests_still_one_card(self):
+        for words, kind in (("/model", "model"), ("换账号", "account"), ("switch core", "runtime")):
+            self.assertEqual(sci.kinds_of(words), [kind], words)
+
+    def test_not_lookups(self):
+        for words in ("what model are you on right now and why", "why did the account switch fail?",
+                      "账号为什么没切过去", "switch to sonnet", "换成 opus 吧", "what is the weather",
+                      "switch account and then summarise my email", "帮我看看这个文件", "hi", "",
+                      "账号切换失败了吗", "which model is better for coding, sonnet or opus?",
+                      # Not about the agent itself (review on #6853): no card, the core answers.
+                      "what model of iPhone do I have?", "which account is the invoice from?",
+                      "which account should I use for billing?", "我该用什么模型写代码", "model 是哪个",
+                      # "you" or "current" alone is not a question about the agent's own account / model / core
+                      # (Chi's agent was held by these, 2026-11-26): the core answers them.
+                      "what is my current account balance?", "what do you think the core problem is?",
+                      "what model do you recommend for my project?", "Which account am I on",
+                      "我现在用的什么账号"):
+            self.assertEqual(sci.kinds_of(words), [], words)
+
+    def test_long_message_stays_with_the_core(self):
+        self.assertEqual(sci.kinds_of("which model " + "x " * 40), [])
+
+
 class Request(unittest.TestCase):
     def setUp(self):
         self.td = tempfile.TemporaryDirectory()
@@ -68,7 +103,7 @@ class Request(unittest.TestCase):
 
     def test_owner_dm(self):
         req = sci.request(self.stamped(task("switch account")), self.ws)
-        self.assertEqual(req, {"kind": "account", "room": "!dm:s.space", "reply_to": "$evt"})
+        self.assertEqual(req, {"kind": "account", "kinds": ["account"], "room": "!dm:s.space", "reply_to": "$evt"})
 
     def test_reply_context_is_not_the_words(self):
         req = sci.request(self.stamped(task("换账号", reply_context=True)), self.ws)
@@ -110,6 +145,22 @@ class Intercept(unittest.TestCase):
         self.assertEqual(argv[argv.index("post") + 1:], ["--room", "!dm:s.space", "--reply-to", "$evt"])
         self.assertTrue((self.results / "task-abc.txt").read_text().startswith("[no-send]"))
 
+    def test_a_question_about_account_and_model_posts_both_cards_in_order(self):
+        self.assertTrue(self.run_with("现在用的什么账号和什么模型"))
+        self.assertEqual([Path(a[1]).name for a in self.calls], ["account_card.py", "model_card.py"])
+        self.assertIn("account and model", (self.results / "task-abc.txt").read_text())
+
+    def test_one_card_out_and_the_other_failed_is_not_answered_twice(self):
+        # The account card posted, the model card failed: the core must not answer the question again.
+        self.file.write_text(task_envelope.stamp_text(task("现在用的什么账号和什么模型"), self.ws))
+
+        def run(argv, **kw):
+            self.calls.append(argv)
+            ok = argv[1].endswith("account_card.py")
+            return subprocess.CompletedProcess(argv, 0 if ok else 1, stdout=json.dumps({"status": "posted" if ok else "failed"}) + "\n", stderr="")
+        self.assertTrue(sci.intercept(self.file, self.ws, self.results, REPO, run=run, log=lambda m: None))
+        self.assertTrue((self.results / "task-abc.txt").read_text().startswith("[no-send]"))
+
     def test_out_of_usage_every_card_asked_for_is_answered_by_the_limits_card(self):
         import core_quota_notice
         state = self.ws.joinpath(*core_quota_notice.FILE)
@@ -133,6 +184,11 @@ class Intercept(unittest.TestCase):
             self.assertEqual(sci.limit_lead(self.ws), "", rec)
         state.write_text(json.dumps({"since": 1.0, "seen": time.time()}))
         self.assertTrue(sci.limit_lead(self.ws), "seen just now: still in force")
+        # A question asking for two cards, out of usage: the limit's card once, not once per card.
+        state.write_text(json.dumps({"since": time.time(), "name": "Codex", "reset": "3:05 PM", "told": True}))
+        self.calls.clear()
+        self.assertTrue(self.run_with("你现在用的什么账号和什么模型"))
+        self.assertEqual([Path(a[1]).name for a in self.calls], ["account_card.py"])
         state.write_text("{}")
         self.calls.clear()
         self.assertTrue(self.run_with("/model"))
