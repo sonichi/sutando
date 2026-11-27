@@ -67,12 +67,15 @@ Editing the page asks again.
 **Saving state.** `options` may hold only `expected_revision` (a `revision` from `read`) and
 `operation_id` (`[A-Za-z0-9_-]{1,128}`); anything else is refused as `INVALID_ARGUMENT`. A failed
 `set` or `delete` rejects with an error carrying `code` and `refused` (and, once the host has
-answered, `current_revision` and `draft`). `refused: true` means nothing was saved:
+answered, `current_revision` and `draft`). `refused: true` means this call saved nothing:
 `REVISION_CONFLICT` (read again and merge), `STATE_NOT_SYNCED` (retry once the page syncs),
-`STATE_REQUEST_REFUSED`, `INVALID_ARGUMENT`, `STATE_REQUEST_PENDING` or `TOO_MANY_STATE_REQUESTS`.
-`refused: false` (`STATE_REQUEST_UNCONFIRMED`, `STATE_REQUEST_TIMEOUT`) means it may have been
-saved: retry the same value with the same `operation_id`, and use a new one for a changed value.
-Keep the viewer's input on any failure.
+`STATE_REQUEST_REFUSED`, `INVALID_ARGUMENT` or `TOO_MANY_STATE_REQUESTS`. `STATE_REQUEST_PENDING`
+refuses only this call: the same `operation_id` is still in flight and may still save, so don't
+treat it as a non-save or switch IDs. `refused: false` (`STATE_REQUEST_UNCONFIRMED`,
+`STATE_REQUEST_TIMEOUT`) means it may have been saved: retry the identical request (same key, same
+`set` or `delete`, value and `expected_revision`) with the `operation_id` of the retained `draft`.
+Anything that changes the request, a rebase onto a new revision included, needs a new ID. Keep the
+viewer's input on any failure.
 
 **The sandbox.** The frame is `allow-scripts` on an opaque origin. It has no network (`fetch`,
 XHR and WebSocket fail), `localStorage` throws, `alert`, `confirm` and `prompt` are blocked,
@@ -300,8 +303,11 @@ me" buttons.
   include `declined`, `page permission required`, `agent not owned or unavailable`,
   `too many agent requests`, `another request is in progress`, `request outcome unknown` and
   `send outcome unknown`. Treat both "outcome unknown" answers alike: it may have been sent, so
-  never make a new `key`. Retrying the same one does not send again in this browser profile;
-  after `send outcome unknown`, check the agent's DM instead of retrying.
+  never make a new `key`. Retrying the same one does not send again only while this browser
+  profile's ledger is intact. After a storage reset, or on another browser or device, the same key
+  can send again if the original went by DM or the Action is no longer offered. There, and after
+  `send outcome unknown`, leave the outcome unresolved and check for the original task instead of
+  retrying.
 
 **2. `artifact.room.post` asks an agent in the room, as the viewer.** Use it when the ask should
 be seen by the room, or the agent is not the viewer's.
