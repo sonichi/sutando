@@ -2903,18 +2903,18 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # any engine's strict parser reads them and a body cannot claim them.
                 "mentions", "mentions_you", "replied_to", "replied_to_you",
                 "thread_starter", "you_in_thread",
-                "task",
-                # Context enrichment (AG2 broker writer side): human room/sender
-                # names + reply reference. Serialized only when the gateway sends
-                "room_name", "sender_name", "reply_to_event", "reply_to_me", "reply_to_sender",
-                "addressed_to",
+                # The broker's reply, thread and roster context (room_members is capped; the count
+                # is the true total). Above "task" for the same reason as the facts above.
+                "reply_to_me", "reply_to_sender",
                 # Ingress only: the backend inherits the route by task id, so a
                 # reply echoing these back could name a thread it was not asked in.
                 "thread_root", "source_room_id",
-                # Room-membership context (gateway writer side, same contract):
-                # a capped one-line mxid list + the true joined total, and the
-                # broker's own dm|room verdict so a skill need not count members.
                 "room_members", "room_member_count", "channel_kind",
+                "task",
+                # Context enrichment (AG2 broker writer side): human room/sender
+                # names + reply reference. Serialized only when the gateway sends
+                "room_name", "sender_name", "reply_to_event",
+                "addressed_to",
                 "source_message_id", "user_id", "interaction_type",
                 # Platform-signed metadata pointer — serialized as a one-line
                 # JSON header by a dedicated branch below (dict, not scalar).
