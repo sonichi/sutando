@@ -108,7 +108,7 @@ class Remote(Base):
 class Offer(Remote):
     def test_the_card_offers_each_other_saved_account_by_address_sorted_and_not_the_one_in_use(self):
         card = self.posted()
-        self.assertEqual([b["label"] for b in card["buttons"]], ["Use " + A, "Use " + B, "Switch account"])
+        self.assertEqual([b["label"] for b in card["buttons"]], ["Use " + A, "Use " + B, "Switch account", ac.SIGN_IN_LABEL])
         self.assertEqual(card["buttons"][0]["command"], "card:account:agent:" + ac.saved_key(A))
         self.assertEqual(card["buttons"][0]["reply"], "Use " + A, "the plan suffix is never shown")
 
@@ -117,7 +117,8 @@ class Offer(Remote):
         self.index(self.appdata, many)
         self.answer = {"loggedIn": False}
         card = self.posted()
-        self.assertEqual([b["label"] for b in card["buttons"]][:-1], ["Use u%d@example.com" % i for i in range(5)])
+        # Six buttons at most: "Switch account" and "Sign in to another account" leave room for four.
+        self.assertEqual([b["label"] for b in card["buttons"]][:-2], ["Use u%d@example.com" % i for i in range(4)])
 
     def test_no_buttons_when_a_switch_here_would_be_refused(self):
         for over in ({"CLAUDE_CONFIG_DIR": ""}, {"CLAUDE_CONFIG_DIR": str(self.home / ".claude-sutando")}):
@@ -913,6 +914,123 @@ class Watch(Remote):
         self.assertEqual(logged[0], "account switch: its watcher restarted")
         self.assertIn("not recovered (RuntimeError: broken)", logged[1])
 
+
+
+
+LINK = "https://claude.ai/oauth/authorize?code=true&client_id=x&state=s"
+CODE = "abcdEFGH1234#stateXYZ987"
+
+
+class PhoneSignIn(Remote):
+    """Owner 11-27: a new Claude account signed in from the phone. The card starts Claude Code's two-step
+    sign-in here and shows its link; the code comes back typed into the card (the tap carries it, never the
+    chat's text) or as the owner's own DM message. Never the model's to start or finish."""
+
+    def setUp(self):
+        super().setUp()
+        self.started, self.given, self.waiting = [], [], False
+
+        def start(cfg, env, state_dir, **kw):
+            self.started.append((env.get("CLAUDE_CONFIG_DIR"), str(state_dir)))
+            self.waiting = True
+            return LINK
+
+        def give(state_dir, code, **kw):
+            self.given.append(code)
+            self.waiting = False
+            return True, ""
+
+        for name, fake in (("start", start), ("give_code", give), ("waiting", lambda d: self.waiting)):
+            p = mock.patch.object(accounts, name, fake)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def started_card(self):
+        self.posted()
+        rc, out = self.tap("task-si", ac.SIGN_IN_LABEL)
+        self.assertIn("(account-signin-started)", out["refused"])
+        card = self.queued()[-1]["card"]
+        _, issued = connector_cards._core()
+        issued.record(Path(self.root), "$acct", card, room=DM, lane="")    # posted in place, as the bridge records it
+        self.clear_outbox()
+        return card
+
+    def test_sign_in_shows_the_page_and_a_code_box_whose_button_carries_the_code(self):
+        card = self.started_card()
+        self.assertEqual(self.started, [(str(self.config), str(Path(self.root) / "state" / "account-sign-in"))])
+        self.assertEqual(card["input"]["name"], ac.CODE_INPUT)
+        self.assertNotIn("message", card["text"].replace("don't send it as a message", ""))
+        self.assertEqual([(b["kind"], b["label"]) for b in card["buttons"]],
+                         [("url", "Open sign-in page"), ("reply", "Submit code")])
+        self.assertEqual(card["buttons"][0]["url"], LINK)
+        self.assertTrue(card["buttons"][1]["uses_input"])
+        self.assertNotIn("on the computer", card["text"])
+
+    def tap_code(self, tid, code):
+        """The bridge's side of a Submit tap: the typed value kept one-time, only its reference in the task."""
+        from ag2_sparrow import card_input
+        ref = card_input.put(self.bridge, {"code": code})
+        return self.claim(self.task(tid, "Submit code", reply_to="$acct",
+                                    click={"card_id": ac.account_switch.NOTE, "action": "Submit code", "input_ref": ref}))
+
+    def test_the_code_typed_into_the_card_signs_in_and_is_never_in_the_task_or_the_card(self):
+        self.started_card()
+        rc, out = self.tap_code("task-code", CODE)
+        self.assertIn("(account-signed-in)", out["refused"])
+        self.assertEqual(self.given, [CODE])
+        self.assertIn("Signed in.", self.queued()[-1]["card"]["text"])
+        self.assertNotIn(CODE, json.dumps(self.queued()))
+        archived = [p.read_text() for p in Path(self.root).rglob("task-code*.txt")]
+        self.assertTrue(archived and all(CODE not in t for t in archived), "the task file carries a reference only")
+        self.assertEqual(list((self.bridge / "card-input").glob("*.json")), [], "taken once, then gone")
+
+    def test_a_code_sent_as_a_dm_message_is_never_taken(self):
+        # Review of #6907: no DM fallback; a waiting sign-in does not turn chat into a code.
+        self.started_card()
+        for tid, said in (("task-m1", CODE), ("task-m2", "sonichi/sutando#6907 is ready")):
+            rc, out = self.claim(self.task(tid, said))
+            self.assertNotIn("account-signed-in", json.dumps(out), said)
+        self.assertEqual(self.given, [])
+        self.assertTrue(self.waiting, "the sign-in still waits for the card")
+
+    def test_a_typed_value_that_is_not_a_code_ends_the_sign_in(self):
+        self.started_card()
+        with mock.patch.object(accounts, "cancel", lambda d: self.cancelled.append(str(d)) or True):
+            self.cancelled = []
+            rc, out = self.tap_code("task-bad", "sonichi/sutando#6907")
+        self.assertIn("(account-signin-bad-code)", out["refused"])
+        self.assertEqual((self.given, len(self.cancelled)), ([], 1))
+
+    def test_the_box_takes_only_a_whole_code(self):
+        card = self.started_card()
+        self.assertTrue(card["input"]["pattern"].startswith("^(?:") and card["input"]["pattern"].endswith(")$"))
+
+    def test_a_click_carries_a_reference_never_the_value(self):
+        from ag2_sparrow import agent_card
+        click = {"card_id": "c", "action": "a"}
+        ref = "0123456789abcdef0123456789abcdef"
+        self.assertEqual(agent_card.card_click({"card_click": json.dumps(dict(click, input_ref=ref))})["input_ref"], ref)
+        for bad in ("../x", "ABC", 7, ref + "0"):
+            self.assertNotIn("input_ref", agent_card.card_click({"card_click": json.dumps(dict(click, input_ref=bad))}))
+        self.assertNotIn("input", agent_card.card_click({"card_click": json.dumps(dict(click, input={"code": CODE}))}))
+
+    def test_the_one_time_store_is_private_taken_once_and_swept(self):
+        from ag2_sparrow import card_input
+        ref = card_input.put(self.bridge, {"code": CODE}, now=1000.0)
+        f = self.bridge / "card-input" / (ref + ".json")
+        self.assertEqual((oct(f.stat().st_mode & 0o777), oct(f.parent.stat().st_mode & 0o777)), ("0o600", "0o700"))
+        self.assertEqual(card_input.take(self.bridge, ref, now=1001.0), {"code": CODE})
+        self.assertEqual(card_input.take(self.bridge, ref, now=1001.0), {}, "once")
+        late = card_input.put(self.bridge, {"code": CODE}, now=1000.0)
+        self.assertEqual(card_input.take(self.bridge, late, now=1000.0 + card_input.TTL_S + 1), {}, "expired")
+        self.assertFalse((self.bridge / "card-input" / (late + ".json")).exists())
+        self.assertEqual(card_input.take(self.bridge, "../../etc/passwd"), {})
+        # Swept with no further click (the bridge's heartbeat), and of two takers only one gets the value.
+        orphan = card_input.put(self.bridge, {"code": CODE}, now=1000.0)
+        os.utime(self.bridge / "card-input" / (orphan + ".json"), (1000.0, 1000.0))
+        self.assertEqual(card_input.sweep(self.bridge, now=1000.0 + card_input.TTL_S + 1), 1)
+        once = card_input.put(self.bridge, {"code": CODE})
+        self.assertEqual([card_input.take(self.bridge, once), card_input.take(self.bridge, once)], [{"code": CODE}, {}])
 
 if __name__ == "__main__":
     unittest.main()

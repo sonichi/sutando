@@ -508,7 +508,26 @@ def card_click(headers: Mapping[str, str]) -> Optional[dict]:
         return None
     if not isinstance(click, dict) or not _text(click.get("card_id"), "id") or not _text(click.get("action"), "reply"):
         return None
-    return {"card_id": click["card_id"], "action": click["action"]}
+    out = {"card_id": click["card_id"], "action": click["action"]}
+    ref = click.get("input_ref")
+    return dict(out, input_ref=ref) if isinstance(ref, str) and _INPUT_REF_RE.fullmatch(ref) else out
+
+
+# A tap's typed value travels in the click, never in the message's text (a sign-in code, say): at most
+# CLICK_INPUTS named values of CLICK_INPUT_MAX characters each.
+CLICK_INPUTS, CLICK_INPUT_MAX = 4, 2048
+# The bridge keeps a typed value out of the task file (card_input) and passes only this reference to it.
+_INPUT_REF_RE = re.compile(r"[0-9a-f]{32}")
+
+
+def click_input(given) -> dict:
+    """`{name: value}` a card click carried for the card's input, {} when there is none or it is not one."""
+    if not isinstance(given, dict) or not 0 < len(given) <= CLICK_INPUTS:
+        return {}
+    if not all(isinstance(k, str) and _INPUT_NAME_RE.fullmatch(k) and isinstance(v, str) and len(v) <= CLICK_INPUT_MAX
+               for k, v in given.items()):
+        return {}
+    return dict(given)
 
 
 def click_tagged(headers: Mapping[str, str]) -> bool:
