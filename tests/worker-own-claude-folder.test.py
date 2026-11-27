@@ -107,6 +107,7 @@ def main() -> int:
     file_auth_isolation()
     private_account_file()
     launcher_refuses_a_failed_folder()
+    launcher_refuses_an_undeterminable_folder()
     print("\n%d failure(s)" % len(FAILS) if FAILS else "\nall passed")
     return 1 if FAILS else 0
 
@@ -202,6 +203,41 @@ def launcher_refuses_a_failed_folder() -> None:
     block = launcher.split("worker_claude_folder \"$REPO\"", 1)[1].split("resolve_claude_settings_args", 1)[0]
     check("worker-claude-folder.sh" in launcher and "exit 1" in block.split("fi", 1)[0],
           "i) the launcher exits before launching when the folder is refused")
+
+
+def launcher_refuses_an_undeterminable_folder() -> None:
+    """A failed path test is not proof of absence: if the workers' folder can't be searched, refuse."""
+    if os.geteuid() == 0:
+        print("SKIP j) running as root: permissions are not enforced")
+        return
+    core = core_folder()
+    stub = core.parent / "failing-python-j"
+    stub.write_text("#!/bin/sh\necho 'stub: refresh failed' >&2\nexit 1\n")
+    stub.chmod(0o755)
+    own = F.ensure(core, WORKER)
+    workers = own.parent
+    workers.chmod(0o000)
+    try:
+        r = _resolve(core, WORKER, str(stub))
+        check(r.returncode == 1 and r.stdout == "",
+              f"j) its own folder unsearchable + failing helper: refused, got {r.returncode} {r.stdout!r}")
+        r = _resolve(core, WORKER, "")
+        check(r.returncode == 1 and r.stdout == "", "j) its own folder unsearchable + no Python: refused")
+    finally:
+        workers.chmod(0o755)
+    gone = core.with_name(".claude-gone")
+    gone.mkdir()
+    r = _resolve(gone, WORKER, str(stub))
+    check(r.returncode == 0 and r.stdout.strip() == str(gone),
+          "j) no workers' folder at all, its parent searchable: confirmed missing, the core's folder")
+    top = core.parent / "locked-top"
+    (top / ".claude").mkdir(parents=True)
+    top.chmod(0o000)
+    try:
+        r = _resolve(top / ".claude", WORKER, str(stub))
+        check(r.returncode == 1 and r.stdout == "", "j) nothing above it can be searched: refused, not the core's folder")
+    finally:
+        top.chmod(0o755)
 
 
 if __name__ == "__main__":
