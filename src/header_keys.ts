@@ -71,6 +71,12 @@ export const HEADER_KEYS: readonly string[] = [
 	'playbook',
 	'voice_room_id',
 	'ui_origin',
+	'mentions',
+	'mentions_you',
+	'thread_starter',
+	'you_in_thread',
+	'room_members',
+	'room_member_count',
 ];
 
 /** Alternation source for a header-line guard. Keys are plain
