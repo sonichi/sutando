@@ -141,6 +141,15 @@ class PreludeSwitch(_Base):
         self.assertEqual(rgb.TASK_PRELUDE, "sutando")
         self.assertIn("===SKILL INSTRUCTIONS", self.write("task-ps-1"))
 
+    def test_none_keeps_addressed_to_as_a_strict_header(self):
+        with patch.object(rgb, "TASK_PRELUDE", "none"):
+            text = self.write("task-ps-3", addressed_to="@other.agent:s.space", mentions_you="false")
+        self.assertNotIn("===SKILL INSTRUCTIONS", text)
+        self.assertNotIn("ADDRESSING", text)
+        parsed = ltp.parse_task_headers(text)
+        self.assertEqual(parsed.headers.get("addressed_to"), "@other.agent:s.space")
+        self.assertNotIn("addressed_to", parsed.body)
+
     def test_none_drops_it_and_keeps_the_headers(self):
         with patch.object(rgb, "TASK_PRELUDE", "none"):
             text = self.write("task-ps-2", mentions_you="false")

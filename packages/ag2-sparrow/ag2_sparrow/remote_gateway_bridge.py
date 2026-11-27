@@ -2905,7 +2905,7 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 "thread_starter", "you_in_thread",
                 # The broker's reply, thread and roster context (room_members is capped; the count
                 # is the true total). Above "task" for the same reason as the facts above.
-                "reply_to_me", "reply_to_sender",
+                "reply_to_me", "reply_to_sender", "addressed_to",
                 # Ingress only: the backend inherits the route by task id, so a
                 # reply echoing these back could name a thread it was not asked in.
                 "thread_root", "source_room_id",
@@ -2914,7 +2914,6 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # Context enrichment (AG2 broker writer side): human room/sender
                 # names + reply reference. Serialized only when the gateway sends
                 "room_name", "sender_name", "reply_to_event",
-                "addressed_to",
                 "source_message_id", "user_id", "interaction_type",
                 # Platform-signed metadata pointer — serialized as a one-line
                 # JSON header by a dedicated branch below (dict, not scalar).
