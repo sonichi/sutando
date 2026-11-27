@@ -38,10 +38,8 @@ RUNTIME = "claude"
 STATUS_WAIT_S = 10.0     # asked inside the claim: an answer the card cannot wait for reads as unknown
 ASKS = ("/account", "/login")
 WHERE = account_switch.elsewhere(NAME) + " The sign-in code goes into the card there, never into this chat."
-# Signing in to another account from the phone (owner 11-27): this connector starts Claude Code's two-step
-# sign-in for the agent's own config dir and shows its link; the code the page then shows comes back either
-# typed into the card (the tap carries it, never the chat's text) or as the owner's own message in her DM.
-# Only these, never the model: a sign-in is never started or finished on anything the session says.
+# Another account from the phone (owner 11-27): Claude Code's two-step sign-in, its code typed into the card
+# (carried by the tap) or sent in the owner's DM; this code acts on those only, never on what the model says.
 SIGN_IN, CODE = "signin", "code"
 SIGN_IN_LABEL = "Sign in to another account"
 CODE_INPUT = "code"
