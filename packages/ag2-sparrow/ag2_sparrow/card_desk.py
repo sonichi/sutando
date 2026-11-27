@@ -21,8 +21,17 @@ class Desk:
     `asked_for(words, sent, result_file)`, `offer(sent, result_file)`, `expired(sent, result_file)`
     and `usable()`."""
 
-    def __init__(self, root, publish, quoted, cards):
+    def __init__(self, root, publish, quoted, cards, limit=None):
         self.root, self.publish, self.quoted, self.cards = root, publish, quoted, list(cards)
+        # `limit(sent, result_file)`: out of usage, the owner's ask for any card is answered by the limit's
+        # card first; it returns what it did, '' when no limit is in force. A tap still acts.
+        self.limit = limit
+
+    def limited(self, sent, result_file) -> str:
+        try:
+            return (self.limit(sent, result_file) if self.limit else "") or ""
+        except Exception:  # noqa: BLE001 - the card asked for is shown as before
+            return ""
 
     def task(self, path, result_file) -> str:
         """What a task that was a card matter came to (a tap, or the owner's slash command in their DM),
@@ -52,21 +61,26 @@ class Desk:
         ask, _, words = said.strip().partition(" ")
         if agent_card.owner_may_act(sent) is not None:
             return ""
-        for card in self.cards:
-            if ask.lower() == card.ASK and card.usable():
-                return self.drawn(card, result_file, lambda: card.asked_for(words.strip(), sent, result_file))
-        # The owner's own words naming one choice ("switch to haiku"): picked as a tap would be, no menu.
-        for card in self.cards:
-            named = getattr(card, "named_in", None)
-            choice = named(said.strip()) if named and card.usable() else ""
-            if choice:
-                return self.drawn(card, result_file, lambda: card.asked_for(choice, sent, result_file))
-        # A card may also name the owner's own words that are its matter (`asks`), read here and never by
-        # the model; one message may ask for several ("which account and model"), each shown once.
+        slash = [card for card in self.cards if ask.lower() == card.ASK and card.usable()]
+        named = [(card, card.named_in(said.strip())) for card in self.cards
+                 if getattr(card, "named_in", None) and card.usable()]
+        named = [(card, choice) for card, choice in named if choice]
         asking = {}
         for card in self.cards:
             if getattr(card, "asks", None) and card.KIND not in asking and card.asks(said) and card.usable():
                 asking[card.KIND] = card
+        if slash or named or asking:
+            told = self.limited(sent, result_file)
+            if told:
+                return told
+        if slash:
+            return self.drawn(slash[0], result_file, lambda: slash[0].asked_for(words.strip(), sent, result_file))
+        # The owner's own words naming one choice ("switch to haiku"): picked as a tap would be, no menu.
+        if named:
+            card, choice = named[0]
+            return self.drawn(card, result_file, lambda: card.asked_for(choice, sent, result_file))
+        # A card may also name the owner's own words that are its matter (`asks`), read here and never by
+        # the model; one message may ask for several ("which account and model"), each shown once.
         if len(asking) == 1:
             card = next(iter(asking.values()))
             return self.drawn(card, result_file, lambda: card.offer(sent, result_file))
