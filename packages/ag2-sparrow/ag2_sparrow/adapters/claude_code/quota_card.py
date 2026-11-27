@@ -358,9 +358,10 @@ def _tell_tasks(root, cfg: dict, bridge: str, limited: list, text: str, log, rec
             continue
         tasks[task_id] = dict({k: v for k, v in entry.items() if k != "again"}, qid=qid, queued=at)
         # Kept with the incident, not the task: the card's fate still counts once the task is answered.
-        covers = ([c for c in rec.get("covers") or [] if isinstance(c, dict) and c.get("qid") != qid]
-                  + [{"qid": qid, "queued": at}])[-COVERS_KEEP:]
-        rec = dict(rec, covers=covers)
+        if in_dm:   # a room's note says nothing in the DM: only a card sent there covers the incident
+            covers = ([c for c in rec.get("covers") or [] if isinstance(c, dict) and c.get("qid") != qid]
+                      + [{"qid": qid, "queued": at}])[-COVERS_KEEP:]
+            rec = dict(rec, covers=covers)
         done.append("quota-task-card")
     rec = dict(rec, tasks=tasks)
     save(root, rec)

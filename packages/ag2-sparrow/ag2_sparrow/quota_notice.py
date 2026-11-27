@@ -149,8 +149,8 @@ class QuotaNotice:
         """The limit in force, in words, for a card the owner asks for meanwhile; '' when none is, or its reset passed."""
         rec = self.load()
         until = rec.get("reset_at")
-        carded = self.limited() or bool(rec.get("since") and rec.get("tasks"))      # a room's card counts too
-        if not carded or (until is not None and self.now() >= float(until)):
+        # The refusal itself is the limit, whether or not any card of it could be queued.
+        if not rec.get("since") or (until is not None and self.now() >= float(until)):
             return ""
         # No reset time was given: with no turn to clear it (a card ask runs none), it ends by itself.
         if until is None and self.now() - float(rec.get("last") or rec.get("since") or 0) > NO_RESET_S:

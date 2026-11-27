@@ -2622,6 +2622,12 @@ class QuotaCardTest(CardWorld, unittest.TestCase):
         self.assertTrue(notice.says().startswith("Codex has reached its usage limit"))
         notice.now = lambda: time.time() + 10 ** 9
         self.assertEqual(notice.says(), "", "past its reset: not said")
+        # The refusal is the limit even when no card of it could be queued anywhere (review of #6859).
+        bare = quota_notice.QuotaNotice(self.work / "bare-state", None, "Codex", None, None, lambda *a: None)
+        (self.work / "bare-state").mkdir()
+        self.assertEqual(bare.hit("3:05 PM"), "quota-no-room")
+        self.assertIn("(resets 3:05 PM)", bare.says())
+        self.assertEqual(bare.says_in_room(), quota_notice.room_words("Codex", "3:05 PM"))
         # A limit that named no reset time ends by itself: a card ask runs no turn that could clear it.
         notice.now = time.time
         rec = notice.load()
