@@ -333,12 +333,24 @@ class QuotaNotice:
         Before anything is sent or queued again, the account is read: a limit kept for an account no longer in
         use (the owner switched) is dropped with whatever of it was owed, and nothing of it is sent."""
         rec = self.load()
-        if not rec.get("since") or (rec.get("told") and not rec.get("owed")):
-            return ""            # nothing to send: the account is not read on every idle tick
+        if not rec.get("since"):
+            return ""
+        if rec.get("told") and not rec.get("owed"):
+            waiting = self._waiting(rec)
+            if not waiting:
+                if rec.get("queued_ids"):
+                    self.save({k: v for k, v in rec.items() if k != "queued_ids"})   # all of them left the outbox
+                return ""        # nothing to send or take back: the account is not read on every idle tick
         rec = self.current()
         if not rec.get("since"):
             return ""
         return ("" if rec.get("told") else self._deliver(rec, self.now())) or self._owed(self.now())
+
+    def _waiting(self, rec: dict) -> list:
+        """The incident's cards still in the bridge's outbox (its own and each message's follow-up)."""
+        outbox = Path(str(self.bridge_state or "")).joinpath(*connector_cards.OUTBOX)
+        return [q for q in [rec.get("qid")] + list(rec.get("queued_ids") or [])
+                if q and self.bridge_state and (outbox / (str(q) + ".json")).is_file()]
 
     def delivery(self, rec: dict, at: float) -> str:
         """What became of the card `rec` queued: 'posted', 'pending' (still in the bridge's outbox), or

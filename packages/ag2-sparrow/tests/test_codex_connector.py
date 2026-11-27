@@ -2841,6 +2841,33 @@ class QuotaCardTest(CardWorld, unittest.TestCase):
         self.assertFalse(connector_cards.withdraw(self.bridge, entry.stem))
         self.assertFalse(connector_cards.withdraw(self.bridge, "not-a-queue-id"))
 
+    def test_a_follow_up_queued_after_the_limit_was_told_is_taken_back_on_a_switch_before_the_bridge_flushes(self):
+        # Second review of #6879: told incident, a message's follow-up queued but not posted, nothing owed.
+        self.sign_in("acct-a")
+        self.serve("task-1", "[[limit]] hello")
+        self.assertEqual(len(self.posted()), 1, "the incident's card is posted")
+        self.serve("task-2", "[[limit]] again")
+        state = self.work / "state"
+        rec = json.loads((state / quota_notice.FILE).read_text())
+        (follow_up,) = rec["queued_ids"]
+        self.assertEqual((rec["told"], rec.get("owed")), (True, {}), "told, and nothing owed")
+        self.assertEqual(len(self.outbox()), 1, "the follow-up waits in the outbox")
+        account = [rec["account"]]
+        notice = quota_notice.QuotaNotice(state, self.bridge, "Codex", None, lambda: "", lambda *a: None,
+                                          account=lambda: account[0])
+        self.assertEqual(notice.tick(), "", "same account: left queued")
+        self.assertEqual(len(self.outbox()), 1)
+        account[0] = "another account"      # the owner switched; no message comes after it
+        self.assertEqual(notice.tick(), "")
+        self.assertEqual((self.outbox(), connector_cards.outcome(self.bridge, follow_up)), ([], "dropped"))
+        self.assertEqual(self.posted(), [], "the bridge's next flush sends nothing of the old account")
+        # Once every card of a told incident has left the outbox, the idle tick stops looking and reads no account.
+        account[0] = rec["account"]
+        notice.save(dict(rec, queued_ids=[follow_up]))
+        notice.account = lambda: 1 / 0
+        self.assertEqual(notice.tick(), "")
+        self.assertNotIn("queued_ids", notice.load())
+
     def test_a_limit_kept_for_another_account_is_not_this_ones(self):
         self.sign_in("acct-b")
         state = self.work / "state"
