@@ -126,8 +126,10 @@ def request(task_text: str, workspace: Optional[Path] = None) -> Optional[dict]:
     import task_envelope
     parsed = task_envelope.attested_task_headers(task_text, workspace)
     h = parsed.headers
-    # A room (any channel kind but the DM) is taken too: there it gets IN_ROOM, never a card (in_room).
-    if (h.get("access_tier") or "").strip() != "owner" or not (h.get("channel_kind") or "").strip():
+    # The cards' own owner check (agent_card.owner_may_act), so the two never drift apart. A room (any
+    # channel kind but the DM) is taken too: there it gets IN_ROOM, never a card (in_room).
+    import agent_card
+    if agent_card.owner_may_act(h, dm_only=False) is not None or not (h.get("channel_kind") or "").strip():
         return None
     if (h.get("interaction_type") or "message").strip() != "message" or not (h.get("channel_id") or "").strip():
         return None
