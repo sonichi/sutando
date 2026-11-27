@@ -80,6 +80,7 @@ ADD = "add"
 RESTART = _REPO / "src" / "agent" / "graceful-restart.sh"
 KEY_RE = re.compile(r"[0-9a-f]{16}")
 STORE_SUB = ("accounts", "codex")
+DESKTOP_ID = "space.ag2.desktop"   # the desktop app's data folder name
 ISSUED = ("state", "account-card-keys.json")
 ISSUED_KEPT = 20
 # The owner's taps that started a switch: a tap delivered again (a client resending on reconnect)
@@ -157,7 +158,7 @@ class Unreadable(Exception):
 
 
 def store_dir() -> Optional[Path]:
-    """The desktop's saved-account store for the core on Codex; None when no desktop hosts this engine."""
+    """The desktop's saved-account store for the core on Codex; None when no desktop keeps one for it."""
     app = os.environ.get("SUTANDO_APP_SUPPORT", "").strip()
     if not app:
         try:
@@ -166,7 +167,23 @@ def store_dir() -> Optional[Path]:
         except Exception:  # noqa: BLE001 - no config: no desktop
             path = None
         app = str(path.parent) if path else ""
-    return Path(app).joinpath(*STORE_SUB) if app else None
+    return Path(app).joinpath(*STORE_SUB) if app else external_store_dir()
+
+
+def external_store_dir(root: Optional[Path] = None, data: Optional[Path] = None) -> Optional[Path]:
+    """A self-run core's store, which the desktop keeps apart from the bundled core's: accounts/
+    codex-external/<first 16 hex of the SHA-256 of this checkout's real path> under its data folder."""
+    try:
+        from sutando_config import _find_repo_root
+        root = root or _find_repo_root()
+    except Exception:  # noqa: BLE001 - no config: no checkout to key it by
+        root = None
+    if root is None:
+        return None
+    data = data or Path.home() / "Library" / "Application Support" / DESKTOP_ID
+    key = hashlib.sha256(os.path.realpath(str(root)).encode()).hexdigest()[:16]
+    store = data / STORE_SUB[0] / (STORE_SUB[1] + "-external") / key
+    return store if store.is_dir() else None
 
 
 def _claims(jwt: str) -> dict:

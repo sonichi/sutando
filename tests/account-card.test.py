@@ -1221,5 +1221,51 @@ class Identity(unittest.TestCase):
         self.assertEqual(acc.masked_label("ChatGPT account (pro)"), "ChatGPT account (pro)")
 
 
+class SelfRunCoreStore(unittest.TestCase):
+    """A core run from the user's own checkout (no SUTANDO_APP_SUPPORT, not under <app>/engine)
+    finds the store the desktop keeps for it: accounts/codex-external/<16 hex of its real path>."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.checkout = self.tmp / "my-sutando"
+        self.checkout.mkdir()
+        self.data = self.tmp / "app-data"
+        key = hashlib.sha256(os.path.realpath(str(self.checkout)).encode()).hexdigest()[:16]
+        self.store = self.data / "accounts" / "codex-external" / key
+
+    def test_the_self_run_cores_store_is_found_by_its_checkout(self):
+        self.assertIsNone(acc.external_store_dir(self.checkout, self.data), "none until the desktop made it")
+        self.store.mkdir(parents=True)
+        self.assertEqual(acc.external_store_dir(self.checkout, self.data), self.store)
+
+    def test_a_path_through_a_link_names_the_same_store(self):
+        self.store.mkdir(parents=True)
+        link = self.tmp / "link-to-checkout"
+        link.symlink_to(self.checkout)
+        self.assertEqual(acc.external_store_dir(link, self.data), self.store)
+
+    def test_another_checkout_never_sees_this_ones_store(self):
+        self.store.mkdir(parents=True)
+        other = self.tmp / "other"
+        other.mkdir()
+        self.assertIsNone(acc.external_store_dir(other, self.data))
+
+    def test_store_dir_falls_back_to_it_only_with_no_desktop_hosting_the_engine(self):
+        with mock.patch.dict(os.environ, {"SUTANDO_APP_SUPPORT": ""}), \
+                mock.patch.object(acc, "external_store_dir", return_value=self.store):
+            import sutando_config
+            with mock.patch.object(sutando_config, "desktop_runtime_selection_path", return_value=None):
+                self.assertEqual(acc.store_dir(), self.store)
+        with mock.patch.dict(os.environ, {"SUTANDO_APP_SUPPORT": str(self.data)}):
+            self.assertEqual(acc.store_dir(), self.data / "accounts" / "codex", "a hosted engine keeps the core's store")
+
+    def test_no_checkout_means_no_store(self):
+        import sutando_config
+        with mock.patch.object(sutando_config, "_find_repo_root", return_value=None):
+            self.assertIsNone(acc.external_store_dir(None, self.data))
+        with mock.patch.object(sutando_config, "_find_repo_root", side_effect=RuntimeError("no config")):
+            self.assertIsNone(acc.external_store_dir(None, self.data))
+
+
 if __name__ == "__main__":
     unittest.main()
