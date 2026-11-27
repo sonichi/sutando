@@ -248,6 +248,9 @@ KNOWN_HEADER_KEYS = (
     # AgentTrigger context (vocabulary: agent_triggers.py). Bridge-written above task:,
     # so the guard defangs forged body copies.
     "event_type", "agent_trigger_id", "playbook",
+    # The message this task is the sender's edit of (the broker's replaces_event_id). Bridge-written
+    # above task:, so the guard defangs a body line claiming a task is only a correction.
+    "edit_of",
     # The room a voice call was docked in, on its session-end task. Metadata only: no
     # bridge routes on it, so the task's result is delivered as an undocked one.
     "voice_room_id",

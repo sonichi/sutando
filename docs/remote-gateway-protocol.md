@@ -143,6 +143,20 @@ the inviter in `user_id` (its `access_tier` is the inviter's) and has no
 `event_type` keeps today's task: the self-describing body still reads as a
 system event.
 
+**`replaces_event_id` (an edited message).** When a sender edits a message whose
+task this agent already took, the broker serves the edit as a second task: its
+own id, the edited text, `source_message_id` still the original message, and
+`replaces_event_id` naming that original. The gateway writes it as the trusted
+pre-body header `edit_of: <original event id>` (dropped unless it is one event
+id) and adds one prose line under the headers: this is an edit of a message the
+agent was already given, so it answers once, replying only to what the edit
+changes or with `[no-send]` when nothing does. For an owner task, when earlier
+tasks of this lane for the same room, message and sender are still in `tasks/`
+with no result, the line names them (at most three) so the core answers the
+edit and closes each with `[deduped: <the edit's task id>]`. The bridge never
+closes a queued task itself: it cannot tell a task the core has not read from
+one it is working on. A task without the field is written as before.
+
 **`capabilities` (the poll's proof).** Every poll carries
 `&capabilities=voice-outcome-v1`, the voice-outcome contract the heartbeat also
 declares (below). One agent's credential may be used by more than one bridge, so
