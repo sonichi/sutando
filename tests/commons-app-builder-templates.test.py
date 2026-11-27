@@ -25,7 +25,7 @@ def check(name, cond):
     passed.append(name)
 
 
-TEMPLATES = ["tracker", "poll", "planner", "turn-game", "research-desk", "task-board"]
+TEMPLATES = ["tracker", "poll", "planner", "turn-game", "review-list", "research-desk", "task-board"]
 # The property types GUIDE.md's prop_add table allows.
 TYPES = {
     "title", "text", "number", "date", "checkbox", "select", "status",
