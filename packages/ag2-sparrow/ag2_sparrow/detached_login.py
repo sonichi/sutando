@@ -38,17 +38,13 @@ def ours(entry) -> int:
     return pid if was and pid != os.getpid() and born(pid) == was else 0
 
 
-def end(entry, group: bool = False) -> bool:
-    """SIGTERM the recorded process (its whole process group with `group`, for a CLI started as a group
-    leader whose own children keep polling otherwise) when it is still that very process."""
+def end(entry) -> bool:
+    """SIGTERM the recorded process when it is still that very process (pid and start time); whether it was."""
     pid = ours(entry)
     if not pid:
         return False
     try:
-        if group:
-            os.killpg(pid, signal.SIGTERM)
-        else:
-            os.kill(pid, signal.SIGTERM)
+        os.kill(pid, signal.SIGTERM)
     except OSError:
         return False
     return True

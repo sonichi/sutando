@@ -1,8 +1,9 @@
 """Codex's device-code sign-in from the owner's phone (`adapters/codex/device_login`), against a stand-in
 `codex` that prints what codex 0.160.0 prints and then signs in, fails or never finishes.
 
-No real `codex` runs and no real login is touched: HOME, the agent's CODEX_HOME and the stand-in live in a
-temp dir, and the stand-in's "login" is a JSON file with a made-up id token. Run:
+No real `codex` runs and no real login is touched: the user's home as the module sees it, the agent's
+CODEX_HOME and the stand-in live in a temp dir, and the stand-in's "login" is a JSON file with a made-up id
+token. HOME itself is left alone: the stub app-server (run under coverage in CI) needs the real one. Run:
     python3 packages/ag2-sparrow/tests/test_codex_device_login.py
 """
 import errno
@@ -78,7 +79,8 @@ def shq(text):
 
 
 class Home:
-    """HOME, an agent's live CODEX_HOME and the stand-in `codex`, all in a temp dir."""
+    """The user's home (as device_login sees it), an agent's live CODEX_HOME and the stand-in `codex`, all in a
+    temp dir."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -92,12 +94,12 @@ class Home:
         self.codex.write_text("#!/bin/sh\nexec %s %s %s \"$@\"\n" % (shq(sys.executable), shq(self.bin / "stub.py"),
                                                                     shq(self.bin)))
         self.codex.chmod(0o755)
-        self.env = {"PATH": "%s:%s" % (self.bin, os.environ.get("PATH", "/usr/bin:/bin")), "HOME": str(self.user),
+        self.env = {"PATH": "%s:%s" % (self.bin, os.environ.get("PATH", "/usr/bin:/bin")), "HOME": os.environ.get("HOME", ""),
                     "CODEX_HOME": str(self.home)}
         self.dir = self.state / dl.STATE
-        patch = mock.patch.dict(os.environ, self.env)
-        patch.start()
-        self.addCleanup(patch.stop)
+        for patch in (mock.patch.dict(os.environ, self.env), mock.patch.object(dl, "_user_home", return_value=self.user)):
+            patch.start()
+            self.addCleanup(patch.stop)
         self.addCleanup(lambda: dl.cancel(self.dir, str(self.codex), self.env))
         self.addCleanup(self.tmp.cleanup)
 
@@ -152,6 +154,9 @@ class ParseTest(unittest.TestCase):
                 self.assertEqual(dl.parse("Open %s\nEnter this one-time code\n%s\n" % (url, CODE))[0], "")
         self.assertTrue(dl.link_ok("https://chatgpt.com/device"))
 
+    def test_the_users_home_is_the_one_the_process_runs_as(self):
+        self.assertEqual(dl._user_home(), Path(os.path.expanduser("~")))
+
 
 class OwnHomeTest(Home, unittest.TestCase):
     def test_only_the_agents_own_home_is_signed_in(self):
@@ -181,7 +186,11 @@ class OwnHomeTest(Home, unittest.TestCase):
             (agents / key).mkdir(parents=True)
             (agents / key / "codex-local.conf").write_text("CODEX=codex\nCODEX_HOME=%s\n" % home)
         self.assertEqual(dl.installed_homes(), [str(self.home)])
-        with mock.patch.object(dl.cm, "config_root", return_value=mock.Mock(rglob=mock.Mock(side_effect=OSError))):
+        (agents / "c").mkdir()
+        (agents / "c" / "codex-local.conf").write_text('CODEX_HOME="unterminated\n')
+        (agents / "d.conf").mkdir()
+        self.assertEqual(dl.installed_homes(), [str(self.home)], "an unreadable or unparsable config names none")
+        with mock.patch.object(dl.Path, "rglob", side_effect=OSError):
             self.assertEqual(dl.installed_homes(), [])
 
 

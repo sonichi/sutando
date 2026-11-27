@@ -20,7 +20,7 @@ anything is done, and an answer must reply to the very card that asked.
 Every tap is the owner's, in the owner's DM, on a card this agent posted (agent_card.click_verdict,
 re-checked here); "Add account" also only on an account card posted within TAP_FRESH_S. One sign-in at a
 time per agent: a second tap while one runs shows the same card again. The sign-in belongs to a small
-detached process (`supervise`), which ends it (its whole process group) after LOGIN_WAIT_S. The code is
+detached process (`supervise`), which ends it after LOGIN_WAIT_S. The code is
 kept only in the sign-in's owner-only state, said nowhere but the card, and dropped when Codex exits.
 
 Refused, as Claude Code's remote sign-in is, for an agent whose Codex home is not its own: none set
@@ -32,8 +32,8 @@ from __future__ import annotations
 import errno
 import os
 import re
+import shlex
 import shutil
-import signal
 import subprocess
 import sys
 import time
@@ -41,13 +41,13 @@ import urllib.parse
 import uuid
 from pathlib import Path
 
-from ... import account_switch, card_desk, connect_common as cm, connector_cards, detached_login, signin_watch
+from ... import account_switch, card_desk, connector_cards, detached_login, signin_watch
 from ...detached_login import ANSI_RE, born, locked, read_json, write_private
 
 # The owner's time to finish signing in, and then to answer Yes or No; "Add account" acts only on a card
 # posted within TAP_FRESH_S; past LOGIN_WAIT_S + GRACE_S with no word from the supervisor it is taken as gone.
 LOGIN_WAIT_S, TAP_FRESH_S, GRACE_S = 300.0, 300.0, 30.0
-LINK_WAIT_S, LOGOUT_WAIT_S = 20.0, 30.0
+LINK_WAIT_S, LOGOUT_WAIT_S, STOP_WAIT_S = 20.0, 30.0, 5.0
 STATE = "codex-device-login"
 STAGING = "home"
 DEVICE_CARD = "account-device"
@@ -81,13 +81,32 @@ def _real(path) -> str:
     return os.path.realpath(os.path.expanduser(str(path)))
 
 
+def _user_home() -> Path:
+    return Path(os.path.expanduser("~"))
+
+
 def installed_homes() -> list:
-    """The Codex home every installed codex-local job names, this one's included."""
+    """The Codex home every installed codex-local job names, this one's included. Read here, not through
+    connect_common, which reaches the gateway credentials this connector never needs."""
+    found = []
     try:
-        paths = sorted(cm.config_root().rglob("*.conf"))
+        paths = sorted((_user_home() / ".config" / "ag2-sparrow").rglob("*.conf"))
     except OSError:
-        return []
-    return [h for h in (cm.read_config_lenient(p).get("CODEX_HOME") or "" for p in paths) if h]
+        return found
+    for path in paths:
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            if line.startswith("CODEX_HOME="):
+                try:
+                    home = "".join(shlex.split(line.partition("=")[2]))
+                except ValueError:
+                    continue
+                if home:
+                    found.append(home)
+    return found
 
 
 def own_home(env: dict, homes=()) -> str:
@@ -96,7 +115,7 @@ def own_home(env: dict, homes=()) -> str:
     if not env.get("CODEX_HOME"):
         raise Refused(SHARED)
     mine = _real(env["CODEX_HOME"])
-    if mine == _real(Path(os.path.expanduser("~")) / ".codex"):
+    if mine == _real(_user_home() / ".codex"):
         raise Refused(PERSONAL)
     if os.path.islink(os.path.join(mine, signin_watch.CODEX_AUTH)):
         raise Refused(CORES)
@@ -137,7 +156,7 @@ def _alive(d: Path) -> bool:
 def _stop(d: Path) -> None:
     """End the sign-in's processes and drop what Codex printed (the code with it)."""
     pids = read_json(d / "pids.json")
-    detached_login.end(pids.get("codex"), group=True)
+    detached_login.end(pids.get("codex"))
     detached_login.end(pids.get("supervisor"))
     for name in ("out.log", "pids.json"):
         try:
@@ -340,21 +359,22 @@ def sign_out(codex: str, env: dict, run=subprocess.run, homes=(), wait_s: float 
 
 
 def supervise(state_dir: str, codex: str, wait_s: float = LOGIN_WAIT_S) -> int:
-    """The detached owner of one device-code sign-in: run it, end it (its whole process group) after
-    `wait_s`, and record how it ended."""
+    """The detached owner of one device-code sign-in: run it, end it after `wait_s` (asked first, then
+    killed), and record how it ended. Only its own child is signalled."""
     d = Path(state_dir)
     with open(d / "out.log", "ab") as log:
         p = subprocess.Popen([codex, "login", "--device-auth"], stdin=subprocess.DEVNULL, stdout=log,
-                             stderr=subprocess.STDOUT, start_new_session=True)
+                             stderr=subprocess.STDOUT)
         write_private(d / "pids.json", {"supervisor": [os.getpid(), born(os.getpid())], "codex": [p.pid, born(p.pid)]})
         try:
             code = p.wait(timeout=wait_s)
         except subprocess.TimeoutExpired:
+            p.terminate()
             try:
-                os.killpg(p.pid, signal.SIGKILL)
-            except OSError:
+                p.wait(timeout=STOP_WAIT_S)
+            except subprocess.TimeoutExpired:
                 p.kill()
-            p.wait()
+                p.wait()
             code = "timeout"
     if d.exists():
         write_private(d / "result.json", {"exit": code})
@@ -366,11 +386,11 @@ class Remote:
     card (account_switch.AccountSwitch), `root` the work root holding the agent's card ledger, `codex` the
     executable, `env` the CLI's environment (its live CODEX_HOME)."""
 
-    def __init__(self, accounts, state_dir, root, codex, env, log, homes=installed_homes, popen=subprocess.Popen,
+    def __init__(self, accounts, state_dir, root, codex, env, log, homes=None, popen=subprocess.Popen,
                  run=subprocess.run):
         self.accounts, self.dir, self.root = accounts, Path(state_dir) / STATE, Path(root)
         self.codex, self.env, self.log = codex, env, log
-        self.homes, self.popen, self.run = homes, popen, run
+        self.homes, self.popen, self.run = homes or (lambda: installed_homes()), popen, run
 
     def busy(self) -> bool:
         return bool(current(self.dir))
