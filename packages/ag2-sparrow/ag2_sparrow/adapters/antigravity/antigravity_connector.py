@@ -618,7 +618,8 @@ class Connector:
         # Out of quota: the account card, unasked, in the owner's DM, on each of their messages (quota_notice).
         self.quota = quota_notice.QuotaNotice(args.state, getattr(args, "bridge_state", None), NAME,
                                               self.accounts.quota_card, self.accounts.using, log,
-                                              note=lambda text: self.accounts.card("pending", text))
+                                              note=lambda text: self.accounts.card("pending", text),
+                                              account=self.quota_account)
         self.desk = card_desk.Desk(self.root, card_desk.led(publish, self.models.unsaid, quoted), quoted,
                                    [self.models, self.accounts], self.limit_first,
                                    lambda: self.quota.says_in_room())
@@ -631,6 +632,12 @@ class Connector:
         self.models.seen([(m.get("modelId"), m.get("name")) for m in (models.get("availableModels") or [])
                           if isinstance(m, dict)], models.get("currentModelId"))
 
+    def quota_account(self) -> str:
+        """The account a limit is kept for: this agent's own Gemini API key, or the computer's Google sign-in. A
+        switch between the two leaves the old limit behind; another Google account is only known from agy's next
+        turn, which clears the limit (it answered) or records it again."""
+        return "api-key" if self.accounts.keyed() else "google"
+
     def limit_first(self, sent, result_file) -> str:
         """Out of quota, the owner's ask for a card is answered by the limit's card, with the account in use."""
         said = self.quota.says()
@@ -638,6 +645,7 @@ class Connector:
             return ""
         text = " ".join(w for w in (said, self.accounts.using()) if w)
         self.accounts.say(sent.get("channel_id"), account_switch.limited(self.accounts.quota_card(text)), result_file)
+        self.quota.shown()
         return "quota-card-asked"
 
     def card_task(self, task_id, headers, path, result_file):

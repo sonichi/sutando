@@ -176,11 +176,21 @@ def _card_words(card, limited: list, text: str, log) -> str:
     return words(limited, text, "" if who else card.using(), who)
 
 
-def new_session(root) -> None:
+def new_session(root, cfg: "dict | None" = None) -> None:
     """A session was just created (an account switch restarts it): what was told was about the session
-    before, so a limit on this one is a new incident, told again. The DM room is the claim's and stays."""
-    if load(root):
-        save(root, {})
+    before, so a limit on this one is a new incident, told again. The DM room is the claim's and stays. With
+    `cfg` (the agent's bridge), the old incident's cards still queued and not tried yet are taken back."""
+    rec = load(root)
+    if not rec:
+        return
+    if cfg is not None:
+        tasks = rec.get("tasks") if isinstance(rec.get("tasks"), dict) else {}
+        qids = [rec.get("qid")] + [e.get("qid") for e in tasks.values() if isinstance(e, dict)] + [
+            c.get("qid") for c in rec.get("covers") or [] if isinstance(c, dict)]
+        bridge = str(cb.bridge_state(cfg))
+        for qid in {q for q in qids if q}:
+            connector_cards.withdraw(bridge, qid)
+    save(root, {})
 
 
 def _limit_lines(text: str) -> list:
@@ -404,6 +414,12 @@ def notice(root, cfg: dict, names, text: str, log, now=time.time, session: str =
         save(root, rec)
     bridge = str(cb.bridge_state(cfg))
     rec = dict(rec, since=rec.get("since") or at)
+    if not rec.get("said"):
+        # Kept as soon as the limit is seen, whether or not a card can be sent yet: an ask that comes first (the
+        # first message after a restart, before the owner's DM is known) is answered by the limit's card too.
+        card = account_card.AccountCard(root, cfg, lambda result_file, body: None, log)
+        rec = dict(rec, said=_card_words(card, limited, text, log), said_room=room_words(text))
+        save(root, rec)
     rec, done = _tell_tasks(root, cfg, bridge, limited, text, log, rec, at)
     told_tasks = "quota-task-card x%d" % done.count("quota-task-card") if "quota-task-card" in done else ""
     return "; ".join(w for w in (_tell_incident(root, cfg, bridge, limited, text, log, rec, at), told_tasks) if w)
@@ -418,6 +434,9 @@ def asked(root, cfg: dict, sent, result_file, publish, log) -> str:
     card = account_card.AccountCard(root, cfg, publish, log)
     card.say(sent.get("channel_id"), account_switch.limited(card.card("pending", str(rec["said"]), ask=True)),
              result_file)
+    if not rec.get("told") and not rec.get("qid"):
+        # That card told the owner: none unasked follows it once their DM is known (one owed for want of a room).
+        save(root, dict(rec, told=True))
     return "quota-card-asked"
 
 

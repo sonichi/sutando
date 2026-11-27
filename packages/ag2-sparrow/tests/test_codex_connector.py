@@ -2741,6 +2741,170 @@ class QuotaCardTest(CardWorld, unittest.TestCase):
         self.serve("task-3", "[[limit-bare]] hello")
         self.assertEqual(len(self.posted("$card2")), 1, "the limit came back: a second card")
 
+    def sign_in(self, account_id):
+        """The login on disk, as the account switch leaves it: the account's id only (no token is needed here)."""
+        (self.home / "auth.json").write_text(json.dumps({"tokens": {"account_id": account_id}}))
+
+    def test_after_a_restart_on_an_account_out_of_usage_the_first_ask_gets_only_the_limits_card(self):
+        # RC6 acceptance: out of usage, the first ask after a restart got the plain card. Each serve is a new
+        # connector (a restart); the server, asked before any turn was refused, says the account is out.
+        self.sign_in("acct-a")
+        (self.home / "stub-limits").write_text("out")
+        for n, ask in enumerate(("account", "model", "/model")):
+            self.assertEqual(self.serve("task-first%d" % n, ask), account_switch.ANSWERED, ask)
+            self.assertEqual(metrics(self.work)[-1]["card"], "quota-card-asked", ask)
+            shown = self.outbox()
+            self.assertEqual([(q["card"]["id"], q["card"]["account_controls"]) for q in shown],
+                             [(account_switch.CARD, {"runtime": "codex", "limit": True})], ask)
+            self.assertRegex(shown[0]["card"]["text"], r"^Codex has reached its usage limit \(resets [^)]+\)")
+            self.posted()
+        rec = json.loads((self.work / "state" / quota_notice.FILE).read_text())
+        self.assertTrue(rec["told"], "the card the ask got told the owner: no unasked one besides")
+        # A limit recorded by a refused turn, then a restart with a server that cannot say: the record answers.
+        (self.home / "stub-limits").unlink()
+        self.serve("task-l", "[[limit]] hello")
+        self.posted()
+        self.serve("task-after", "/model")
+        self.assertEqual([q["card"]["id"] for q in self.outbox()], [account_switch.CARD])
+        self.assertEqual(metrics(self.work)[-1]["card"], "quota-card-asked")
+
+    def test_after_switching_to_an_account_with_usage_the_old_limit_no_longer_answers(self):
+        self.sign_in("acct-a")
+        self.serve("task-1", "[[limit]] hello")
+        self.posted()
+        self.assertEqual(self.serve("task-2", "/model"), account_switch.ANSWERED)
+        self.assertEqual(metrics(self.work)[-1]["card"], "quota-card-asked")
+        self.posted()
+        # The owner switched (another account in auth.json) and the agent restarted: its own cards, its turns.
+        self.sign_in("acct-b")
+        self.assertEqual(self.serve("task-3", "/model"), model_switch.ANSWERED)
+        self.assertEqual(metrics(self.work)[-1]["card"], "model-card")
+        self.assertEqual([q["card"]["id"] for q in self.outbox()], [self.CARD])
+        self.assertFalse(json.loads((self.work / "state" / quota_notice.FILE).read_text()), "the old limit is dropped")
+        self.posted()
+        self.serve("task-4", "account")
+        self.assertEqual(self.outbox()[-1]["card"]["account_controls"], {"runtime": "codex"}, "the plain account card")
+        self.assertTrue(self.serve("task-5", "hello").startswith("STUB echo"))
+
+    def test_after_a_switch_nothing_of_the_old_accounts_limit_is_sent_or_sent_again(self):
+        # Review of #6879: the idle tick re-sent an owed or dropped notice of the account before the switch, with
+        # the old reset time beside the new account's name. Nothing of it may go out once another account is in use.
+        self.sign_in("acct-a")
+        self.serve("task-1", "[[limit]] hello")
+        (first,) = self.outbox()            # queued, not posted yet
+        state = self.work / "state"
+        kept = json.loads((state / quota_notice.FILE).read_text())
+        self.assertTrue(kept["account"], "kept with the account it was recorded on")
+        account, said = [kept["account"]], []
+        mine = "id: task-2\nchannel_id: %s\nuser_id: @alice:s.space\naccess_tier: owner\ntask: again\n" % self.DM
+
+        def notice():
+            return quota_notice.QuotaNotice(state, self.bridge, "Codex", lambda text: (first["body"], first["card"]),
+                                            lambda: "", lambda *a: said.append(" ".join(map(str, a))),
+                                            now=lambda: time.time() + quota_notice.RETRY_S + 1,
+                                            account=lambda: account[0])
+
+        # A message's card that could not be queued is owed; the incident's own card is still in the outbox.
+        with mock.patch.object(connector_cards, "queue", side_effect=OSError("disk full")):
+            notice().hit(task="task-2", task_text=mine)
+        self.assertEqual(notice().owed(), ["task-2"])
+        account[0] = "another account"      # the owner switched; no message comes after it
+        self.assertEqual(notice().tick(), "")
+        self.assertEqual(self.outbox(), [], "the queued card was taken back, the owed one never queued")
+        self.assertEqual(json.loads((state / quota_notice.FILE).read_text()), {})
+        self.assertIn("1 queued card(s) taken back", " ".join(said))
+        self.assertEqual(self.posted(), [])
+        # A notice owed for want of a DM room, then the room seen after the switch: not sent either.
+        account[0] = "acct-a"
+        (state / quota_notice.ROOM_FILE).unlink()
+        self.assertEqual(notice().hit("3:05 PM"), "quota-no-room")
+        (state / quota_notice.ROOM_FILE).write_text(json.dumps({"room": self.DM}))
+        account[0] = "another account"
+        self.assertEqual(notice().tick(), "")
+        self.assertEqual(self.outbox(), [])
+        # One the bridge dropped is not queued again for an account no longer in use.
+        account[0] = "acct-a"
+        self.assertEqual(notice().hit("3:05 PM"), "quota-card")
+        (sent,) = self.outbox()
+        for p in (self.bridge / "agent-cards" / "outbox").iterdir():
+            p.unlink()                      # gone from the outbox with no record: past its deadline, dropped
+        rec = json.loads((state / quota_notice.FILE).read_text())
+        (state / quota_notice.FILE).write_text(json.dumps(dict(rec, queued=0)))
+        account[0] = "another account"
+        self.assertEqual(notice().tick(), "")
+        self.assertEqual(self.outbox(), [])
+        # A card whose send was already tried stands: it is not taken back.
+        account[0] = "acct-a"
+        notice().hit("3:05 PM")
+        (entry,) = (self.bridge / "agent-cards" / "outbox").iterdir()
+        entry.write_text(json.dumps(dict(json.loads(entry.read_text()), attempted=True)))
+        self.assertFalse(connector_cards.withdraw(self.bridge, entry.stem))
+        self.assertFalse(connector_cards.withdraw(self.bridge, "not-a-queue-id"))
+
+    def test_a_follow_up_queued_after_the_limit_was_told_is_taken_back_on_a_switch_before_the_bridge_flushes(self):
+        # Second review of #6879: told incident, a message's follow-up queued but not posted, nothing owed.
+        self.sign_in("acct-a")
+        self.serve("task-1", "[[limit]] hello")
+        self.assertEqual(len(self.posted()), 1, "the incident's card is posted")
+        self.serve("task-2", "[[limit]] again")
+        state = self.work / "state"
+        rec = json.loads((state / quota_notice.FILE).read_text())
+        (follow_up,) = rec["queued_ids"]
+        self.assertEqual((rec["told"], rec.get("owed")), (True, {}), "told, and nothing owed")
+        self.assertEqual(len(self.outbox()), 1, "the follow-up waits in the outbox")
+        account = [rec["account"]]
+        notice = quota_notice.QuotaNotice(state, self.bridge, "Codex", None, lambda: "", lambda *a: None,
+                                          account=lambda: account[0])
+        self.assertEqual(notice.tick(), "", "same account: left queued")
+        self.assertEqual(len(self.outbox()), 1)
+        account[0] = "another account"      # the owner switched; no message comes after it
+        self.assertEqual(notice.tick(), "")
+        self.assertEqual((self.outbox(), connector_cards.outcome(self.bridge, follow_up)), ([], "dropped"))
+        self.assertEqual(self.posted(), [], "the bridge's next flush sends nothing of the old account")
+        # Once every card of a told incident has left the outbox, the idle tick stops looking and reads no account.
+        account[0] = rec["account"]
+        notice.save(dict(rec, queued_ids=[follow_up]))
+        notice.account = lambda: 1 / 0
+        self.assertEqual(notice.tick(), "")
+        self.assertNotIn("queued_ids", notice.load())
+
+    def test_a_limit_kept_for_another_account_is_not_this_ones(self):
+        self.sign_in("acct-b")
+        state = self.work / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / quota_notice.FILE).write_text(json.dumps({"since": time.time(), "last": time.time(), "told": True,
+                                                           "reset_at": time.time() + 3600, "account": "another"}))
+        self.serve("task-1", "/model")
+        self.assertEqual(metrics(self.work)[-1]["card"], "model-card")
+        # Kept for this very account, the same record answers.
+        notice = quota_notice.QuotaNotice(state, self.bridge, "Codex", None, None, lambda *a: None,
+                                          account=lambda: "mine")
+        notice.save({"since": time.time(), "told": True, "reset_at": time.time() + 3600, "account": "mine"})
+        self.assertTrue(notice.says())
+        # An account that cannot be read leaves the record as it is.
+        self.assertTrue(quota_notice.QuotaNotice(state, self.bridge, "Codex", None, None, lambda *a: None,
+                                                 account=lambda: 1 / 0).says())
+
+    def test_a_server_that_says_the_account_has_usage_clears_a_limit_kept_from_before_the_restart(self):
+        self.sign_in("acct-a")
+        self.serve("task-1", "[[limit-bare]] hello")
+        self.posted()
+        (self.home / "stub-limits").write_text("ok")
+        self.serve("task-2", "/model")
+        self.assertEqual(metrics(self.work)[-1]["card"], "model-card")
+
+    def test_what_a_usage_read_says(self):
+        later = time.time() + 3600
+        out = {"rateLimits": {"primary": {"usedPercent": 100, "resetsAt": later}}}
+        self.assertEqual(cc.usage_state(out), out["rateLimits"])
+        self.assertTrue(cc.usage_state({"rateLimits": {"rateLimitReachedType": "plan"}}) is not None)
+        self.assertTrue(cc.usage_state({"rateLimits": {}, "ordinaryUsageAllowed": False}) is not None)
+        self.assertEqual(cc.usage_state({"rateLimits": {"primary": {"usedPercent": 40, "resetsAt": later},
+                                                        "secondary": {"usedPercent": 99}}}), {})
+        for unknown in (None, {}, {"turn": {}}, {"rateLimits": {}}, {"rateLimits": {"primary": {"usedPercent": "x"}}},
+                        {"rateLimits": {"primary": {"usedPercent": 100}}}):
+            self.assertIsNone(cc.usage_state(unknown), unknown)
+
     def test_another_error_queues_no_card(self):
         self.assertEqual(self.serve("task-1", "[[fail]] hello"), "Codex ended this task with status failed.\n")
         self.assertEqual(self.outbox(), [])
