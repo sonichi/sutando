@@ -42,6 +42,7 @@ import sys
 from pathlib import Path
 
 OWN = (".claude.json", "settings.json")      # kept per worker, never linked
+
 # The only core entries a worker follows: what it works with, never who it is signed in as
 # (`channels` is the core's channel configs its progress posts go through, not a Claude sign-in).
 SHARED = ("CLAUDE.md", "agents", "channels", "commands", "hooks", "keybindings.json",
