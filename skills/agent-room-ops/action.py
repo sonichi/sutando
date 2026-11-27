@@ -92,6 +92,10 @@ def credential(room_id: str, agent_mxid: Optional[str] = None, *, workspace=None
     worker's session gets its own agent's or Refused; None only for a core install that records none."""
     connections, _ = _owners()
     worker = connections.session_worker(environ)
+    named = str((os.environ if environ is None else environ).get(connections.SESSION_WORKER_ENV) or "")
+    if named and not worker:
+        raise Refused(f"{connections.SESSION_WORKER_ENV} is set but is not a pool worker id, so whose "
+                      "agent this session acts as is unknown; nothing was sent")
     if worker:
         try:
             row = connections.connection_for_room(room_id, workspace, environ)

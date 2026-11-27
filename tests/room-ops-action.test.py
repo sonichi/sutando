@@ -234,6 +234,32 @@ class AllowList(Base):
 
 
 class WhoseAgent(Base):
+    """The core's credential is there to be used in every case: a refusal is the worker rule's."""
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.dict("os.environ", {"GATEWAY_URL": RELAY, "GATEWAY_TOKEN": CORE_SECRET})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_the_cores_credential_is_usable_here(self):
+        res = self.run_action(worker="")
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(self.server.calls[0]["bearer"], CORE_SECRET)
+
+    def test_a_malformed_worker_id_is_refused_not_read_as_the_core(self):
+        for bad in ("Not A Worker", "-x", "w" * 40):
+            res = self.run_action(worker=bad)
+            self.assert_refused_without_the_core(res)
+            self.assertIn(C.SESSION_WORKER_ENV, res["reason"])
+
+    def test_a_worker_whose_token_is_missing_is_refused(self):
+        vault = FakeVault()
+        del vault.store[C.token_ref_for(OWN)]
+        res = action.run("execute", ROOM, WRITE, None, workspace=self.ws, environ={C.SESSION_WORKER_ENV: W},
+                         vault=vault, request=self.server, no_task=True)
+        self.assert_refused_without_the_core(res)
+
     def assert_refused_without_the_core(self, res):
         self.assert_nothing_sent(res)
         self.assertNotIn(CORE_SECRET, json.dumps(res))
