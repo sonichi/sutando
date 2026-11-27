@@ -44,6 +44,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -69,6 +70,10 @@ NO_REPLY = "NO_REPLY"
 HELD_WAIT_S = held_start.WAIT_S
 RETRY_S = 60.0
 STDERR_NAME = "agy-acp.stderr"
+# Said at once to an owner's or collaborator's message that waits behind a running turn (`Connector.while_busy`).
+BUSY_ACK = "Got it \u2014 I'm finishing the previous request, then I'll do this."
+BUSY_CARD_ID = "agy-busy"
+BUSY_KINDS = frozenset({OWNER, COLLABORATOR})
 NOT_SIGNED_IN = ("Antigravity is not signed in on this computer (%s): run `agy` once in a terminal and sign in, "
                  "or run `agy acp --login`")
 
@@ -628,6 +633,59 @@ class Connector:
         # What a person opening this agent's terminal panel follows (`ag2-sparrow-antigravity-local view`).
         # Written off the ACP reader thread, which also answers permission requests.
         self.view = live_view.Writer(live_view.path_of(self.root), background=True)
+        self.seen = set()       # tasks done, as _serve keeps them: the busy watcher skips these
+        self.acked = set()      # tasks the busy watcher already looked at (and acknowledged, when it should)
+
+    @contextlib.contextmanager
+    def while_busy(self, current):
+        """While a turn runs (turns stay one at a time), a watcher thread only reads the waiting task files
+        and acknowledges each owner's or collaborator's message among them once (`ack_waiting`)."""
+        stop = threading.Event()
+
+        def watch():
+            while True:
+                self.ack_waiting(current)
+                if stop.wait(max(float(self.args.poll or 0), 0.05)):
+                    return
+        watcher = threading.Thread(target=watch, name="agy-busy-ack", daemon=True)
+        watcher.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            watcher.join()
+
+    def ack_waiting(self, current):
+        """Post BUSY_ACK in the room of each task waiting behind `current` that is a message from the owner or an
+        attested collaborator; never for a card tap or a message carrying a secret. Only a NOTE card in that room
+        (the bridge's card outbox): the task's one result stays its real answer, posted after its own turn."""
+        try:
+            names = self.pending_tasks(self.seen)
+        except OSError:
+            return
+        for name in names:
+            if name == current or name in self.acked:
+                continue
+            self.acked.add(name)
+            try:
+                self.ack_one(name)
+            except Exception as e:  # noqa: BLE001 - an acknowledgement never stops the running turn
+                log("busy acknowledgement not sent ->", name[:-4], "%s: %s" % (type(e).__name__, str(e)[:120]))
+
+    def ack_one(self, name):
+        path = os.path.join(self.args.inbox, name)
+        headers, _message, _ = parse_task(path)
+        kind, _ = turn_for(headers)
+        if kind not in BUSY_KINDS or not acp_host.is_message(headers):
+            return
+        agent_card, _ = connector_cards._core()
+        sent, said = agent_card.reply_words(card_desk.read_task(path))
+        if agent_card.click_tagged(sent) or agy_account.carries_secret(said):
+            return
+        room = (headers.get("channel_id") or "").strip()
+        built = agent_card.build(BUSY_CARD_ID, "info", title=NAME, body=BUSY_ACK, text=BUSY_ACK)
+        posted = card_desk.post(getattr(self.args, "bridge_state", None), room, built, log)
+        log("busy acknowledgement %s ->" % ("queued" if posted else "not queued"), name[:-4])
 
     def models_seen(self, models: dict):
         """Remember what a Session offered (ACP `models`), for the card."""
@@ -907,13 +965,16 @@ class Connector:
             if headers.get("access_tier") == "owner" and self.accounts.usable():
                 prompt += "\n\n" + self.accounts.HINT
             self.agy_pid = None
-            status, text, detail, turn = self.run_turn(task_id, headers, prompt, True, kind=kind)
+            with self.while_busy(name):
+                status, text, detail, turn = self.run_turn(task_id, headers, prompt, True, kind=kind)
             switched = self.account_seen() if kind == OWNER and self.in_owner_dm(path) else ""
         else:
             with guest_turn(self.args, headers, message) as pair:
                 prompt = wake_prompt(task_id, headers, message, operator_lines, None, self.note, readable=pair[1],
                                      kind=kind)
-                status, text, detail, turn = self.run_turn(task_id, headers, prompt, False, pair, message=message)
+                with self.while_busy(name):
+                    status, text, detail, turn = self.run_turn(task_id, headers, prompt, False, pair,
+                                                               message=message)
         self.view.done(status)
         # The outcome of an earlier pick goes first: a menu asked for in this turn then stays the card in force.
         # The owner's pick runs on every turn, whoever sends it; the outcome is told in the owner's DM only,
@@ -982,7 +1043,7 @@ class Connector:
     def _serve(self):
         done_path = os.path.join(self.args.state, "done")
         metrics = os.path.join(self.args.state, "metrics.jsonl")
-        seen = set(load_done(done_path))
+        seen = self.seen = set(load_done(done_path))
         done = 0
         idle_since = time.time()
         while not stop_requested():
