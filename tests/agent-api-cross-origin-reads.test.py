@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""agent-api never grants a cross-origin read to a foreign site.
+"""agent-api never grants a cross-origin read to a foreign site, and its loopback state is behind the bearer.
 
 A REAL HTTP server on an ephemeral port, the workspace a temp dir. Contract:
   a) no response carries `Access-Control-Allow-Origin: *`; a foreign Origin gets no grant at all
      (JSON routes, /media, /avatar, the OPTIONS preflight)
   b) a loopback page, the desktop app's origins and a page served from the same host get their
      Origin echoed, with Vary: Origin
-  c) responses still reach callers that need no grant (same-origin, <img>, local tools)
-  d) DNS rebinding is refused: a Host that is not loopback, an IP literal or declared gets 403
+  c) /media/state/*, /media/tasks/*, /media/logs/* and any text-like file need the local API
+     bearer: 401 without it (before any existence check), 403 for a foreign Origin even with it,
+     200 with it from the desktop app's origin
+  d) embeddable media in results/, data/ and notes/ needs no bearer (an <img> cannot send one)
+  e) DNS rebinding is refused: a Host that is not loopback, an IP literal or declared gets 403
      on every route (reads and POST /task), unless the request carries a valid bearer
 
 Run: python3 tests/agent-api-cross-origin-reads.test.py
@@ -51,6 +54,7 @@ api.API_TOKEN = ""
 (WS / "results" / "media").mkdir(parents=True, exist_ok=True)
 (WS / "results" / "media" / "pic.png").write_bytes(b"\x89PNG\r\n\x1a\n")
 (WS / "results" / "task-1.txt").write_text("private reply\n")
+TOKEN = api.connections_bearer()
 
 server = http.server.HTTPServer(("127.0.0.1", 0), api.Handler)
 PORT = server.server_address[1]
@@ -107,34 +111,58 @@ def main() -> int:
     for origin in ("null", "http://127.0.0.1@evil.com", "http://localhost.evil.com", "http://127.0.0.1.evil.com"):
         check(req("/ping", origin=origin)[1] is None, f"b) {origin} gets no grant")
 
-    # d) DNS rebinding: the Host is the attacker's name, so the request is refused
+    # e) DNS rebinding: the Host is the attacker's name, so the request is refused
     rebound = f"evil.example:{PORT}"
     for path in ("/ping", "/tasks/active", "/activity", "/media/results/media/pic.png"):
         status, acao, _v, body = req(path, origin=f"http://{rebound}", host=rebound)
-        check(status == 403 and b"host not allowed" in body, f"d) {path} under a rebinding Host: 403 ({status})")
+        check(status == 403 and b"host not allowed" in body, f"e) {path} under a rebinding Host: 403 ({status})")
     c = http.client.HTTPConnection("127.0.0.1", PORT, timeout=10)
     c.request("POST", "/task", body="hello", headers={"Host": rebound, "Origin": f"http://{rebound}",
                                                        "Content-Type": "text/plain"})
     r = c.getresponse()
     r.read()
     c.close()
-    check(r.status == 403, f"d) POST /task under a rebinding Host: 403 ({r.status})")
+    check(r.status == 403, f"e) POST /task under a rebinding Host: 403 ({r.status})")
     check(req("/ping", host=rebound, bearer=api.connections_bearer())[0] == 200,
-          "d) a valid bearer is not a rebinding page: allowed")
-    check(req("/ping", host=f"192.168.1.20:{PORT}")[0] == 200, "d) an IP-literal LAN Host: allowed")
-    check(req("/ping", host=f"[::1]:{PORT}")[0] == 200, "d) [::1]: allowed")
+          "e) a valid bearer is not a rebinding page: allowed")
+    check(req("/ping", host=f"192.168.1.20:{PORT}")[0] == 200, "e) an IP-literal LAN Host: allowed")
+    check(req("/ping", host=f"[::1]:{PORT}")[0] == 200, "e) [::1]: allowed")
     api.ALLOWED_HOSTS = "my-mac.lan"
     try:
-        check(req("/ping", host=f"my-mac.lan:{PORT}")[0] == 200, "d) a declared LAN name: allowed")
+        check(req("/ping", host=f"my-mac.lan:{PORT}")[0] == 200, "e) a declared LAN name: allowed")
     finally:
         api.ALLOWED_HOSTS = ""
-    check(req("/ping", host=f"my-mac.lan:{PORT}")[0] == 403, "d) an undeclared name: 403")
+    check(req("/ping", host=f"my-mac.lan:{PORT}")[0] == 403, "e) an undeclared name: 403")
     check(gate.rebinding_safe_host("") and gate.rebinding_safe_host("app.localhost:1"),
-          "d) no Host (no browser) and *.localhost are safe")
+          "e) no Host (no browser) and *.localhost are safe")
 
-    # the response still reaches same-origin callers; only the grant is withheld
+    # c) state, tasks and text need the bearer; the refusal comes before any existence check
+    for path in ("/media/state/agent-activity.jsonl", "/media/tasks/task-1.txt", "/media/results/task-1.txt",
+                 "/media/state/missing.json"):
+        status, acao, _v, body = req(path)
+        check(status == 401 and b"private" not in body, f"c) {path} without the bearer: 401 ({status})")
+        status, acao, _v, body = req(path, origin=FOREIGN, bearer=TOKEN)
+        check(status == 403 and acao is None and b"private" not in body,
+              f"c) {path} from a foreign origin with the bearer: 403, no grant ({status})")
+    status, acao, _v, body = req("/media/state/agent-activity.jsonl", origin="tauri://localhost", bearer=TOKEN)
+    check(status == 200 and acao == "tauri://localhost" and b"private task text" in body,
+          f"c) the desktop app with the bearer reads its activity rows ({status})")
+    check(req("/media/state/missing.json", bearer=TOKEN)[0] == 404, "c) with the bearer, a missing file is 404")
+    check(req("/media/state/agent-activity.jsonl", bearer="wrong")[0] == 401, "c) a wrong bearer is 401")
+
+    # d) embeddable media in a shared folder needs no bearer, judged by where the file really is
+    (WS / "state" / "secret.png").write_bytes(b"\x89PNG private")
+    (WS / "results" / "media" / "smuggled.png").symlink_to(WS / "state" / "secret.png")
+    status, _a, _v, body = req("/media/results/media/smuggled.png")
+    check(status == 401 and b"private" not in body, f"d) a results/ symlink into state/ still needs the bearer ({status})")
+    c = http.client.HTTPConnection("127.0.0.1", PORT, timeout=10)
+    c.request("GET", "/media/results/media/pic.png", headers={"Host": HOST})
+    r = c.getresponse()
+    r.read()
+    c.close()
+    check(r.getheader("X-Content-Type-Options") == "nosniff", "d) media is served with nosniff")
     status, acao, _v, body = req("/media/results/media/pic.png")
-    check(status == 200 and body.startswith(b"\x89PNG"), f"c) media still served to a same-origin caller ({status})")
+    check(status == 200 and body.startswith(b"\x89PNG"), f"d) an image in results/ embeds without the bearer ({status})")
 
     # the predicate itself
     check(gate.cors_origin(None, HOST) == "" and gate.cors_origin("", HOST) == "", "gate: no Origin, no grant")
@@ -170,6 +198,14 @@ def main() -> int:
     h.path, h.headers = "/twilio/voice", dict(rebound)
     check(h.host_allowed() is True, "f) in-process: Twilio's tunnel Host is exempt")
     check(h._bound_port() is None, "f) a handler with no server has no bound port")
+    sent, _h = bare("GET", "/media/state/agent-activity.jsonl", {"Host": HOST})
+    check(sent.get("status") == 401, "f) in-process: state needs the bearer")
+    sent, h = bare("GET", "/media/state/agent-activity.jsonl",
+                   {"Host": HOST, "Origin": "tauri://localhost", "Authorization": f"Bearer {TOKEN}"})
+    check(sent.get("status") == 200 and sent.get("X-Content-Type-Options") == "nosniff"
+          and b"private task text" in h.wfile.getvalue(), "f) in-process: with the bearer, state is served nosniff")
+    sent, _h = bare("GET", "/media/results/media/smuggled.png", {"Host": HOST})
+    check(sent.get("status") == 401, "f) in-process: a results/ link into state/ needs the bearer")
     sent, _h = bare("GET", "/media/results/media/pic.png", {"Host": HOST, "Origin": "tauri://localhost"})
     check(sent.get("status") == 200 and sent.get("Access-Control-Allow-Origin") == "tauri://localhost",
           "f) in-process: media carries the echoed grant")
@@ -192,7 +228,7 @@ def main() -> int:
     if FAILS:
         print(f"\nFAILED {len(FAILS)}: {FAILS}")
         return 1
-    print("\nPASS: no foreign site is granted a read of agent-api")
+    print("\nPASS: no foreign site can read agent-api; loopback state needs the bearer")
     return 0
 
 
