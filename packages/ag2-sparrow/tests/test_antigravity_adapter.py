@@ -20,6 +20,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -2790,6 +2792,86 @@ class SspaceStdioTest(unittest.TestCase):
         argv = cli.connector_argv(cfg, "/w", 7)
         self.assertEqual(argv[argv.index("--mcp-proxy-command") + 1], PROXY)
         self.assertIn("MCP_PROXY_COMMAND", cli.CONFIG_KEYS)
+
+
+class BusyAckTest(unittest.TestCase):
+    """Turns run one at a time; a message waiting behind a running turn is acknowledged at once in its room."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.w = Work(self.tmp.name)
+        self.outbox = Path(str(self.w.root) + ".bridge") / "state" / "agent-cards" / "outbox"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def task(self, tid, body, at, **kw):
+        self.w.task(tid, body, **kw)
+        os.utime(self.w.root / "tasks" / (tid + ".txt"), (at, at))
+
+    def cards(self):
+        return [json.loads(p.read_text()) for p in sorted(self.outbox.glob("*.json"))] if self.outbox.is_dir() else []
+
+    def wait_for(self, check, timeout=30.0):
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if check():
+                return True
+            time.sleep(0.05)
+        return False
+
+    def serve_in_background(self, n):
+        a = self.w.args()
+        a.once = n
+        runner = threading.Thread(target=gc.Connector(a).serve, daemon=True)
+        runner.start()
+        return runner
+
+    def test_messages_waiting_behind_a_turn_are_acknowledged_during_it_and_then_run_in_arrival_order(self):
+        now = time.time()
+        self.task("task-1", "STUB:SLOW 3 STUB:TEXT one", now - 10)
+        with contextlib.redirect_stderr(io.StringIO()):
+            runner = self.serve_in_background(4)
+            self.assertTrue(self.wait_for(lambda: "session/prompt" in self.w.methods()), "the first turn started")
+            self.task("task-2", "STUB:TEXT two", now - 3, channel="!other:s.space")
+            self.task("task-3", "STUB:TEXT three", now - 2, tier="team", collaborator=True)
+            self.task("task-4", "STUB:TEXT four", now - 1, tier="guest")
+            self.assertTrue(self.wait_for(lambda: len(self.cards()) == 2, 10.0), self.cards())
+            self.assertIsNone(self.w.result("task-1"), "acknowledged while the first turn still runs")
+            runner.join(90)
+        self.assertFalse(runner.is_alive())
+        cards = self.cards()
+        self.assertEqual(sorted(c["room"] for c in cards), ["!other:s.space", "!room:s.space"],
+                         "the owner's and the collaborator's messages, each in its own room; never the guest's")
+        self.assertEqual({(c["body"], c["card"]["text"]) for c in cards}, {(gc.BUSY_ACK, gc.BUSY_ACK)})
+        self.assertEqual([m["task"] for m in self.w.metrics()], ["task-1", "task-2", "task-3", "task-4"])
+        self.assertEqual(self.w.result("task-2"), "hello from agy-stub\n", "the ack is not the task's result")
+        self.assertEqual(len(self.cards()), 2, "each waiting message is acknowledged once")
+
+    def test_turns_stay_one_at_a_time(self):
+        now = time.time()
+        self.task("task-1", "STUB:SLOW 1 STUB:TEXT one", now - 2)
+        self.task("task-2", "STUB:SLOW 1 STUB:TEXT two", now - 1, channel="!other:s.space")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.serve_in_background(2).join(90)
+        prompts = [r for r in self.w.records() if r.get("method") in ("initialize", "session/prompt")]
+        self.assertEqual([r["method"] for r in prompts], ["initialize", "session/prompt"] * 2)
+        self.assertEqual([m["task"] for m in self.w.metrics()], ["task-1", "task-2"])
+        self.assertEqual(len(self.cards()), 1, "the second message waited behind the first and was told so")
+
+    def test_no_acknowledgement_when_nothing_is_running_or_for_a_card_tap(self):
+        self.w.task("task-1", "STUB:TEXT hi")
+        self.w.serve()
+        self.assertEqual(self.cards(), [])
+        c = gc.Connector(self.w.args())
+        self.w.task("task-2", "STUB:TEXT tap")
+        path = self.w.root / "tasks" / "task-2.txt"
+        path.write_text(path.read_text().replace("task: ", "card_click: {\"card_id\": \"x\", \"action\": \"y\"}\ntask: "))
+        self.w.task("task-3", "my key [REDACTED-Google API Key]", tier="owner")
+        c.seen = {"task-1"}
+        with contextlib.redirect_stderr(io.StringIO()):
+            c.ack_waiting("task-9.txt")
+        self.assertEqual(self.cards(), [], "neither a tap nor a message carrying a key is acknowledged")
 
 
 if __name__ == "__main__":

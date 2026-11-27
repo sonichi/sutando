@@ -9,7 +9,7 @@ and log files live under $HOME (the one variable the launcher's allowlist always
 signed in, `stub-sessions.json` keeps its sessions, `stub.log` records each request and permission outcome.
 A prompt marker picks the turn: STUB:TEXT, STUB:NOREPLY, STUB:MARKER, STUB:EDIT, STUB:SHELL, STUB:WEB,
 STUB:AGYWRITE, STUB:READ, STUB:ODD, STUB:HANG, STUB:ASKMODEL, STUB:MEDIA (asks to read every attachment it is told
-of, and to change one), STUB:CHANNEL, STUB:ATTACH. STUB:AGYWRITE's rawInput carries agy's own argument names (Path, Content,
+of, and to change one), STUB:CHANNEL, STUB:ATTACH; STUB:SLOW <seconds> waits that long, then answers as the rest says. STUB:AGYWRITE's rawInput carries agy's own argument names (Path, Content,
 Overwrite; Target, Replacement, Edits) as its file tools declare them; the key order (Content first) is the one
 a real owner turn's refusal named ("unrecognised key Content").
 `initialize` declares agy 1.5.13's captured `promptCapabilities` (image) and `sessionCapabilities`
@@ -31,6 +31,7 @@ import json
 import os
 import re
 import sys
+import time
 
 HOME = os.environ.get("HOME", "")
 STATE = os.path.join(HOME, "stub-sessions.json")
@@ -146,6 +147,9 @@ def prompt(rid, params):
     if "STUB:FAIL" in text:
         send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32603, "message": "internal error: stream reset"}})
         return
+    slow = re.search(r"STUB:SLOW (\d+(?:\.\d+)?)", text)
+    if slow:
+        time.sleep(float(slow.group(1)))
     cwd = sessions().get(sid) or os.getcwd()
     told = re.search(r"write the result to (results/\S+?\.txt)", text)
     if told:
