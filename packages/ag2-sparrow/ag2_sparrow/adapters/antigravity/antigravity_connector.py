@@ -55,7 +55,7 @@ from ...acp_host import MESSAGE_EVENT, SESSIONS_NAME, TASK_NAME_RE, SessionStore
 from ...acp_client import AcpClient as _SharedClient
 from ...relay_loop import count_arg
 from .gemini_key import API_KEY_AUTH, authenticate_with_app_key
-from . import agy_account
+from . import agy_account, agy_usage
 from ...team_guardrail import SANDBOXED_DELEGATION_CODEX
 from ...task_io import (COLLABORATOR, NON_OWNER_NOTE, NON_OWNER_REFUSED, OWNER, RESTRICTED, LockRefused,
                         acquire_lock, exit_code, exit_on_sigterm, holder_consumer, load_done, make_dirs, parse_task,
@@ -615,6 +615,7 @@ class Connector:
             args.state, getattr(args, "bridge_state", None), NAME, getattr(args, "agent_id", None) or "", publish,
             quoted, log)
         self.agy_pid = None   # the owner turn's agy process, whose own log names the account it used
+        self.usage_reader = agy_usage.read   # agy's own usage windows, None when they cannot be read
         # Out of quota: the account card, unasked, in the owner's DM, on each of their messages (quota_notice).
         self.quota = quota_notice.QuotaNotice(args.state, getattr(args, "bridge_state", None), NAME,
                                               self.accounts.quota_card, self.accounts.using, log,
@@ -647,6 +648,44 @@ class Connector:
             return None
         log("card ->", task_id, outcome)
         return {"task": task_id, "status": "completed", "detail": outcome, "tier": headers["access_tier"], "card": outcome}
+
+    def usage_task(self, task_id, headers, task_text, result_file):
+        """The owner asking how much of agy's own usage is left (agy_usage.asks), answered here and never by the
+        model; else None. Out of usage: the limit's card, as any card ask gets (in a room, the limit's room line).
+        Else the usage as read, or that it cannot be read now; in a room the same, without the account named."""
+        agent_card, _ = connector_cards._core()
+        sent, said = agent_card.reply_words(task_text or "")
+        if not agy_usage.asks(said):
+            return None
+        if agent_card.owner_may_act(sent, dm_only=False) is not None or agent_card.click_tagged(sent):
+            return None     # anyone else's words, or a tap: as before
+        room = card_desk.in_room(sent)
+        if self.quota.says():
+            if room:
+                publish(result_file, quoted(self.quota.says_in_room()) + "\n")
+                outcome = "usage-limit-in-room"
+            else:
+                outcome = self.limit_first(sent, result_file)
+        else:
+            text, outcome = self.usage_words(room)
+            publish(result_file, quoted(text) + "\n")
+        log("usage ->", task_id, outcome)
+        return {"task": task_id, "status": "completed", "detail": outcome, "tier": headers["access_tier"],
+                "card": outcome}
+
+    def usage_words(self, room: bool) -> "tuple[str, str]":
+        """(the answer to a usage ask, its outcome): the windows as read, or why they cannot be shown."""
+        if self.accounts.keyed():
+            return agy_usage.ON_API_KEY, "usage-api-key"
+        try:
+            rows = agy_usage.rows_of(self.usage_reader(getattr(self.args, "agent_id", None) or ""))
+        except Exception as e:  # noqa: BLE001 - a read that failed is a usage not available
+            log("usage not read:", "%s: %s" % (type(e).__name__, str(e)[:120]))
+            rows = []
+        if not rows:
+            return agy_usage.UNAVAILABLE, "usage-unavailable"
+        who = "" if room else str(self.accounts.record().get("account") or "")
+        return agy_usage.words(rows, "this computer's Google sign-in%s" % (", " + who if who else "")), "usage"
 
     def sspace_servers(self, init, tools=frozenset()):
         """An owner's or team turn's MCP servers: AG2 Space as this agent, over stdio through --mcp-proxy-command
@@ -824,6 +863,9 @@ class Connector:
         carded = self.card_task(task_id, headers, path, result_file)
         if carded:
             return carded
+        used = self.usage_task(task_id, headers, task_text, result_file)
+        if used:
+            return used
         event, _ = trigger_of(headers)
         log("wake ->", task_id, headers["access_tier"], event or "message")
         self.view.turn("%s, %s" % (headers.get("sender_name") or headers["access_tier"], kind), message)

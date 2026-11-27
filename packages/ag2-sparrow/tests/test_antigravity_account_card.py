@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import test_antigravity_adapter as ta  # noqa: E402  (its hermetic env and Work)
 
 from ag2_sparrow import account_switch, connector_cards, model_switch  # noqa: E402
-from ag2_sparrow.adapters.antigravity import agy_account, antigravity_connector as gc, gemini_key as gk  # noqa: E402
+from ag2_sparrow.adapters.antigravity import agy_account, agy_usage, antigravity_connector as gc, gemini_key as gk  # noqa: E402
 
 CODE = "4/0A" + "d" * 40                # shaped like a Google sign-in code; not a real one
 DUMMY_KEY = "AIza" + "D" * 35            # shaped like a Google API key; not a real one
@@ -314,6 +314,85 @@ class AccountCardTest(unittest.TestCase):
             (shown,) = self.posted("$a%d" % n)
             self.assertEqual((shown["text"], shown["account_controls"]), (card["text"], card["account_controls"]), asked)
 
+    # ── the owner asks agy about its own usage (agy_usage): answered here, never by the model ──
+    ROWS = [{"name": "Gemini models", "window": "weekly", "used": 12, "resets": "Nov 28, 3:05 PM"},
+            {"name": "Claude and GPT models", "window": "five hours", "used": 0}]
+
+    def usage_ask(self, tid, said, reader=None, **kw):
+        if self.connector is None:
+            self.connector = gc.Connector(self.w.args("--agent-id", AGENT))
+        if reader is not None:
+            self.connector.usage_reader = reader
+        prompts = len(self.prompts())
+        self.dm(tid, said, **kw)
+        self.serve()
+        return self.w.result(tid), len(self.prompts()) - prompts
+
+    def test_a_usage_ask_with_usage_left_is_answered_with_the_usage_as_read(self):
+        for n, ask in enumerate(("how much usage do you have left?", "你还剩多少额度", "what's your usage",
+                                 "我的 agy 用了多少", "agy 额度还剩多少？")):
+            said, prompted = self.usage_ask("task-u%d" % n, ask, reader=lambda agent: self.ROWS)
+            self.assertEqual(said, gc.quoted("Antigravity's usage (this computer's Google sign-in):\n"
+                                             "- Gemini models, weekly: 12% used (resets Nov 28, 3:05 PM)\n"
+                                             "- Claude and GPT models, five hours: 0% used") + "\n", ask)
+            self.assertEqual(prompted, 0, "never sent to agy")
+            self.assertEqual(self.w.metrics()[-1]["card"], "usage")
+        self.assertEqual(self.posted(), [], "and no card")
+        # In a room the owner gets the same answer, with no account named and nothing to switch with.
+        self.connector.accounts.keep(account="a…@example.com")
+        said, _ = self.usage_ask("task-ur", "what's your usage", kind="room")
+        self.assertTrue(said.startswith(gc.quoted("Antigravity's usage (this computer's Google sign-in):")), said)
+        said, _ = self.usage_ask("task-ud", "what's your usage")
+        self.assertIn("(this computer's Google sign-in, a…@example.com):", said)
+
+    def test_a_usage_that_cannot_be_read_is_said_so_and_never_shown_as_zero(self):
+        # Sparrow has no reader of agy's usage yet: the default read says so.
+        self.assertIsNone(agy_usage.read(AGENT))
+        said, prompted = self.usage_ask("task-u0", "how much usage do you have left?")
+        self.assertEqual((said, prompted), (gc.quoted(agy_usage.UNAVAILABLE) + "\n", 0))
+        self.assertEqual(self.w.metrics()[-1]["card"], "usage-unavailable")
+
+        def broken(agent):
+            raise OSError("no answer")
+
+        for n, reader in enumerate((broken, lambda a: [], lambda a: [{"name": "Gemini models"}],
+                                    lambda a: [{"name": "Gemini models", "used": "n/a"}], lambda a: {"used": 0})):
+            said, _ = self.usage_ask("task-u%d" % (n + 1), "你还剩多少额度", reader=reader)
+            self.assertEqual(said, gc.quoted(agy_usage.UNAVAILABLE) + "\n")
+            self.assertNotIn("0%", said)
+        said, _ = self.usage_ask("task-ur", "你还剩多少额度", kind="room")
+        self.assertEqual(said, gc.quoted(agy_usage.UNAVAILABLE) + "\n")
+        # On this agent's own API key the sign-in's usage is not its usage.
+        self.keychain["saved"] = True
+        said, _ = self.usage_ask("task-uk", "what's your usage", reader=lambda a: self.ROWS)
+        self.assertEqual(said, gc.quoted(agy_usage.ON_API_KEY) + "\n")
+
+    def test_a_usage_ask_while_out_of_usage_gets_only_the_quota_card(self):
+        self.dm("task-q1", "STUB:QUOTA hi")
+        self.serve()
+        (limit,) = self.posted("$q1")
+        for n, ask in enumerate(("how much usage do you have left?", "你还剩多少额度")):
+            said, prompted = self.usage_ask("task-u%d" % n, ask, reader=lambda a: self.ROWS)
+            self.assertEqual((said, prompted), (account_switch.ANSWERED, 0), ask)
+            (shown,) = self.posted("$u%d" % n)
+            self.assertEqual((shown["text"], shown["account_controls"]), (limit["text"], limit["account_controls"]))
+            self.assertEqual(self.w.metrics()[-1]["card"], "quota-card-asked")
+        # In a room: the limit's room line, no account named, no card.
+        said, _ = self.usage_ask("task-ur", "what's your usage", kind="room")
+        self.assertEqual(said, gc.quoted(self.connector.quota.says_in_room()) + "\n")
+        self.assertIn("To switch account, message me in our direct message.", said)
+        self.assertEqual(self.posted("$ur"), [])
+
+    def test_usage_in_other_senses_and_anyone_elses_ask_go_to_the_model(self):
+        for n, said in enumerate(("show CLI usage", "usage of this function", "what's the usage of X",
+                                  "what is usage", "show usage", "how do you limit the output")):
+            _, prompted = self.usage_ask("task-n%d" % n, said,
+                                         reader=lambda a: self.ROWS)
+            self.assertEqual(prompted, 1, said)
+            self.assertNotEqual(self.w.metrics()[-1].get("card"), "usage", said)
+        _, prompted = self.usage_ask("task-c", "what's your usage", tier="team", collaborator=True, kind="room")
+        self.assertEqual(prompted, 1, "a collaborator's ask is theirs to the model, as before")
+
     def test_a_collaborator_who_asks_while_agy_is_at_its_limit_is_told_why_there_is_no_answer(self):
         # Review of #6713: once the owner's card was queued, anyone else who asked got no reply at all.
         self.dm("task-q1", "STUB:QUOTA hi")
@@ -449,6 +528,16 @@ class PartsTest(unittest.TestCase):
             Path(d, "acp-server-2-42.log").write_text("started\n")
             self.assertEqual(agy_account.signed_in_as(d, 42), "")
             self.assertEqual(agy_account.signed_in_as(os.path.join(d, "none"), 42), "")
+
+    def test_a_usage_ask_is_read_by_intent_not_keyword(self):
+        for ask in ("你还剩多少额度", "how much usage do you have left?", "what's your usage", "我的 agy 用了多少",
+                    "How much quota is left?", "agy usage?", "你的用量", "check your usage limits please",
+                    "还有多少额度", "Antigravity, how much quota do you have left"):
+            self.assertTrue(agy_usage.asks(ask), ask)
+        for said in ("show CLI usage", "usage of this function", "what's the usage of X", "what is usage", "show usage",
+                     "how do you limit the output", "我的额度", "/usage", "", None, "what's your usage " + "x" * 80,
+                     "which model are you using", "explain the usage limits of the Gemini API"):
+            self.assertFalse(agy_usage.asks(said), said)
 
     def test_asks_for_card_only_for_short_asks(self):
         for ask in ("换账号", "帮我切换账号", "Switch account.", "use an API key", "/account",
