@@ -213,6 +213,7 @@ def unauthorized(error) -> bool:
 MODEL_REFUSED_INFO = "modelnotfound"
 _MODEL_REFUSED = re.compile(r"\bmodel\b.{0,80}\bis not supported\b", re.IGNORECASE)
 PICKED = ("model-picked", "model-pending", "model-same")
+CARD_RETRY_S = 5.0   # a card line to someone other than the owner that could not be written is tried again
 HOLD_S = 600.0       # a message waiting for a model pick is answered in words after this long
 RELEASED_KEEP = 20   # tasks remembered as having waited once, until each is answered
 
@@ -484,6 +485,7 @@ class Connector:
         state = getattr(args, "state", None)
         self.view = live_view.Writer(live_view.path_of(os.path.dirname(state))) if state else None
         self.rerouted = ""        # the model Codex moved the current turn to, when it said so
+        self.card_retry_at = {}   # task id -> when a card line that could not be written is tried again
         self._models = self._accounts = self._quota = None
         self.rate_limits = {}
         # The current turn's error when it said the account is out of usage, or its login no longer works.
@@ -1325,6 +1327,7 @@ class Connector:
         waiting = self.held().get("task", "")
         names = [n for n in os.listdir(self.args.inbox)
                  if n.startswith("task-") and n.endswith(".txt") and n[:-4] not in seen and n[:-4] != waiting
+                 and self.card_retry_at.get(n[:-4], 0) <= time.time()
                  and not os.path.exists(os.path.join(self.args.results, n))]
         names.sort(key=lambda n: (os.stat(os.path.join(self.args.inbox, n)).st_mtime, n))
         return names
@@ -1397,7 +1400,14 @@ class Connector:
                 idle_since = time.time()
                 continue
             result_path = os.path.join(self.args.results, name)
-            carded = self.card_task(task_id, headers, path, result_path)
+            try:
+                carded = self.card_task(task_id, headers, path, result_path)
+            except card_desk.Undelivered as e:
+                # Never Codex's, never done: served again after CARD_RETRY_S.
+                seen.discard(task_id)
+                self.card_retry_at[task_id] = time.time() + CARD_RETRY_S
+                log("card line not written, retrying in %ss ->" % CARD_RETRY_S, task_id, str(e))
+                continue
             if carded:
                 # The owner picked in the DM the waiting message came in: it is answered next, on the pick.
                 if carded["card"] in PICKED and headers.get("channel_id") == self.held().get("room"):

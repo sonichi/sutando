@@ -25,6 +25,7 @@ from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
 isolate_os_environ()
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
+import card_words  # noqa: E402
 import switch_card_intercept as sci  # noqa: E402
 import task_envelope  # noqa: E402
 
@@ -262,7 +263,7 @@ class InterceptEdges(Intercept):
         import io
         from unittest import mock
         argv = [str(self.file), "--workspace", str(self.ws), "--results-dir", str(self.results)]
-        for answered, code, word in ((True, 0, sci.ANSWERED), (False, 1, "")):
+        for answered, code, word in ((sci.ANSWERED, 0, sci.ANSWERED), (sci.HELD, 2, sci.HELD), ("", 1, "")):
             with self.subTest(answered=answered), mock.patch.object(sci, "intercept", return_value=answered):
                 out = io.StringIO()
                 with contextlib.redirect_stdout(out):
@@ -305,7 +306,7 @@ class InRoom(Intercept):
         self.assertEqual(((self.results / "task-abc.txt").read_text(), self.calls), (sci.IN_ROOM + "\n", []))
 
     def test_others_and_other_words_in_a_room_go_to_the_core(self):
-        self.assertFalse(self.in_room("switch account", tier="team"))
+        self.assertFalse(self.in_room("what's on my calendar", tier="team"))
         self.assertFalse(self.in_room("what's on my calendar"))
         self.assertFalse((self.results / "task-abc.txt").exists())
         self.assertEqual(self.calls, [])
@@ -322,12 +323,213 @@ class InRoom(Intercept):
         self.assertEqual(self.calls, [])
 
 
+class NotOwner(Intercept):
+    """Owner 2026-11-26: anyone but the owner asking which account or model, or to switch, is answered in
+    code and the core never sees it: team hears the model's name only (as the model card names it), a
+    guest to ask the owner; the account is told to no one but the owner, in a room or a DM."""
+
+    def ask(self, words, *, tier="team", kind="room", name="Sonnet (1M context)", rc=0, extra=""):
+        text = task(words, tier=tier, kind=kind).replace("access_tier:", extra + "access_tier:")
+        self.file.write_text(task_envelope.stamp_text(text, self.ws))
+        out = self.ws / "results" / "task-abc.txt"
+        if out.exists():
+            out.unlink()
+
+        def run(argv, **kw):
+            self.calls.append(argv)
+            return subprocess.CompletedProcess(argv, rc, stdout=json.dumps(
+                {"model": "sonnet[1m]", "name": name, "source": "model-switch.json", "ts": 1}) + "\n", stderr="")
+        done = sci.intercept(self.file, self.ws, self.results, REPO, run=run, log=lambda m: None)
+        return out.read_text().rstrip("\n") if done else None
+
+    def test_team_asking_which_model_is_told_its_name_only(self):
+        for words, line in (("what model are you using?", "I'm running on Sonnet (1M context)."),
+                            ("你在用什么模型", "我现在用的模型是 Sonnet (1M context)。"),
+                            ("what model and account are you using", "I'm running on Sonnet (1M context)."),
+                            ("现在用的什么账号和什么模型", "我现在用的模型是 Sonnet (1M context)。")):
+            for kind in ("room", "dm"):
+                with self.subTest(words=words, kind=kind):
+                    self.assertEqual(self.ask(words, kind=kind), line)
+        self.assertEqual(self.ask("what model are you using?", extra="collaborator: true\n"),
+                         "I'm running on Sonnet (1M context).", "a collaborator is team")
+        argv = self.calls[-1]
+        self.assertTrue(argv[1].endswith("skills/model-switch/scripts/model_card.py"))
+        self.assertEqual(argv[2:], ["--workspace", str(self.ws), "status"], "the card's own read, no card posted")
+
+    def test_team_with_no_model_read_is_told_so_without_a_guess(self):
+        self.assertEqual(self.ask("what model are you using?", rc=1), sci.MODEL_UNKNOWN)
+        self.assertEqual(self.ask("你在用什么模型", name=""), sci.MODEL_UNKNOWN_ZH)
+
+        def raises(argv, **kw):
+            raise subprocess.TimeoutExpired(argv, 30)
+        self.assertEqual(sci.model_name(self.ws, REPO, run=raises), "")
+
+    def test_team_asking_about_the_account_is_told_it_is_only_for_the_owner(self):
+        for words, line in (("which account are you on", sci.ACCOUNT_OWNER_ONLY),
+                            ("你在用什么账号", sci.ACCOUNT_OWNER_ONLY_ZH), ("account", sci.ACCOUNT_OWNER_ONLY)):
+            for kind in ("room", "dm"):
+                with self.subTest(words=words, kind=kind):
+                    self.assertEqual(self.ask(words, kind=kind), line)
+        self.assertEqual(self.calls, [], "nothing read, nothing posted")
+
+    def test_a_switch_by_anyone_but_the_owner_switches_nothing(self):
+        for words, team, guest in (("/model", sci.SWITCH_OWNER_ONLY, sci.ASK_OWNER),
+                                   ("switch account", sci.SWITCH_OWNER_ONLY, sci.ASK_OWNER),
+                                   ("switch to opus", sci.SWITCH_OWNER_ONLY, sci.ASK_OWNER),
+                                   ("换成 sonnet", sci.SWITCH_OWNER_ONLY_ZH, sci.ASK_OWNER_ZH),
+                                   ("换模型", sci.SWITCH_OWNER_ONLY_ZH, sci.ASK_OWNER_ZH),
+                                   ("switch core", sci.SWITCH_OWNER_ONLY, sci.ASK_OWNER)):
+            with self.subTest(words=words):
+                self.assertEqual(self.ask(words), team)
+                self.assertEqual(self.ask(words, tier="guest"), guest)
+        self.assertEqual(self.calls, [], "no card script ran")
+
+    def test_a_guest_is_told_to_ask_the_owner_and_nothing_else(self):
+        for words, line in (("what model are you using?", sci.ASK_OWNER), ("which account are you on", sci.ASK_OWNER),
+                            ("现在用的什么账号和什么模型", sci.ASK_OWNER_ZH)):
+            for kind in ("room", "dm"):
+                with self.subTest(words=words, kind=kind):
+                    self.assertEqual(self.ask(words, tier="guest", kind=kind), line)
+        self.assertEqual(self.calls, [], "the model is not even read")
+
+    def test_no_reply_to_anyone_but_the_owner_names_the_account(self):
+        # model_card status never names the account; the account card's script is never run for them.
+        for tier in ("team", "guest"):
+            for words in ("which account are you on", "现在用的什么账号和什么模型", "/account", "switch account"):
+                line = self.ask(words, tier=tier)
+                self.assertNotIn("@", line)
+                self.assertNotIn("plan", line.lower())
+        self.assertFalse(any("account_card.py" in a[1] for a in self.calls))
+
+    def test_the_owner_is_unchanged(self):
+        self.assertEqual(self.ask("what model are you using?", tier="owner"), sci.IN_ROOM)
+        self.calls.clear()
+        self.file.write_text(task_envelope.stamp_text(task("what model are you using?"), self.ws))
+        self.assertTrue(sci.intercept(self.file, self.ws, self.results, REPO, log=lambda m: None, run=lambda argv, **kw:
+                        self.calls.append(argv) or subprocess.CompletedProcess(argv, 0, stdout='{"status": "posted"}\n')))
+        self.assertTrue(self.calls[0][1].endswith("skills/model-switch/scripts/model_card.py"))
+        self.assertIn("post", self.calls[0], "the owner's DM still posts the card")
+
+    def test_other_words_and_other_tiers_still_reach_the_core(self):
+        for tier in ("team", "guest"):
+            for words in ("what's on my calendar", "which model is better for coding, sonnet or opus?",
+                          "switch to dark mode", "use claude to write this", "which core are you running",
+                          "what model of iPhone do I have?"):
+                with self.subTest(tier=tier, words=words):
+                    self.assertIsNone(self.ask(words, tier=tier))
+        for tier in ("ambient", "nobody"):
+            self.assertIsNone(self.ask("what model are you using?", tier=tier), tier)
+        self.assertEqual(self.calls, [])
+
+    def test_a_line_that_cannot_be_written_is_held_from_the_core(self):
+        # Review on #6877: recognised is never the core's, even when the reply cannot be written.
+        from unittest import mock
+        tries = []
+        with mock.patch.object(sci, "say_in_room", side_effect=lambda *a: tries.append(a) or False):
+            self.file.write_text(task_envelope.stamp_text(task("which account are you on", tier="team"), self.ws))
+            self.assertEqual(sci.intercept(self.file, self.ws, self.results, REPO, run=None, log=lambda m: None),
+                             sci.HELD, "not answered: the watcher holds it and asks again")
+            self.assertEqual(sci.main([str(self.file), "--workspace", str(self.ws), "--results-dir",
+                                       str(self.results)]), 2)
+        self.assertEqual(len(tries), 2 * sci.SAY_TRIES, "tried again before holding it")
+        self.assertFalse((self.results / "task-abc.txt").exists())
+        landed = mock.Mock(side_effect=[False, True])
+        with mock.patch.object(sci, "say_in_room", landed):
+            self.assertEqual(sci.intercept(self.file, self.ws, self.results, REPO, run=None, log=lambda m: None),
+                             sci.ANSWERED)
+        self.assertEqual(landed.call_count, 2, "a retry that lands ends the tries")
+
+    def test_a_missing_model_record_is_not_a_known_default(self):
+        # Review on #6877: the real `status` names a default with `model` null when no record says which.
+        self.assertEqual(sci.model_name(self.ws, REPO), "", "the real status on a workspace with no record")
+        self.assertEqual(self.ask("what model are you using?", rc=0, name="Default"), "I'm running on Default.")
+
+        def no_record(argv, **kw):
+            return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(
+                {"model": None, "name": "the default model", "source": None, "ts": None}) + "\n", stderr="")
+        self.assertEqual(sci.model_name(self.ws, REPO, run=no_record), "")
+        self.file.write_text(task_envelope.stamp_text(task("what model are you using?", tier="team"), self.ws))
+        self.assertTrue(sci.intercept(self.file, self.ws, self.results, REPO, run=no_record, log=lambda m: None))
+        self.assertEqual((self.results / "task-abc.txt").read_text(), sci.MODEL_UNKNOWN + "\n")
+
+    def test_an_owner_tier_collaborator_is_not_the_owner(self):
+        # Review on #6877: `collaborator` with an owner tier takes no owner path (agent_card.owner_may_act).
+        self.assertIsNone(sci.request(task_envelope.stamp_text(
+            task("switch account").replace("access_tier:", "collaborator: true\naccess_tier:"), self.ws), self.ws))
+        for kind in ("dm", "room"):
+            with self.subTest(kind=kind):
+                self.assertEqual(self.ask("which account are you on", tier="owner", kind=kind,
+                                          extra="collaborator: true\n"), sci.ACCOUNT_OWNER_ONLY)
+                self.assertEqual(self.ask("switch account", tier="owner", kind=kind, extra="collaborator: true\n"),
+                                 sci.SWITCH_OWNER_ONLY)
+        self.assertEqual(self.calls, [], "no card posted")
+
+    def test_any_length_ask_about_the_account_or_model_is_answered_in_code(self):
+        # Review on #6877: email, plan and usage too, past the short-question cap; never the core's to tell.
+        tail = " I need it for the onboarding doc we are writing together this afternoon, thanks!"
+        for words, team in (("what's your email", sci.ACCOUNT_OWNER_ONLY),
+                            ("which plan are you on", sci.ACCOUNT_OWNER_ONLY),
+                            ("how much usage is left", sci.ACCOUNT_OWNER_ONLY),
+                            ("which email are you signed in with?" + tail, sci.ACCOUNT_OWNER_ONLY),
+                            ("what model are you", "I'm running on Sonnet (1M context)."),
+                            ("what model are you running on?" + tail, "I'm running on Sonnet (1M context)."),
+                            ("你的邮箱是什么", sci.ACCOUNT_OWNER_ONLY_ZH), ("你用的什么套餐", sci.ACCOUNT_OWNER_ONLY_ZH),
+                            ("额度还剩多少", sci.ACCOUNT_OWNER_ONLY_ZH)):
+            with self.subTest(words=words):
+                self.assertEqual(self.ask(words), team)
+                self.assertEqual(self.ask(words, tier="guest", kind="dm"),
+                                 sci.ASK_OWNER_ZH if card_words.is_zh(words) else sci.ASK_OWNER)
+        for words in ("what's the usage of this API", "show CLI usage", "email me the report",
+                      "how much of my quota is left", "what's your plan for today?", "which model should you use here"):
+            with self.subTest(words=words):
+                self.assertIsNone(self.ask(words))
+
+
+class CardWords(unittest.TestCase):
+    """The one policy the core and every connector (ag2_sparrow.card_words, a sync_from_src copy) read."""
+
+    def test_owner_only_asks(self):
+        for words, kinds in (("what's your email", {"account"}), ("What is your email address?", {"account"}),
+                             ("which plan are you on", {"account"}), ("how much usage is left", {"account"}),
+                             ("are you on a Max plan?", {"account"}), ("how much quota do you have left", {"account"}),
+                             ("are you out of usage?", {"account"}), ("who are you logged in as", {"account"}),
+                             ("what is your subscription", {"account"}), ("what model are you", {"model"}),
+                             ("which model do you use", {"model"}), ("what's your current model?", {"model"}),
+                             ("what LLM are you running on", {"model"}), ("你是什么模型", {"model"}),
+                             ("你的模型是什么", {"model"}), ("你的邮箱是什么", {"account"}), ("额度还剩多少", {"account"}),
+                             ("which email are you on, and what model are you using?", {"account", "model"})):
+            self.assertEqual(card_words.owner_only_kinds(words), kinds, words)
+
+    def test_other_words_are_not(self):
+        for words in ("what's the usage of this API", "show CLI usage", "email me the report",
+                      "can you email me the report", "which model is best for coding", "what model of iPhone do I have?",
+                      "what's your plan for today?", "what's your account of what happened?", "how much of my quota is left",
+                      "how much usage is left on the GCP project", "which model should you use for this",
+                      "我的账号余额还剩多少", "reply to the email from Bob", "", None):
+            self.assertEqual(card_words.owner_only_kinds(words), frozenset(), words)
+
+    def test_tiers(self):
+        for headers, tier in (({"access_tier": "team"}, "team"), ({"access_tier": "team", "collaborator": "true"}, "team"),
+                              ({"access_tier": "owner", "collaborator": "true"}, "team"), ({"access_tier": "guest"}, "guest"),
+                              ({"access_tier": "other"}, "guest"), ({"access_tier": "owner"}, ""),
+                              ({"access_tier": "ambient"}, ""), ({}, ""), (None, "")):
+            self.assertEqual(card_words.sender_tier(headers), tier, headers)
+
+    def test_the_package_carries_this_very_file(self):
+        pkg = REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "card_words.py"
+        self.assertEqual(pkg.read_text(), (REPO / "src" / "card_words.py").read_text())
+
+
 class Watcher(unittest.TestCase):
     def test_the_watcher_asks_before_announcing(self):
         src = (REPO / "src" / "watch-tasks-stream.sh").read_text()
         at = src.index("/src/switch_card_intercept.py\"")
         self.assertLess(at, src.index("read_handler_config_now\n  reconcile_dead_claims hold"))
         self.assertIn('[ -z "${SUTANDO_INSTANCE_ID:-}" ]', src[at - 300:at])
+        held = src.index('[ "$card_verdict" = switch-card-held ]')
+        self.assertIn('hold_task "$filename"', src[held:held + 300])
+        self.assertNotIn("record_admission", src[held:src.index("read_handler_config_now\n  reconcile_dead_claims hold")],
+                         "a held line is never admitted (tests/watch-tasks-stream-switch-card-held.test.py runs it)")
 
 
 if __name__ == "__main__":

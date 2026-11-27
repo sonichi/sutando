@@ -80,6 +80,19 @@ class HeldInbox(unittest.TestCase):
         self.assertEqual(self.quota.hits[0], ["task-a"])
         self.assertEqual(self.launches, [])
 
+    def test_a_task_whose_card_line_was_not_written_is_offered_again(self):
+        # Review on #6877: HELD is not done; the next tick asks again, until it is answered.
+        import switch_card_intercept as sci
+        self.assertEqual(chi.HELD, sci.HELD)
+        self.hold()
+        self.task("task-a")
+        verdicts = [sci.HELD, sci.ANSWERED]
+        box = chi.HeldInbox(self.ws, REPO, now=lambda: self.t, launch=lambda repo: 0, quota=self.quota,
+                            intercept=lambda p: self.intercepted.append(p.name) or verdicts.pop(0), log=lambda *a: None)
+        for _ in range(3):
+            self.assertEqual(box.step(), "held")
+        self.assertEqual(self.intercepted, ["task-a.txt", "task-a.txt"])
+
     def test_a_rate_limit_hold_sends_no_account_card(self):
         self.hold(kind="rate-limit")
         self.task("task-a")

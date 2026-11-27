@@ -21,8 +21,8 @@ from unittest import mock
 
 PKG_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG_ROOT))
-from ag2_sparrow import (account_switch, connector_cards, local_task_protocol, model_switch, quota_notice,  # noqa: E402
-                         result_markers, task_io, team_guardrail)
+from ag2_sparrow import (account_switch, card_desk, connector_cards, local_task_protocol, model_switch,  # noqa: E402
+                         quota_notice, result_markers, task_io, team_guardrail)
 from ag2_sparrow.adapters.codex import codex_connector as cc  # noqa: E402
 
 # The note as it was pinned before it moved to the shared owner: proves the move changed no byte.
@@ -954,6 +954,43 @@ class ModelCardTest(CardWorld, unittest.TestCase):
         self.assertEqual(run_connector(self.work, once=1), 0)
         self.assertEqual((result(self.work, "task-3").strip(), "card" in metrics(self.work)[-1]), ("[model-card]", False))
         self.assertEqual(self.posted(), [])
+
+    def test_anyone_else_asking_which_model_is_answered_by_the_code_and_never_told_the_account(self):
+        # Owner 2026-11-26: team hears the model's name as the card shows it; a guest is told to ask the owner;
+        # the account is told to no one else; Codex never sees these.
+        self.pick("Stub Large")
+        self.posted("$card2")
+        self.serve("task-2", "hello")      # the pick taken: now the model in use
+        self.posted()
+        room = dict(extra=["--allow-non-owner"], channel="!room:s.space", kind="room")
+        self.assertEqual(self.serve("task-3", "what model are you using?", tier="team", **room),
+                         "I'm running on Stub Large.\n")
+        self.assertEqual(self.serve("task-4", "which account are you on?", tier="team", **room),
+                         card_desk.ACCOUNT_OWNER_ONLY + "\n")
+        self.assertEqual(self.serve("task-5", "/model", tier="team", **room), card_desk.SWITCH_OWNER_ONLY + "\n")
+        for n, said in enumerate(("what model are you using?", "你在用哪个账号", "switch to opus")):
+            self.assertIn(self.serve("task-g%d" % n, said, tier="guest", **room).strip(),
+                          (card_desk.ASK_OWNER, card_desk.ASK_OWNER_ZH), said)
+        self.assertEqual(metrics(self.work)[-1]["card"], "card-not-owner")
+        self.assertEqual(self.posted(), [], "no card")
+        self.assertEqual(self.state()["confirmed"], "gpt-6-sol", "nothing switched")
+        self.assertTrue(self.serve("task-6", "hi", tier="team", **room).startswith("STUB echo:"),
+                        "other words still reach Codex")
+
+    def test_a_line_to_anyone_else_that_cannot_be_written_is_served_again_never_by_codex(self):
+        # Review on #6877: not marked done, never given to Codex; the same running connector writes it later.
+        real, fails = cc.write_atomic, [OSError("disk full")] * (card_desk.SAY_TRIES + 1)
+
+        def flaky(path, text):
+            if path.endswith("task-3.txt") and fails:
+                raise fails.pop()
+            return real(path, text)
+        room = dict(extra=["--allow-non-owner", "--poll", "0.05"], channel="!room:s.space", kind="room")
+        with mock.patch.object(cc, "write_atomic", flaky), mock.patch.object(cc, "CARD_RETRY_S", 0.1):
+            self.assertEqual(self.serve("task-3", "which account are you on?", tier="team", **room),
+                             card_desk.ACCOUNT_OWNER_ONLY + "\n")
+        self.assertEqual(fails, [], "every failed write was tried, then the retry landed")
+        self.assertEqual([r.get("card") for r in metrics(self.work)], ["card-not-owner"], "done once, as a card")
 
     def test_the_task_archived_during_the_turn_still_shows_the_card(self):
         """A task the bridge archived while the turn ran (Codex wrote its result file itself) is not opened
