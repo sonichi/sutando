@@ -137,14 +137,24 @@ def _room_task(path, workspace) -> bool:
 
 def room_tasks(workspace) -> dict:
     """{task id: its file} for the tasks waiting in the core's queue that were sent in a shared room and
-    that the core would answer. A room message it would not have replied to is told nothing."""
+    that the core itself would answer. A room message it would not have replied to, or one routed to a
+    worker, is told nothing."""
     out = {}
     try:
         import task_queue
         files = task_queue.pending_files(Path(workspace))
     except Exception:  # noqa: BLE001 - no queue read: nobody to tell
         return out
+    from delivery import task_dispatch
+    deliveries = Path(workspace) / "deliveries"
     for p in files:
+        try:
+            # A task a worker holds is that worker's to answer, as the core's own dispatch reads it: the
+            # core's limit does not hold it, and one whose owner cannot be told is told nothing.
+            if task_dispatch.worker_holds(deliveries, p.name):
+                continue
+        except task_dispatch.WorkerHoldUnreadable:
+            continue
         if _room_task(p, workspace):
             out[p.name[:-4] if p.name.endswith(".txt") else p.name] = p
     return out

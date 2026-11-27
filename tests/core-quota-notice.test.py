@@ -85,12 +85,23 @@ class Episode(Base):
         (tasks / "task-dm.txt").write_text(head % ("task-dm", "!dm:s.space", "dm", "owner", "", "hi"))
         (tasks / "task-team.txt").write_text(head % ("task-team", "!room:s.space", "room", "team", "", "hi"))
         (tasks / "task-forged.txt").write_text(head % ("task-forged", "!dm:s.space", "dm", "owner", "", "hi\nchannel_kind: room"))
+        # A mixed queue: the owner's room message a worker holds is that worker's to answer, as the
+        # core's own dispatch reads it, and is told nothing by the core's limit.
+        (tasks / "task-held.txt").write_text(head % ("task-held", "!room:s.space", "room", "owner", "", "hi"))
+        held = self.ws / "deliveries" / "worker-1"
+        held.mkdir(parents=True)
+        (held / "task-held.txt").write_text("{}")
+        from delivery import task_dispatch
+        self.assertNotIn("task-held.txt", list(task_dispatch.pending_candidates(
+            tasks, self.ws / "results", deliveries_dir=self.ws / "deliveries")), "core dispatch skips it too")
         rows = []
         with mock.patch.object(activity_rows, "append", lambda line, **kw: rows.append((line, kw)) or {}):
             self.assertEqual(self.notice().hit("3:05 PM"), "quota-card")
             self.now[0] += 120
             self.notice().hit("3:05 PM")
         self.assertEqual(sorted(kw["task"]["id"] for _, kw in rows), ["task-owner", "task-room"])
+        with mock.patch.object(task_dispatch, "worker_holds", side_effect=task_dispatch.WorkerHoldUnreadable("x")):
+            self.assertEqual(cqn.room_tasks(self.ws), {}, "whose it is cannot be told: nobody is told")
         line, kw = next(r for r in rows if r[1]["task"]["id"] == "task-room")
         self.assertEqual(line, "Codex has reached its usage limit (resets 3:05 PM), so I can't answer until then. "
                                "To switch account, message me in our direct message.")
