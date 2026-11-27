@@ -27,6 +27,8 @@ from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
 
 # Before the imports below: codex_connector reaches the agent's token file (the room tools' exchange).
 isolate_os_environ()
+# The isolation drops PYTHONPATH, so the routine-cap child finds this package by its own path, never an installed one.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 TASKS = [  # (id, tier, channel, body, mtime)
     ("task-1700000000001", "owner", "!room:ag2.space", "first owner task", 1000),
