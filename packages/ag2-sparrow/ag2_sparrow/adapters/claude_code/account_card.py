@@ -37,7 +37,12 @@ NAME = "Claude Code"
 RUNTIME = "claude"
 STATUS_WAIT_S = 10.0     # asked inside the claim: an answer the card cannot wait for reads as unknown
 ASKS = ("/account", "/login")
-WHERE = account_switch.elsewhere(NAME) + " The sign-in code goes into the card there, never into this chat."
+# A "Switch account" tap with none to offer: no other account is saved for this agent yet.
+NONE_HERE = ("No other account is available to switch to here. An account another agent has needs one sign-in "
+             "for this agent on the computer that runs %s." % NAME)
+# A "Switch account" tap with saved accounts to offer: they are the card's "Use" buttons.
+PICK = ("Tap an account below to switch to it. Another account needs one sign-in on the computer that runs %s."
+        % NAME)
 _run = subprocess.run       # Claude Code's own `auth status`, the one command this card runs
 
 # The desktop app's saved accounts for this agent, and the request/answer files it watches in the config dir.
@@ -221,7 +226,10 @@ class AccountCard(account_switch.AccountSwitch):
         found = others(dict(self.cfg, email=self.seen.get("email") or ""))
         return dict(sorted(found.items(), key=lambda kv: kv[1].lower())[:USE_BUTTONS])
 
-    def card(self, state: str, text: str, url: str = "", ask: bool = False, signed_out: bool = False):
+    def card(self, state: str, text: str, url: str = "", ask: bool = False, signed_out: bool = False,
+             offered=None):
+        """The shared card plus a "Use" button for each of `offered` (default: `offers()` read now), so a caller
+        that worded the card from one reading of the offers shows the very same buttons."""
         body, card = super().card(state, text, url, ask, signed_out)
         if not ask:
             return body, card
@@ -231,7 +239,7 @@ class AccountCard(account_switch.AccountSwitch):
             self.log("late switches not settled:", "%s: %s" % (type(e).__name__, str(e)[:200]))
         agent_card, _ = connector_cards._core()
         uses = []
-        for key, email in self.offers().items():
+        for key, email in (self.offers() if offered is None else offered).items():
             words = ("Use " + email)[:agent_card.LIMITS["label"]]
             uses.append(agent_card.button(words, "reply", style="secondary", reply=words,
                                           command=agent_card.reply(self.KIND, "agent", key)))
@@ -239,14 +247,29 @@ class AccountCard(account_switch.AccountSwitch):
             card = dict(card, buttons=uses + list(card.get("buttons") or []))
         return body, card
 
+    def none_here(self) -> str:
+        """Why nothing is offered: a switch here refused (its reason), or no other account to switch to."""
+        if self.seen.get("proxy"):
+            return "No account can be switched here: %s." % accounts.PROXIED
+        try:
+            config_dir_for_switch(self.cfg)
+        except accounts.Refused as e:
+            return "No account can be switched here: %s." % e
+        return NONE_HERE
+
     def tapped(self, verb, sent, result_file) -> str:
         """"Switch account": where to switch it, shown in place of the card tapped and still carrying the
         controls, so opened on the agent's computer it is the account card again. Nothing is started here.
         A saved account's key: ask the app to switch to it (`use`)."""
         if verb == "switch":
-            self.say(sent.get("channel_id"), account_switch.with_controls(self.card("info", WHERE), RUNTIME),
+            # From the phone (owner 11-27): never "open this on the computer". Accounts switchable here are offered
+            # in place; only an account another agent keeps needs a sign-in here, said as such.
+            text, refused = self.status()
+            offered = self.offers()             # after status(): the account in use decides what is offered
+            self.say(sent.get("channel_id"), self.card("pending", "%s %s" % (text, PICK if offered else self.none_here()),
+                                                       ask=True, signed_out=refused, offered=offered),
                      result_file, card_desk.tapped_event(sent))
-            return "account-where"
+            return "account-picks" if offered else "account-none-here"
         if KEY_RE.fullmatch(str(verb or "")):
             return self.use(verb, sent, result_file)
         self.publish(result_file, self.quoted(account_switch.EXPIRED_NO_CARD) + "\n")
