@@ -46,6 +46,8 @@ INDEX, INDEX_MAX = "index.json", 64 << 10
 USE_BUTTONS = 5          # with "Switch account", the six buttons a card may carry
 KEY_RE = re.compile(r"[0-9a-f]{16}")
 NOT_SAVED = "That account is no longer saved on this computer. Send /account for a new card."
+OTHERS_UNKNOWN = ("I could not check whether another agent shares this agent's Claude config dir, so nothing "
+                  "was done")
 UNMATCHED = "I couldn't match that button. Send /account for a new card."
 
 
@@ -154,16 +156,35 @@ def others(cfg: dict) -> dict:
             if not using or (v.lower() != using and k != saved_key(cfg.get("email") or ""))}
 
 
+def same_dir(mine, other) -> bool:
+    """Whether `other` is the very folder `mine` is (by device and inode, whatever path or link names it):
+    `own_dir`'s realpath comparison resolves what it can and compares the rest as text. Only an `other` that
+    is not there is a different folder; any other error raises, as Refused (fail closed)."""
+    try:
+        here = os.stat(mine)
+    except OSError as e:
+        raise accounts.Refused(OTHERS_UNKNOWN) from e
+    try:
+        there = os.stat(os.path.expanduser(str(other)))
+    except FileNotFoundError:
+        return False
+    except OSError as e:
+        raise accounts.Refused(OTHERS_UNKNOWN) from e
+    return (here.st_dev, here.st_ino) == (there.st_dev, there.st_ino)
+
+
 def config_dir_for_switch(cfg: dict) -> str:
     """The agent's own config dir; accounts.Refused when it has none, or it is not this agent's alone, or the
     credential proxy decides the account (the rules of a sign-in, `account.own_dir`)."""
     try:
         from .cli import other_agents_dirs
         from .shape import LOCAL
-        dirs = other_agents_dirs(LOCAL)
-    except Exception:  # noqa: BLE001 - the other checks still hold
-        dirs = []
+        dirs = other_agents_dirs(LOCAL, strict=True)
+    except Exception as e:  # noqa: BLE001 - fail closed: a dir shared with another agent cannot be ruled out
+        raise accounts.Refused(OTHERS_UNKNOWN) from e
     mine = accounts.own_dir(cfg, dirs)
+    if any(same_dir(mine, other) for other in dirs):
+        raise accounts.Refused(accounts.ANOTHER_AGENTS)
     if os.environ.get(accounts.PROXY_VAR):
         raise accounts.Refused(accounts.PROXIED)
     return mine
@@ -261,7 +282,7 @@ class AccountCard(account_switch.AccountSwitch):
                      result_file, tapped)
             return "account-not-asked"
         if nonce is None:
-            self.say(room, remote.note("info", remote.BUSY), result_file, tapped)
+            self.say(room, remote.note("info", remote.busy_words(self.root, config_dir)), result_file, tapped)
             return "account-busy"
         text = "Switching to %s…" % email
         if not remote.start(self.root, nonce, self.popen):

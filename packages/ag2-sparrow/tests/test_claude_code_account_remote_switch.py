@@ -4,8 +4,10 @@ and the app's answer (or silence) shown in place of the card. Stub CLI and a fak
 from __future__ import annotations
 
 import json
+import os
 import stat
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -81,6 +83,8 @@ class Remote(Base):
         self.request().rename(self.config / (rm.CLAIMED % nonce))
 
     def result(self, nonce, **data):
+        """The app's receipt; a success is a verified one unless the test says otherwise, as the app sends it."""
+        data = dict({"verified": True} if data.get("ok") is True else {}, **data)
         (self.config / (rm.RESULT % nonce)).write_text(json.dumps(dict({"v": 2, "nonce": nonce}, **data)))
         (self.config / (rm.CLAIMED % nonce)).unlink(missing_ok=True)
 
@@ -202,7 +206,11 @@ class Tap(Remote):
         self.assertIsNone(rm.publish(self.root, self.config, "k", A, DM, "$x", str(self.bridge)))
         self.request().unlink()
         (self.config / (rm.CLAIMED % "other")).write_text("{}")
-        self.assertIsNone(rm.publish(self.root, self.config, "k", A, DM, "$x", str(self.bridge)))
+        old = time.time() - 10 * rm.STALE_CLAIM_S
+        os.utime(self.config / (rm.CLAIMED % "other"), (old, old))
+        self.assertIsNone(rm.publish(self.root, self.config, "k", A, DM, "$x", str(self.bridge)),
+                          "a claim, however old, is the app's to release")
+        self.assertTrue((self.config / (rm.CLAIMED % "other")).exists())
         self.assertEqual(rm.outstanding(self.root), [])
 
     def test_the_exclusive_create_lets_only_one_writer_win(self):
@@ -246,15 +254,15 @@ class Tap(Remote):
         self.assertIn(ac.UNMATCHED, said[0])
         self.assertFalse(self.request().exists())
 
-    def use_directly(self, **over):
+    def use_directly(self, event="$own", **over):
         self.configure(BRIDGE_STATE_DIR=str(self.bridge), AGENT_ID=AGENT, **over)
         card = ac.AccountCard(self.root, self.cfg(), lambda *a: None, print)
         _, issued = connector_cards._core()
         built = card.card("pending", "x", ask=True)[1]
         built["buttons"].insert(0, {"label": "Use " + A, "kind": "reply", "reply": "Use " + A,
                                     "command": "card:account:agent:" + ac.saved_key(A)})
-        issued.record(Path(self.root), "$own", built, room=DM, lane="")
-        return card.tapped(ac.saved_key(A), {"channel_id": DM, "reply_to_event": "$own"}, None)
+        issued.record(Path(self.root), event, built, room=DM, lane="")
+        return card.tapped(ac.saved_key(A), {"channel_id": DM, "reply_to_event": event}, None)
 
     def test_no_config_dir_of_its_own_or_the_cores_is_refused_in_one_line(self):
         fallback = ac.app_data_dirs({})[0]
@@ -269,7 +277,125 @@ class Tap(Remote):
             self.assertEqual(self.use_directly(CLAUDE_CONFIG_DIR=str(self.config)), "account-refused")
         self.assertIn(accounts.PROXIED, self.queued()[-1]["card"]["text"])
         with mock.patch("ag2_sparrow.adapters.claude_code.cli.other_agents_dirs", side_effect=RuntimeError("x")):
-            self.assertEqual(self.use_directly(CLAUDE_CONFIG_DIR=str(self.config)), "account-switching")
+            self.assertEqual(self.use_directly(CLAUDE_CONFIG_DIR=str(self.config)), "account-refused")
+            self.assertEqual(self.queued()[-1]["card"]["text"], "Could not switch: " + ac.OTHERS_UNKNOWN)
+            self.assertNotIn("Use " + A, [b["label"] for b in self.posted("$x")["buttons"]], "fail closed: no buttons")
+        self.assertFalse(self.request().exists())
+        from ag2_sparrow.adapters.claude_code import cli as cc
+        with mock.patch.object(cc.os, "scandir", side_effect=OSError("x")), self.assertRaises(OSError):
+            cc.other_agents_dirs(cc.LOCAL, strict=True)
+        with mock.patch.object(Path, "rglob", side_effect=OSError("x")):
+            self.assertEqual(cc.other_agents_dirs(cc.LOCAL), [], "the sign-in's own reading is as before")
+
+    def test_a_peer_config_that_cannot_be_read_or_parsed_refuses_the_switch(self):
+        from ag2_sparrow.adapters.claude_code import cli as cc
+        root = cc.cm.config_root()
+        for name, make in (("peer-dir.conf", lambda p: p.mkdir(parents=True)),
+                           ("peer-bad.conf", lambda p: p.write_text("CLAUDE_CONFIG_DIR='unterminated\n"))):
+            peer = root / "peers" / name
+            peer.parent.mkdir(parents=True, exist_ok=True)
+            make(peer)
+            self.assertEqual([b["label"] for b in self.posted("$p" + name)["buttons"]], ["Switch account"], name)
+            self.assertEqual(self.use_directly("$u" + name, CLAUDE_CONFIG_DIR=str(self.config)), "account-refused", name)
+            self.assertEqual(self.queued()[-1]["card"]["text"], "Could not switch: " + ac.OTHERS_UNKNOWN)
+            self.assertFalse(self.request().exists())
+            self.assertEqual(cc.other_agents_dirs(cc.LOCAL), [], "other callers read leniently, as before")
+            (peer.rmdir() if peer.is_dir() else peer.unlink())
+        (root / "peers" / "peer.conf").write_text("CLAUDE_CONFIG_DIR=%s\n" % (self.home / "elsewhere"))
+        self.assertEqual(cc.other_agents_dirs(cc.LOCAL, strict=True), [str(self.home / "elsewhere")])
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root lists any directory")
+    def test_a_config_root_that_cannot_be_listed_whole_refuses_the_switch(self):
+        from ag2_sparrow.adapters.claude_code import cli as cc
+        root = cc.cm.config_root()
+        (root / "seen").mkdir(parents=True)
+        (root / "seen" / "peer.conf").write_text("CLAUDE_CONFIG_DIR=%s\n" % (self.home / "elsewhere"))
+        hidden = root / "hidden"
+        (hidden / "deeper").mkdir(parents=True)
+        (hidden / "deeper" / "peer.conf").write_text("CLAUDE_CONFIG_DIR=%s\n" % self.config)
+        hidden.chmod(0)
+        self.addCleanup(hidden.chmod, 0o700)
+        with self.assertRaises(PermissionError):
+            cc.other_agents_dirs(cc.LOCAL, strict=True)
+        self.assertEqual(cc.other_agents_dirs(cc.LOCAL), [str(self.home / "elsewhere")], "lenient: what it can")
+        self.assertEqual([b["label"] for b in self.posted("$h")["buttons"]], ["Switch account"])
+        self.assertEqual(self.use_directly("$hu", CLAUDE_CONFIG_DIR=str(self.config)), "account-refused")
+        self.assertEqual(self.queued()[-1]["card"]["text"], "Could not switch: " + ac.OTHERS_UNKNOWN)
+        self.assertFalse(self.request().exists())
+        hidden.chmod(0o700)
+        self.assertEqual(sorted(cc.other_agents_dirs(cc.LOCAL, strict=True)),
+                         sorted([str(self.home / "elsewhere"), str(self.config)]), "listed whole: every peer")
+        self.assertEqual(cc._strict_confs(self.home / "none"), [], "no config root: no other agent")
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root reads any directory")
+    def test_a_config_root_that_cannot_be_looked_at_is_never_taken_for_no_peers(self):
+        from ag2_sparrow.adapters.claude_code import cli as cc
+        cfg = self.cfg()
+        parent = cc.cm.config_root().parent
+        parent.chmod(0)
+        self.addCleanup(parent.chmod, 0o700)
+        with self.assertRaises(PermissionError):
+            cc.other_agents_dirs(cc.LOCAL, strict=True)
+        with self.assertRaises(accounts.Refused) as refused:
+            ac.config_dir_for_switch(cfg)
+        self.assertEqual(str(refused.exception), ac.OTHERS_UNKNOWN)
+        parent.chmod(0o700)
+        afile = self.home / "afile"
+        afile.write_text("")
+        with mock.patch.object(cc.cm, "config_root", return_value=afile / "ag2-sparrow"):
+            with self.assertRaises(NotADirectoryError):
+                cc.other_agents_dirs(cc.LOCAL, strict=True)
+            self.assertEqual(cc.other_agents_dirs(cc.LOCAL), [], "lenient: as before")
+        with mock.patch.object(cc.cm, "config_root", return_value=afile):
+            with self.assertRaises(NotADirectoryError):
+                cc.other_agents_dirs(cc.LOCAL, strict=True)
+        with mock.patch.object(cc.cm, "config_root", return_value=self.home / "missing" / "ag2-sparrow"):
+            self.assertEqual(cc.other_agents_dirs(cc.LOCAL, strict=True), [], "truly missing: no peers")
+            self.assertEqual(ac.config_dir_for_switch(cfg), str(self.config))
+
+    def test_an_entry_whose_kind_cannot_be_told_refuses_rather_than_skips(self):
+        from ag2_sparrow.adapters.claude_code import cli as cc
+
+        class Entry:
+            name, path = "sub", str(self.home / "sub")
+
+            def is_dir(self, follow_symlinks=True):
+                raise PermissionError("cannot stat")
+
+        class Listing(list):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+        with mock.patch.object(cc.os, "scandir", return_value=Listing([Entry()])):
+            with self.assertRaises(PermissionError):
+                cc._strict_confs(self.home)
+
+    def test_a_peer_that_names_this_agents_folder_another_way_is_refused_and_unknowns_fail_closed(self):
+        from ag2_sparrow.adapters.claude_code import cli as cc
+        cfg = self.cfg()
+        link = self.home / "link-to-mine"
+        link.symlink_to(self.config)
+        peers = cc.cm.config_root() / "peers"
+        peers.mkdir(parents=True)
+        (peers / "peer.conf").write_text("CLAUDE_CONFIG_DIR=%s\n" % link)
+        with self.assertRaises(accounts.Refused) as refused:
+            ac.config_dir_for_switch(cfg)
+        self.assertEqual(str(refused.exception), accounts.ANOTHER_AGENTS)
+        with mock.patch.object(ac.accounts, "own_dir", side_effect=lambda cfg, dirs: cfg["CLAUDE_CONFIG_DIR"]):
+            with self.assertRaises(accounts.Refused) as refused:
+                ac.config_dir_for_switch(cfg)
+            self.assertEqual(str(refused.exception), accounts.ANOTHER_AGENTS, "by inode, not by resolved text")
+        (peers / "peer.conf").write_text("CLAUDE_CONFIG_DIR=%s\n" % (self.home / "not-made-yet"))
+        self.assertEqual(ac.config_dir_for_switch(cfg), str(self.config), "a peer folder not there is not mine")
+        self.assertFalse(ac.same_dir(self.config, self.home / "not-made-yet"))
+        with mock.patch.object(ac.os, "stat", side_effect=[os.stat(self.config), PermissionError("x")]):
+            with self.assertRaises(accounts.Refused):
+                ac.same_dir(self.config, self.home / "elsewhere")
+        with mock.patch.object(ac.os, "stat", side_effect=PermissionError("x")):
+            with self.assertRaises(accounts.Refused):
+                ac.same_dir(self.config, self.home / "elsewhere")
 
     def test_an_account_no_longer_saved_and_a_request_that_cannot_be_written(self):
         self.index(self.appdata, {})
@@ -314,7 +440,7 @@ class Watch(Remote):
         self.result(nonce, ok=False, error="the saved sign-in\nhas expired")
         self.assertEqual(rm.watch(self.root, nonce), "Could not switch: the saved sign-in has expired")
         self.assertEqual(rm.told({"ok": False}, A), ("error", "Could not switch: the app gave no reason"))
-        self.assertEqual(rm.told({"ok": True}, A), ("done", "Switched to %s." % A))
+        self.assertEqual(rm.told({"ok": True}, A), ("done", rm.UNVERIFIED % A), "no `verified`: not known verified")
         self.assertEqual(rm.told({"ok": True, "verified": True}, A), ("done", "Switched to %s." % A))
 
     def test_a_switch_whose_new_sign_in_is_not_tried_yet_says_so(self):
@@ -328,8 +454,9 @@ class Watch(Remote):
         self.clear_outbox()
         nonce = self.begun()
         self.claim_it(nonce)
-        self.result(nonce, ok=True, label=A)      # an older app: no `verified`, read as verified
-        self.assertEqual(rm.watch(self.root, nonce), "Switched to %s." % A)
+        self.result(nonce, ok=True, label=A, verified=None)
+        (self.config / (rm.RESULT % nonce)).write_text(json.dumps({"v": 2, "nonce": nonce, "ok": True, "label": A}))
+        self.assertEqual(rm.watch(self.root, nonce), rm.UNVERIFIED % A, "an older app sends no `verified`: not verified")
 
     def test_a_result_for_a_different_nonce_is_ignored(self):
         nonce = self.begun()
@@ -337,10 +464,10 @@ class Watch(Remote):
         self.result(other, ok=True, label=B)
         (self.config / (rm.RESULT % nonce)).write_text(json.dumps({"v": 2, "nonce": other, "ok": True, "label": B}))
         rec = rm.load(self.root, nonce)
-        self.assertEqual(rm.receive(self.root, rec)["outcome"]["ok"], False, "a receipt naming another nonce is no success")
+        self.assertIs(rm.receive(self.root, rec)["outcome"]["unreadable"], True, "a receipt naming another nonce is no answer")
         self.assertTrue((self.config / (rm.RESULT % other)).exists(), "another request's receipt is left alone")
         self.assertIsNone(rm.receive(self.root, rec), "no receipt for it any more")
-        self.assertEqual(rm._parsed("not json", nonce)["error"], "the app's answer could not be read")
+        self.assertEqual(rm._parsed("not json", nonce), {"nonce": nonce, "unreadable": True})
         self.assertEqual(rm._watch(self.root, "66666666-6666-4666-8666-666666666666", None, None, print), "",
                          "a switch settled meanwhile is not told again")
 
@@ -351,7 +478,7 @@ class Watch(Remote):
         with mock.patch.object(rm.card_desk, "post", return_value=False):
             self.assertEqual(rm.watch(self.root, nonce, log=lambda *a: None), "Switched to %s." % A)
         rec, = rm.outstanding(self.root)
-        self.assertEqual(rec["outcome"], {"nonce": nonce, "ok": True, "label": A}, "the answer is kept")
+        self.assertEqual(rec["outcome"], {"nonce": nonce, "ok": True, "label": A, "verified": True}, "the answer is kept")
         self.assertEqual(list(self.config.iterdir()), [], "the receipt is gone")
         self.assertEqual(self.queued(), [])
         with mock.patch.object(rm.card_desk, "post", return_value=False):
@@ -383,7 +510,7 @@ class Watch(Remote):
         self.claim_it(nonce)
         self.result(nonce, ok=True, label=A)
         rec = rm.load(self.root, nonce)
-        rm.save(self.root, dict(rec, outcome={"nonce": nonce, "ok": True, "label": A}))     # then the stop
+        rm.save(self.root, dict(rec, outcome={"nonce": nonce, "ok": True, "label": A, "verified": True}))     # then the stop
         self.assertEqual(rm.settle_late(self.root), ["Switched to %s." % A])
         self.assertEqual(rm.settle_late(self.root), [])
         self.assertEqual(rm.recover(self.root), 0)
@@ -458,13 +585,172 @@ class Watch(Remote):
         with mock.patch.object(rm, "receive", side_effect=[None, rm.RETRY, None, None]):
             self.assertEqual(rm.watch(self.root, nonce, sleep=lambda s: None), rm.UNTOLD)
 
+    def test_a_receipt_with_its_nonce_but_not_the_contracts_shape_is_said_uncertain(self):
+        n = "88888888-8888-4888-8888-888888888888"
+        bad = ({}, {"ok": "yes", "label": A}, {"ok": None}, {"ok": True}, {"ok": True, "label": 5},
+               {"ok": True, "label": " "}, {"ok": True, "label": A, "verified": "no"},
+               {"ok": False, "verified": 1}, {"unknown": "yes", "ok": False}, {"unknown": False})
+        for data in bad:
+            self.assertEqual(rm._parsed(json.dumps(dict(data, nonce=n)), n), {"nonce": n, "unreadable": True}, data)
+        good = ({"ok": True, "label": A}, {"ok": True, "label": A, "verified": False}, {"ok": False},
+                {"ok": False, "error": "locked"}, {"unknown": True}, {"unknown": True, "ok": False, "error": "x"},
+                {"unknown": False, "ok": False})
+        for data in good:
+            self.assertNotIn("unreadable", rm._parsed(json.dumps(dict(data, nonce=n)), n), data)
+        self.assertEqual(rm.told(rm._parsed(json.dumps({"nonce": n, "ok": True, "label": A}), n), A)[1],
+                         rm.UNVERIFIED % A, "an older app's success: usable, shown as not yet tried")
+        nonce = self.begun()
+        self.claim_it(nonce)
+        (self.config / (rm.RESULT % nonce)).write_text(json.dumps({"v": 2, "nonce": nonce, "label": A}))
+        (self.config / (rm.CLAIMED % nonce)).unlink()
+        said = rm.watch(self.root, nonce)
+        self.assertEqual(said, rm.UNREAD_ON % ac.account_switch.masked(SARAH), "no `ok`: never 'Could not switch'")
+
     def test_a_receipt_read_whole_but_not_an_answer_is_said_so(self):
         nonce = self.begun()
         self.claim_it(nonce)
         (self.config / (rm.CLAIMED % nonce)).unlink()
         (self.config / (rm.RESULT % nonce)).write_text("{half")
-        self.assertEqual(rm.watch(self.root, nonce), "Could not switch: the app's answer could not be read")
-        self.assertEqual(list(self.config.iterdir()), [])
+        said = rm.watch(self.root, nonce)
+        self.assertEqual(said, rm.UNREAD_ON % ac.account_switch.masked(SARAH), "uncertain, with the account now")
+        self.assertNotIn("Could not switch", said)
+        self.assertEqual(self.texts(), [("$acct", said)])
+        self.assertEqual((list(self.config.iterdir()), rm.outstanding(self.root)), ([], []), "removed once told")
+        self.clear_outbox()
+        nonce = self.begun()
+        (self.config / rm.REQUEST).unlink()
+        (self.config / (rm.RESULT % nonce)).write_text("[]")
+        self.answer = "not json"
+        self.assertEqual(rm.watch(self.root, nonce), rm.UNREAD)
+
+    def aged(self, nonce, by):
+        rm.save(self.root, dict(rm.load(self.root, nonce), at=rm.load(self.root, nonce)["at"] - by))
+
+    def test_a_claim_unanswered_past_its_bound_is_told_once_kept_and_never_removed(self):
+        nonce = self.begun()
+        self.claim_it(nonce)
+        rm.save(self.root, dict(rm.load(self.root, nonce), gave_up=True))     # the watcher stopped at 10 min
+        self.aged(nonce, rm.STALE_CLAIM_S - 60)
+        self.assertEqual(rm.settle_late(self.root), [], "within its bound: still the app's")
+        self.aged(nonce, 120)
+        said = rm.UNCERTAIN % A
+        self.assertEqual(rm.recover(self.root), 0)
+        self.assertEqual(rm.settle_late(self.root), [], "told once")
+        self.assertEqual(self.texts(), [("$acct", said)])
+        self.assertNotIn("Could not", said)
+        self.assertTrue((self.config / (rm.CLAIMED % nonce)).exists(), "sparrow never removes a claim")
+        self.assertTrue(rm.load(self.root, nonce)["told_uncertain"], "the record is kept")
+        self.assertTrue(rm.busy(self.root, self.config))
+        os.utime(self.config / (rm.CLAIMED % nonce), (time.time() - rm.STALE_CLAIM_S - 5,) * 2)
+        self.assertEqual(rm.busy_words(self.root, self.config), rm.UNRESOLVED)
+        self.posted("$b")
+        rc, out = self.tap("task-b", "Use " + B, event="$b")
+        self.assertIn("(account-busy)", out["refused"])
+        self.assertEqual(self.texts()[-1], ("$b", rm.UNRESOLVED))
+        self.clear_outbox()
+        self.result(nonce, ok=True, label=A)          # the app, reopened, answers
+        self.assertEqual(rm.settle_late(self.root), ["Switched to %s after all." % A])
+        self.assertEqual((list(self.config.iterdir()), rm.outstanding(self.root)), ([], []))
+
+    def test_a_late_answer_after_the_uncertain_line_says_its_real_outcome(self):
+        self.assertEqual(rm.told({"ok": True}, A, after_all=True)[1], rm.UNVERIFIED % (A + " after all"))
+        self.assertEqual(rm.told({"ok": False, "error": "locked"}, A, after_all=True)[1], "Could not switch: locked")
+        nonce = self.begun()
+        self.claim_it(nonce)
+        rm.save(self.root, dict(rm.load(self.root, nonce), gave_up=True, told_uncertain=True))
+        (self.config / (rm.CLAIMED % nonce)).unlink()         # released by the app with no receipt: nothing to say
+        self.assertEqual(rm.settle_late(self.root), [])
+        self.assertEqual((self.texts(), rm.outstanding(self.root)), ([], []))
+        self.assertEqual(rm.busy_words(self.root, self.config), rm.BUSY)
+
+    def test_the_uncertain_line_survives_a_failed_journal_write_and_a_restart_between_steps(self):
+        nonce = self.begun()
+        self.claim_it(nonce)
+        rm.save(self.root, dict(rm.load(self.root, nonce), gave_up=True))
+        self.aged(nonce, rm.STALE_CLAIM_S + 1)
+        real = rm.save
+
+        def failing(root, rec):
+            if rec.get("told_uncertain"):
+                raise OSError("disk full")
+            return real(root, rec)
+        with mock.patch.object(rm, "save", side_effect=failing):
+            self.assertEqual(rm.settle_late(self.root, log=lambda *a: None), [rm.UNCERTAIN % A])
+        self.assertNotIn("told_uncertain", rm.load(self.root, nonce))
+        self.assertEqual(rm.settle_late(self.root), [rm.UNCERTAIN % A], "the second upkeep journals it")
+        self.assertEqual(len(self.queued()), 1, "one card: the repeat is the same keyed card")
+        self.assertTrue(rm.load(self.root, nonce)["told_uncertain"])
+        with mock.patch.object(rm.card_desk, "post", return_value=False):
+            rm.save(self.root, dict(rm.load(self.root, nonce), told_uncertain=False))
+            self.assertEqual(rm.settle_late(self.root, log=lambda *a: None), [], "not queued: not marked told")
+            self.assertFalse(rm.load(self.root, nonce)["told_uncertain"])
+        rec = {k: v for k, v in rm.load(self.root, nonce).items() if k != "uncertain_at"}
+        rm.save(self.root, rec)
+        with mock.patch.object(rm, "save", side_effect=OSError("disk full")):
+            self.assertEqual(rm.settle_late(self.root, log=lambda *a: None), [], "not journalled: not told")
+        self.assertEqual(len(self.queued()), 1)
+        self.result(nonce, ok=True, label=A)          # a real receipt stays the answer, whatever came before
+        self.assertEqual(rm.settle_late(self.root), ["Switched to %s." % A])
+
+    def test_a_junk_request_file_stops_blocking_after_its_bound_and_is_removed_only_while_unchanged(self):
+        self.request().write_text("")
+        self.assertTrue(rm.busy(self.root, self.config), "fresh: it may be the app's, mid-write")
+        self.assertIsNone(rm.publish(self.root, self.config, "a" * 16, A, DM, "$x", str(self.bridge)))
+        old = time.time() - rm.JUNK_REQUEST_S - 5
+        os.utime(self.request(), (old, old))
+        self.assertFalse(rm.busy(self.root, self.config))
+        nonce = rm.publish(self.root, self.config, "a" * 16, A, DM, "$x", str(self.bridge))
+        self.assertEqual(rm.request_nonce(self.config), nonce, "removed, and the new request written")
+        rm.drop(self.root, nonce)
+        self.request().unlink()
+        for junk in ("{half", '{"v": 2}'):
+            self.request().write_text(junk)
+            os.utime(self.request(), (old, old))
+            self.assertIsNotNone(rm.junk_request(self.config))
+        real = rm.os.rename
+
+        def swapped(src, dst):
+            real(src, dst)
+            Path(dst).write_text("changed")         # another file took its place meanwhile
+        with mock.patch.object(rm.os, "rename", side_effect=swapped):
+            self.assertFalse(rm.clear_junk_request(self.config))
+        self.assertEqual(self.request().read_text(), "changed", "put back")
+        os.utime(self.request(), (old, old))
+        with mock.patch.object(rm.os, "rename", side_effect=swapped), \
+                mock.patch.object(rm.os, "link", side_effect=FileExistsError("x")):
+            self.assertFalse(rm.clear_junk_request(self.config))
+        self.request().write_text('{"nonce": "x"}')
+        os.utime(self.request(), (old, old))
+        self.assertIsNone(rm.junk_request(self.config), "a whole request is never junk")
+        self.request().unlink()
+        self.assertFalse(rm.clear_junk_request(self.config))
+        with mock.patch.object(rm, "request_nonce", return_value=""):
+            self.assertIsNone(rm.junk_request(self.config), "gone between the two looks")
+        self.request().write_text("")
+        os.utime(self.request(), (old, old))
+        with mock.patch.object(rm.os, "rename", side_effect=OSError("x")):
+            self.assertFalse(rm.clear_junk_request(self.config))
+        self.assertEqual(rm.claims(self.home / "none"), [])
+        self.assertIsNone(rm.claim_age(self.config, "nope"))
+
+    def test_the_watchers_log_and_the_records_are_owner_only_whatever_the_umask(self):
+        log = Path(self.root) / "state" / rm.LOG
+        log.write_text("")
+        log.chmod(0o644)
+        old = os.umask(0)
+        try:
+            self.assertTrue(rm.start(self.root, "77777777-7777-4777-8777-777777777777", popen=lambda *a, **k: None))
+            nonce = self.begun()
+        finally:
+            os.umask(old)
+        self.assertEqual(stat.S_IMODE(log.stat().st_mode), 0o600)
+        tmp = rm.folder(self.root) / (nonce + ".json.tmp")
+        tmp.write_text("")
+        tmp.chmod(0o644)
+        rm.save(self.root, rm.load(self.root, nonce))
+        self.assertEqual(stat.S_IMODE((rm.folder(self.root) / (nonce + ".json")).stat().st_mode), 0o600)
+        with mock.patch.object(rm.os, "fchmod", side_effect=OSError("x")), self.assertRaises(OSError):
+            rm.private_log(self.root)
 
     def test_an_app_restart_mid_switch_says_the_account_now_never_that_it_failed(self):
         nonce = self.begun()
@@ -559,13 +845,13 @@ class Watch(Remote):
         self.request().unlink()
         self.assertEqual(rm.watch(self.root, nonce), rm.UNTOLD, "the watcher too")
         nonce = self.begun()
-        late = dict(rm.load(self.root, nonce), outcome={"nonce": nonce, "ok": True, "label": A})
+        late = dict(rm.load(self.root, nonce), outcome={"nonce": nonce, "ok": True, "label": A, "verified": True})
         with mock.patch.object(rm, "receive", side_effect=[None, late]):
             self.request().unlink()
             self.assertEqual(rm.settle_late(self.root), ["Switched to %s." % A], "written as the claim went")
         nonce = self.begun()
         self.request().unlink()
-        late = dict(rm.load(self.root, nonce), outcome={"nonce": nonce, "ok": True, "label": A})
+        late = dict(rm.load(self.root, nonce), outcome={"nonce": nonce, "ok": True, "label": A, "verified": True})
         with mock.patch.object(rm, "receive", side_effect=[None, late]):
             self.assertEqual(rm.watch(self.root, nonce), "Switched to %s." % A)
 

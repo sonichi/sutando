@@ -20,17 +20,19 @@ replaces the session's credential with its own, so its sign-in decides the accou
 """
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import time
-from contextlib import contextmanager
 from pathlib import Path
+
+from ... import detached_login
+from ...detached_login import ANSI_RE, born  # noqa: F401 - born is this module's name for it too
+
+_ours, _locked, _read_json = detached_login.ours, detached_login.locked, detached_login.read_json
 
 LOGIN_WAIT_S = 600.0        # how long a sign-in in the browser may take
 STATUS_WAIT_S = 30.0
@@ -38,7 +40,6 @@ LINK_WAIT_S = 20.0          # how long Claude Code may take to print its sign-in
 CODE_WAIT_S = 90.0          # how long it may take to accept or refuse a code
 LINK_RE = re.compile(r"https://[^\s\x07\x1b]+/oauth/authorize\?[^\s\x07\x1b]+")
 CODE_RE = re.compile(r"[A-Za-z0-9_\-#.~+/=]{8,2048}")
-ANSI_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-9;?]*[A-Za-z]")
 NOT_WAITING = "no sign-in is waiting for a code; start one first"
 PROXY_VAR = "ANTHROPIC_BASE_URL"
 SHARED = ("this agent has no Claude config dir of its own (install --claude-config-dir): signing in here would "
@@ -138,45 +139,6 @@ def sign_in(cfg: dict, env: dict, console: bool = False, run=subprocess.run, wai
     return (True, "") if r.returncode == 0 else (False, "claude auth login ended with exit code %d" % r.returncode)
 
 
-def born(pid) -> str:
-    """When the process started, as `ps` tells it; '' when there is none. With the pid, its identity."""
-    try:
-        r = subprocess.run(["/bin/ps", "-p", str(int(pid)), "-o", "lstart="], capture_output=True, text=True, timeout=10)
-    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
-        return ""
-    return " ".join(r.stdout.split()) if r.returncode == 0 else ""
-
-
-def _ours(entry) -> int:
-    """The pid of a recorded [pid, born] process that is still that very process, else 0."""
-    try:
-        pid, was = int(entry[0]), str(entry[1])
-    except (TypeError, ValueError, IndexError, KeyError):
-        return 0
-    return pid if was and pid != os.getpid() and born(pid) == was else 0
-
-
-@contextmanager
-def _locked(state_dir):
-    """One at a time over a sign-in's state: a stable lock file beside the dir, never removed."""
-    d = Path(state_dir)
-    d.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(d.parent / (d.name + ".lock")), os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0), 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
-    finally:
-        os.close(fd)
-
-
-def _read_json(path: Path) -> dict:
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
 def waiting(state_dir) -> bool:
     """Whether a started sign-in is still waiting for its code."""
     d = Path(state_dir)
@@ -189,12 +151,7 @@ def _end(d: Path) -> bool:
     died is ended too, and a pid since reused by something else is left alone."""
     pids = _read_json(d / "pids.json")
     for entry in (pids.get("claude"), pids.get("supervisor")):
-        pid = _ours(entry)
-        if pid:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except OSError:
-                pass
+        detached_login.end(entry)
     there = d.exists()
     shutil.rmtree(d, ignore_errors=True)
     return there

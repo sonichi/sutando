@@ -39,6 +39,8 @@ TAG = r"UNTRUSTED_TASK_[0-9a-f]{8}"
 REPO_ROOT = PKG_ROOT.parents[1]
 REAL_SERVER_ARGV = cc.server_argv
 REAL_OPEN_PAGE = cc.open_page
+# The account card's buttons: the browser sign-in on this computer, and the device-code one from any device.
+ACCOUNT_BUTTONS = ["Switch account", "Add account"]
 
 
 def covered_server_argv(server, codex="codex"):
@@ -1280,7 +1282,7 @@ class AccountCardTest(CardWorld, unittest.TestCase):
         ordinary message follows in the same run, during which the server reports the sign-in over."""
         self.assertEqual(self.serve("task-ask", "/account"), "[no-send] the account card answers\n")
         ((room, card),) = self.posted(event)
-        self.assertEqual((room, card["state"], [b["label"] for b in card["buttons"]]), (self.DM, "pending", ["Switch account"]))
+        self.assertEqual((room, card["state"], [b["label"] for b in card["buttons"]]), (self.DM, "pending", ACCOUNT_BUTTONS))
         said = card["buttons"][0]["reply"]
         self.dm("task-tap", said, reply_to=event, click=said)
         if extra_task:
@@ -1354,7 +1356,7 @@ class AccountCardTest(CardWorld, unittest.TestCase):
         self.assertEqual(self.serve("task-1", "hello"), account_switch.ANSWERED)
         ((room, card),) = self.posted()
         self.assertEqual((room, card["state"], card["text"], [b["label"] for b in card["buttons"]]),
-                         (self.DM, "pending", cc.SIGNED_OUT + " " + account_switch.BELOW, ["Switch account"]))
+                         (self.DM, "pending", cc.SIGNED_OUT + " " + account_switch.BELOW, ACCOUNT_BUTTONS))
         self.assertEqual(card["account_controls"], {"runtime": "codex", "signed_out": True})
         rec = metrics(self.work)[-1]
         self.assertEqual((rec["status"], rec["card"], rec["auth"]), ("unauthorized", "signed-out-card", "restarted-unauthorized"))
