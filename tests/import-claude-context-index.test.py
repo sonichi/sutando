@@ -21,6 +21,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -397,6 +398,21 @@ class TestCli(Base):
 
 
 class TestScanEdges(Base):
+    def test_first_prompt_survives_invalid_message_and_text_shapes(self):
+        self.addCleanup(shutil.rmtree, self.tmp)
+        p = self.tmp / "malformed.jsonl"
+        _write(p, [
+            {"type": "user", "message": True},
+            {"type": "user", "message": {"content": 17}},
+            {"type": "user", "message": {"content": [
+                {"type": "text", "text": {}},
+                {"type": "text", "text": "<system-reminder>noise</system-reminder>Valid ask"},
+            ]}},
+        ])
+        before = p.read_bytes()
+        self.assertEqual(self.m.scan_session(p)["first_prompt"], "Valid ask")
+        self.assertEqual(p.read_bytes(), before)
+
     def test_default_root_is_the_stock_projects_dir(self):
         with patch.dict(os.environ, {"SOURCE_CLAUDE_CONFIG_DIR": str(self.tmp / "vanilla")}):
             self.assertEqual(self.m.default_root(), self.tmp / "vanilla" / "projects")

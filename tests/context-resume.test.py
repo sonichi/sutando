@@ -222,6 +222,81 @@ class BudgetTests(unittest.TestCase):
 
 
 class MessageTextEdgeTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "transcript.jsonl"
+
+    def write(self, entries):
+        self.path.write_text("".join(json.dumps(e) + "\n" for e in entries), encoding="utf-8")
+        return self.path
+
+    def test_non_object_records_preserve_surrounding_turns(self):
+        for invalid in (None, False, True, 17, 1.5, "text", [], ["user"]):
+            with self.subTest(record=invalid):
+                p = self.write([_user("before"), invalid, _assistant("after")])
+                self.assertEqual(extract_recent_turns(p),
+                                 "**User:** before\n\n**Assistant:** after")
+
+    def test_invalid_messages_and_content_do_not_consume_turn_window(self):
+        for invalid in (None, False, True, 17, 1.5, "text", [], ["text"]):
+            with self.subTest(message=invalid):
+                p = self.write([_user("before"), {"type": "user", "message": invalid},
+                                _assistant("after")])
+                self.assertEqual(extract_recent_turns(p, max_turns=2),
+                                 "**User:** before\n\n**Assistant:** after")
+        for invalid in (None, False, True, 17, 1.5, {"type": "text", "text": "wrong shape"}):
+            with self.subTest(content=invalid):
+                p = self.write([_user("before"), _assistant(invalid), _user("after")])
+                self.assertEqual(extract_recent_turns(p, max_turns=2),
+                                 "**User:** before\n\n**User:** after")
+
+    def test_shared_parser_skips_invalid_fields_and_keeps_valid_blocks(self):
+        invalid = (None, False, True, 17, 1.5, [], {}, ["text"])
+        blocks = [{"type": kind, field: value} for value in invalid
+                  for kind, field in (("text", "text"), ("tool_use", "name"))]
+        blocks += [{"type": "text"}, {"type": "tool_use", "name": ""},
+                   {"type": "text", "text": "kept"},
+                   {"type": "text", "text": "second"},
+                   {"type": "tool_use", "name": "Read"}, {"type": "tool_use"}]
+        self.assertEqual(context_resume.message_text({"content": blocks}),
+                         ("kept\nsecond", ["Read", "?"]))
+        p = self.write([_assistant(blocks)])
+        self.assertEqual(extract_recent_turns(p), "**Assistant:** kept\nsecond")
+
+    def test_invalid_tool_names_do_not_hide_valid_tool_summary(self):
+        p = self.write([_assistant([
+            {"type": "text", "text": None},
+            {"type": "tool_use", "name": ["invalid"]},
+            {"type": "tool_use", "name": "Read"},
+            {"type": "tool_use", "name": "Read"},
+            {"type": "tool_use"},
+        ])])
+        self.assertEqual(extract_recent_turns(p), "**Assistant:** [ran tools: Read, ?]")
+
+    def test_shared_parser_handles_invalid_message_and_content_shapes(self):
+        for invalid in (None, False, True, 17, 1.5, "text", [], ["text"]):
+            with self.subTest(message=invalid):
+                self.assertEqual(context_resume.message_text(invalid), ("", []))
+        for invalid in (None, False, True, 17, 1.5, {"text": "wrong shape"}):
+            with self.subTest(content=invalid):
+                self.assertEqual(context_resume.message_text({"content": invalid}), ("", []))
+
+    def test_cli_recovers_turns_and_reports_an_all_invalid_transcript(self):
+        for entries, expected in (([_user("before"), None, _assistant([
+                {"type": "text", "text": []}, {"type": "text", "text": "after"}])],
+                "**User:** before\n\n**Assistant:** after\n"),
+                ([None, {"type": "user", "message": True}, _assistant([
+                    {"type": "tool_use", "name": {}}])], "")):
+            with self.subTest(entries=entries):
+                p = self.write(entries)
+                r = subprocess.run([sys.executable, str(ROOT / "src/context_resume.py"), str(p)],
+                                   capture_output=True, text=True, timeout=10, check=False)
+                self.assertEqual(r.returncode, 0 if expected else 1)
+                self.assertEqual(r.stdout, expected)
+                self.assertEqual(r.stderr, "" if expected else
+                                 "context-resume: no conversation turns found\n")
+
     def test_non_dict_blocks_skipped(self):
         # line 69: non-dict entries in a content list are skipped, not fatal
         p = _write([

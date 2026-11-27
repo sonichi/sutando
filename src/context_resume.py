@@ -68,19 +68,25 @@ def _clean(text: str) -> str:
 
 def _message_text(message: dict) -> tuple[str, list[str]]:
     """Return (joined text, tool names) from a transcript message's content."""
+    if not isinstance(message, dict):
+        return "", []
     content = message.get("content")
     if isinstance(content, str):
         return content, []
+    if not isinstance(content, list):
+        return "", []
     texts: list[str] = []
     tools: list[str] = []
-    for block in content or []:
+    for block in content:
         if not isinstance(block, dict):
             continue
         btype = block.get("type")
-        if btype == "text":
+        if btype == "text" and isinstance(block.get("text"), str):
             texts.append(block.get("text", ""))
         elif btype == "tool_use":
-            tools.append(block.get("name", "?"))
+            name = block.get("name", "?")
+            if isinstance(name, str) and name:
+                tools.append(name)
         # thinking / tool_result / images: skipped — noise for resume purposes
     return "\n".join(texts), tools
 
@@ -107,7 +113,7 @@ def extract_recent_turns(transcript: Path, max_turns: int = 12, max_chars: int =
                 entry = json.loads(raw)
             except json.JSONDecodeError:
                 continue
-            if entry.get("type") not in ("user", "assistant"):
+            if not isinstance(entry, dict) or entry.get("type") not in ("user", "assistant"):
                 continue
             message = entry.get("message") or {}
             text, tools = _message_text(message)
