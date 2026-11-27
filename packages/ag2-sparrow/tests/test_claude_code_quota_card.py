@@ -477,12 +477,15 @@ class LimitMenu(NoticeBase):
         self.task("task-done", "answered already")
         (self.results / "task-done.txt").write_text("[s.space] done\n")
         self.task("task-r", "from a room", kind="room")
-        self.assertEqual(self.tick(STARTUP_MENU), "quota-task-card x1")
-        (only,) = self.queued()
-        self.assertEqual(only["room"], DM, "the owner's message in a room is told in their DM")
+        # The room gets its note; that says nothing in the DM, so the limit's own card goes there too.
+        self.assertEqual(self.tick(STARTUP_MENU), "quota-card; quota-task-card x1")
+        texts = sorted(q["card"]["text"] for q in self.queued())
+        self.assertEqual(len(texts), 2)
+        self.assertTrue(texts[0].startswith("Claude Code has reached its usage limit") and "sarah@" in texts[1], texts)
+        self.assertNotIn("covers", quota_card.load(self.root), "a room's note covers no DM incident")
         self.assertEqual(sorted(quota_card.load(self.root)["tasks"]), ["task-c", "task-g", "task-r"])
         self.assertEqual(self.tick(STARTUP_MENU, 5.0), "")
-        self.assertEqual(len(self.queued()), 1)
+        self.assertEqual(len(self.queued()), 2)
 
     def test_an_account_that_cannot_be_read_is_named_as_claude_code_and_said_so(self):
         quota_card.remember_room(self.root, DM)
@@ -509,9 +512,9 @@ class LimitMenu(NoticeBase):
             self.assertEqual(self.tick(STARTUP_MENU, quota_card.RETRY_S), "quota-not-posted", "its key not kept: not sent")
         self.assertEqual(self.queued(), [])
         # Asked in a room: the card answers there, and names no account.
-        self.assertEqual(self.tick(STARTUP_MENU, quota_card.RETRY_S), "quota-task-card x1")
+        self.assertEqual(self.tick(STARTUP_MENU, quota_card.RETRY_S), "quota-card; quota-task-card x1")
         self.assertEqual(self.tick(STARTUP_MENU, 1.0), "")
-        (there,) = self.queued()
+        (there,) = [q for q in self.queued() if "sarah@" not in q["card"]["text"]]
         self.assertEqual(there["card"]["text"].split(" ", 2)[:2], ["Claude", "Code"])
         self.assertNotIn("sarah@example.com", there["card"]["text"])
         self.assertEqual(there["card"]["text"], "Claude Code has reached its usage limit (resets Nov 28, 1pm), so I can't "
