@@ -18,6 +18,7 @@ want="$(printf '%s' "$*" | sed -n 's/.*#{==:#{pane_pid},\([0-9]*\)}.*/\1/p')"
 if [ -n "$want" ]; then
   to="$(printf '%s' "$*" | sed -n "s/.*copy-mode -q -t '\([^']*\)' ; .*/\1/p")"
   [ "$(pid_of "$to")" = "$want" ] || { echo "WITHHELD $to" >> "$TMUX_LOG"; exit 1; }
+  echo "BOUND $to $want" >> "$TMUX_LOG"
 fi
 . "$TMUX_FAKE_UNWRAP"
 printf '%s\n' "$*" >> "$TMUX_LOG"
@@ -33,7 +34,9 @@ case " $* " in *" capture-pane "*)
   seen=""; prev=""; for a in "$@"; do [ "$a" = capture-pane ] && seen=1; [ -n "$seen" ] && [ "$prev" = -t ] && { target="$a"; break; }; prev="$a"; done
   # One acceptance line per /model sent, on the pane it was sent to; the pick is saved in the folder that session runs in.
   acc=""; sent="$(grep -- "-l /model" "$TMUX_LOG" | tail -1)"
-  if [ -n "$sent" ] && [ -z "${FAKE_NO_ACCEPT:-}" ]; then
+  # FAKE_DIALOG: the CLI asks to confirm, and accepts only once a second Enter lands.
+  dialog=""; [ -n "${FAKE_DIALOG:-}" ] && [ -n "$sent" ] && [ "$(grep -c ' Enter$' "$TMUX_LOG")" -le 1 ] && dialog="   ❯ 1. Yes, switch to X\n     2. No, go back\n"
+  if [ -n "$sent" ] && [ -z "${FAKE_NO_ACCEPT:-}" ] && [ -z "$dialog" ]; then
     model="${sent##*-l /model }"; session="$(printf '%s' "$sent" | sed 's/.*send-keys -t \([^ ]*\) .*/\1/')"
     case "$model" in opus) name="Opus 5";; haiku) name="Haiku 4.5";; sonnet) name="Sonnet 5";; *) name="$model";; esac
     if [ "$target" = "$session" ] || [ "$target" = "$(awk '{print $1}' "$panes/$session" 2>/dev/null)" ]; then
@@ -44,8 +47,9 @@ case " $* " in *" capture-pane "*)
   fi
   # What some other pane shows once a /model was sent: text planted for this exact target on this socket.
   [ -n "$sent" ] && acc="$acc$(cat "$FAKE_ROOT/screen/$sb/$target" 2>/dev/null)"
-  printf '%b' "$acc────\n❯ \n────\n"
-  [ -n "$bound" ] && echo "$bound";; esac
+  printf '%b' "$acc$dialog────\n❯ \n────\n"
+  [ -n "$bound" ] && echo "$bound"
+  [ -n "$dialog" ] && swap dialog;; esac
 exit 0
 SH
 cat > "$T/bin/pgrep" <<'SH'
@@ -166,6 +170,22 @@ printf '%s' "$ACCEPTED" > "$T/accepted"; mkdir -p "$T/screen/x.sock"; cp "$T/acc
 rc=$(run $(worker_as "$A") FAKE_NO_ACCEPT=1 "FAKE_SWAP=enter:sutando-worker-$A:301" -- opus)
 replaced 15 && grep -q "while waiting for acceptance" "$T/err" && ok "P3c the acceptance line is on the pane after its process was replaced: not counted (exit 15), nothing recorded" || fail "P3c" "rc=$rc $(cat "$T/err")"
 rm -rf "$T/screen"
+
+# the confirm dialog: its Enter and its Escape go only to the checked pane, and only while it is still that pane
+enters(){ grep -c ' Enter$' "$TMUX_LOG"; }
+rc=$(run $(worker_as "$A") FAKE_DIALOG=1 "FAKE_SWAP=dialog:sutando-worker-$A:301" -- opus --confirm)
+replaced 15 && [ "$(enters)" = 1 ] && grep -q "before the confirming Enter" "$T/err" \
+  && ok "P4a --confirm, pane replaced while the dialog is up: exit 15, no confirming Enter sent, nothing recorded" || fail "P4a" "rc=$rc enters=$(enters) $(cat "$T/err")"
+rc=$(run $(worker_as "$A") FAKE_DIALOG=1 "FAKE_SWAP=panes3:sutando-worker-$A:301" -- opus --confirm)
+replaced 8 && [ "$(enters)" = 1 ] && grep -q "WITHHELD %102" "$TMUX_LOG" \
+  && ok "P4b --confirm, pane replaced after the last check: the Enter is bound to the pane id and pid and withheld, nothing recorded" || fail "P4b" "rc=$rc enters=$(enters) $(cat "$T/err")"
+rc=$(run $(worker_as "$A") FAKE_DIALOG=1 -- opus)
+replaced 6 && [ "$(enters)" = 1 ] && grep -q -- "send-keys -t %102 Escape" "$TMUX_LOG" && grep -q "BOUND %102 102" "$TMUX_LOG" && [ "$(grep -c ' Escape$' "$TMUX_LOG")" = 1 ] \
+  && ok "P4c no --confirm: one Escape, to the checked pane id with its pid, exit 6, nothing recorded" || fail "P4c" "rc=$rc $(cat "$T/err")"
+rc=$(run $(worker_as "$E") FAKE_DIALOG=1 -- sonnet --confirm)
+[ "$rc" = 0 ] && [ "$(field "$STATE/workers/$E/model-switch.json" model confirmed worker)" = "sonnet True $E" ] && [ "$(enters)" = 2 ] \
+  && grep -q -- "send-keys -t %203 Enter" "$TMUX_LOG" && grep -q "BOUND %203 203" "$TMUX_LOG" && [ "$(core_snapshot)" = "$CORE_BEFORE" ] \
+  && ok "P4d --confirm, pane unchanged: the Enter goes to the checked pane id with its pid; switched and recorded as confirmed" || fail "P4d" "rc=$rc enters=$(enters) $(cat "$T/err")"
 
 # a worker folder that is a link is not that worker's own, wherever it points
 F=ffffffffffffffffffffffffffffffff; G=0000000000000000000000000000000a; H=0000000000000000000000000000000b; WORKERS="$(dirname "$OWN_A")"
