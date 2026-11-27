@@ -17,10 +17,14 @@ said still in progress, and after GIVE_UP_S said untold (never failed) with the 
 result is still told: `settle_late`, on the next card or tap, and `recover`, which restarts a watcher a
 restart left dead. The app's answer is kept in that record before its receipt is removed, and the
 record is dropped only once the card telling it is queued; an answer the app could not finish knowing
-(`unknown`: it restarted mid-switch), a receipt read whole that is not an answer, and a claim the app left
-unanswered for STALE_CLAIM_S (by its mtime: the app died for good) say the account in use now, never that the
-switch failed. A stale claim then stops counting as a switch in progress: its record is dropped and the claim
-removed while it still holds that nonce. The watcher's log is owner-only, like every file kept here.
+(`unknown`: it restarted mid-switch) and a receipt read whole that is not an answer say the account in use
+now, never that the switch failed. Sparrow never removes a claim: only the app releases one (at its next
+launch it answers a claim it left with `unknown`). A claim unanswered STALE_CLAIM_S after the request is told
+to the owner once as not known yet (`told_uncertain`, journalled in the record), the record kept so a late
+receipt is still shown ("… after all"); while the claim is there the agent stays busy and a tap is told that
+reopening the app resolves it. A request file that is not a whole request (empty, unparseable or unreadable)
+and older than JUNK_REQUEST_S is not one sparrow wrote: it stops counting as busy and is removed while it is
+still the same file. The watcher's log is owner-only, like every file kept here.
 
     python3 -m ag2_sparrow.adapters.claude_code.account_remote await --root ROOT --nonce NONCE
 """
@@ -47,7 +51,8 @@ FILE_MAX = 16 << 10
 VERSION = 2
 PENDING = "account-remote"
 UNCLAIMED_S, GIVE_UP_S, POLL_S = 90.0, 600.0, 1.0
-STALE_CLAIM_S = 900.0       # a claim with no result this long after its last change: the app is not coming back
+STALE_CLAIM_S = 900.0       # a claim with no result this long after the request: told once as not known yet
+JUNK_REQUEST_S = 120.0      # a request file that is not a whole request, this old: never sparrow's, and stale
 LOG = "account-remote.log"
 NONCE_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
 BUSY = "A switch is already running for this agent."
@@ -59,8 +64,10 @@ RESTARTED_ON = "The app restarted during the switch. This agent is now on %s."
 RESTARTED = "The app restarted during the switch; check the account card to see which account is in use."
 UNREAD_ON = "The app's answer about this switch could not be read. This agent is now on %s."
 UNREAD = "The app's answer about this switch could not be read; check the account card to see which account is in use."
-STALE_ON = "The app never said how this switch ended. This agent is now on %s."
-STALE = "The app never said how this switch ended; check the account card to see which account is in use."
+UNCERTAIN = ("It isn't known yet how the switch to %s ended; check the account card. If the app on that computer "
+             "was closed or crashed, opening it again will finish this.")
+UNRESOLVED = ("A previous switch for this agent is still unresolved; opening the app on the computer it runs on "
+              "will resolve it.")
 UNTOLD = "The app has not said how the switch ended; check the account card again in a moment."
 _popen = subprocess.Popen
 
@@ -149,44 +156,64 @@ def claimed(config_dir, nonce: str) -> bool:
     return os.path.lexists(str(Path(config_dir) / (CLAIMED % nonce)))
 
 
-def stale_claim(config_dir, nonce: str, now=None) -> bool:
-    """Whether the claim of `nonce` is there and unchanged for STALE_CLAIM_S."""
+def claim_age(config_dir, nonce: str, now=None):
+    """Seconds since the claim of `nonce` last changed; None when there is none."""
     try:
         at = os.lstat(str(Path(config_dir) / (CLAIMED % nonce))).st_mtime
     except OSError:
-        return False
-    return (time.time() if now is None else now) - at >= STALE_CLAIM_S
+        return None
+    return (time.time() if now is None else now) - at
 
 
-def claimed_any(config_dir, now=None) -> bool:
-    """Whether the app holds a claim that may still be answered: a stale one (STALE_CLAIM_S) does not count."""
+def claims(config_dir) -> list:
+    """The nonces of the claims the app holds (each stays until the app itself answers it)."""
     try:
         names = os.listdir(str(config_dir))
     except OSError:
+        return []
+    return [n[len(".ag2-switch-claimed-"):-len(".json")] for n in names
+            if n.startswith(".ag2-switch-claimed-") and n.endswith(".json")]
+
+
+def claimed_any(config_dir) -> bool:
+    return bool(claims(config_dir))
+
+
+def junk_request(config_dir, now=None):
+    """The request file's (inode, mtime) when it is not a whole request (empty, unparseable, unreadable) and
+    at least JUNK_REQUEST_S old: sparrow writes requests whole, so it is not one of sparrow's. None otherwise."""
+    if request_nonce(config_dir) != "":
+        return None
+    try:
+        st = os.lstat(str(Path(config_dir) / REQUEST))
+    except OSError:
+        return None
+    if (time.time() if now is None else now) - st.st_mtime < JUNK_REQUEST_S:
+        return None
+    return st.st_ino, st.st_mtime
+
+
+def clear_junk_request(config_dir, now=None) -> bool:
+    """Remove a junk request (`junk_request`) only while it is the same file: moved aside, compared by inode
+    and mtime, put back when it is not. Whether one was removed."""
+    seen = junk_request(config_dir, now)
+    if seen is None:
         return False
-    return any(n.startswith(".ag2-switch-claimed-") and n.endswith(".json")
-               and not stale_claim(config_dir, n[len(".ag2-switch-claimed-"):-len(".json")], now) for n in names)
-
-
-def drop_stale_claim(config_dir, nonce: str) -> None:
-    """Remove the claim of `nonce` only while it still holds that nonce (moved aside first, then checked)."""
-    path = Path(config_dir) / (CLAIMED % nonce)
-    aside = path.with_name(path.name + ".stale")
+    path = Path(config_dir) / REQUEST
+    aside = path.with_name(REQUEST + ".junk")
     try:
         os.rename(str(path), str(aside))
     except OSError:
-        return
+        return False
     try:
-        text, _ = read_regular(str(aside), FILE_MAX, follow=False)
+        st = os.lstat(str(aside))
+        if (st.st_ino, st.st_mtime) == seen:
+            return True
         try:
-            data = json.loads(text) if text else None
-        except ValueError:
-            data = None
-        if not (isinstance(data, dict) and data.get("nonce") == nonce):
-            try:
-                os.link(str(aside), str(path))      # not that nonce's: left as it was
-            except OSError:
-                pass
+            os.link(str(aside), str(path))      # another file since: left as it was
+        except OSError:
+            pass
+        return False
     finally:
         aside.unlink(missing_ok=True)
 
@@ -290,27 +317,28 @@ def current_account(rec: dict) -> str:
         return ""
 
 
-def told(data, label: str, current=lambda: "") -> tuple:
+def told(data, label: str, current=lambda: "", after_all: bool = False) -> tuple:
     """(state, words) for the app's answer. One that does not say how the switch ended (the app restarted
-    during it, `unknown`; a receipt that is not an answer, `unreadable`; a claim left unanswered, `stale`)
-    is never said failed: it says the account in use now, as `current()` reads it."""
-    for flag, on, plain in (("unknown", RESTARTED_ON, RESTARTED), ("unreadable", UNREAD_ON, UNREAD),
-                            ("stale", STALE_ON, STALE)):
+    during it, `unknown`; a receipt that is not an answer, `unreadable`) is never said failed: it says the
+    account in use now, as `current()` reads it. `after_all`: the owner was told it was not known yet."""
+    for flag, on, plain in (("unknown", RESTARTED_ON, RESTARTED), ("unreadable", UNREAD_ON, UNREAD)):
         if data.get(flag) is True:
             now = current()
             return "info", (on % now if now else plain)
     if data.get("ok") is True:
-        name = account_switch.shown(str(data.get("label") or "").split(" (")[0])
+        name = (account_switch.shown(str(data.get("label") or "").split(" (")[0]) or label) + (
+            " after all" if after_all else "")
         if data.get("verified") is not True:      # switched; its sign-in not tried yet, or not said (older app)
-            return "done", UNVERIFIED % (name or label)
-        return "done", "Switched to %s." % (name or label)
+            return "done", UNVERIFIED % name
+        return "done", "Switched to %s." % name
     return "error", "Could not switch: %s" % (one_line(data.get("error")) or "the app gave no reason")
 
 
-def tell(rec: dict, state: str, words: str, phase: str, log=_log) -> bool:
-    """Queue `words` in place of the card tapped; whether it was queued."""
+def tell(rec: dict, state: str, words: str, phase: str, log=_log, at_ns: int = 0) -> bool:
+    """Queue `words` in place of the card tapped; whether it was queued. With the `at_ns` first decided (kept
+    in the record) a repeat is the same keyed card, never a second one."""
     if card_desk.post(rec.get("bridge_state") or "", rec.get("room") or "", note(state, words), log,
-                      key="account-remote:%s:%s" % (rec["nonce"], phase), at_ns=time.time_ns(),
+                      key="account-remote:%s:%s" % (rec["nonce"], phase), at_ns=at_ns or time.time_ns(),
                       edit=str(rec.get("edit") or "")):
         return True
     log("not posted:", words)
@@ -320,7 +348,8 @@ def tell(rec: dict, state: str, words: str, phase: str, log=_log) -> bool:
 def settle(root, rec: dict, log=_log) -> str:
     """Tell the answer kept in `rec`; the record is dropped only once its card is queued, else it stays,
     answer and all, for the next try (`settle_late`)."""
-    state, words = told(rec["outcome"], str(rec.get("label") or "that account"), lambda: current_account(rec))
+    state, words = told(rec["outcome"], str(rec.get("label") or "that account"), lambda: current_account(rec),
+                        after_all=bool(rec.get("told_uncertain")))
     if tell(rec, state, words, "result", log):
         drop(root, rec["nonce"])
     return words
@@ -346,19 +375,19 @@ def _settle_late(root, log) -> list:
         if watcher_alive(root, nonce) or request_nonce(config_dir) == nonce:
             continue
         if claimed(config_dir, nonce):
-            if not stale_claim(config_dir, nonce):
-                continue
-            drop_stale_claim(config_dir, nonce)     # the app is not coming back: told as unknown, below
-            got = receive(root, rec)
-            if got is RETRY:
-                continue
-            if got is None:
-                got = dict(rec, outcome={"nonce": nonce, "stale": True})
+            # Only the app releases a claim. Past STALE_CLAIM_S: told once, journalled first (`uncertain_at`,
+            # so a repeat is the same keyed card), then marked told; the record stays for the late receipt.
+            if not rec.get("told_uncertain") and time.time() - float(rec.get("at") or 0) >= STALE_CLAIM_S:
                 try:
-                    save(root, got)     # kept like an answer, so a card that cannot be queued yet is told later
-                except OSError:
-                    continue
-            said.append(settle(root, got, log))
+                    if not rec.get("uncertain_at"):
+                        rec = dict(rec, uncertain_at=time.time_ns())
+                        save(root, rec)
+                    words = UNCERTAIN % (rec.get("label") or "that account")
+                    if tell(rec, "info", words, "uncertain", log, at_ns=int(rec["uncertain_at"])):
+                        said.append(words)
+                        save(root, dict(rec, told_uncertain=True))
+                except OSError as e:
+                    log("not journalled:", "%s: %s" % (type(e).__name__, str(e)[:200]))
             continue
         got = receive(root, rec)       # written just before the claimed file was removed
         if got is RETRY:
@@ -366,7 +395,7 @@ def _settle_late(root, log) -> list:
         if got is not None:
             said.append(settle(root, got, log))
             continue
-        if not rec.get("gave_up"):
+        if not rec.get("gave_up") and not rec.get("told_uncertain"):
             tell(rec, "info", UNTOLD, "lost", log)
             said.append(UNTOLD)
         drop(root, nonce)
@@ -374,7 +403,19 @@ def _settle_late(root, log) -> list:
 
 
 def busy(root, config_dir) -> bool:
-    return request_nonce(config_dir) is not None or claimed_any(config_dir) or bool(outstanding(root))
+    """Whether a switch is unresolved for this agent: a request (but junk past JUNK_REQUEST_S), a claim the
+    app holds, or a switch of sparrow's not yet told."""
+    request = request_nonce(config_dir) is not None and junk_request(config_dir) is None
+    return request or claimed_any(config_dir) or bool(outstanding(root))
+
+
+def busy_words(root, config_dir) -> str:
+    """What a tap is told while `busy`: that a previous switch is unresolved when a claim has waited past
+    STALE_CLAIM_S (the app was likely closed mid-switch), else that one is running."""
+    if any((claim_age(config_dir, n) or 0) >= STALE_CLAIM_S for n in claims(config_dir)) or \
+            any(r.get("told_uncertain") for r in outstanding(root)):
+        return UNRESOLVED
+    return BUSY
 
 
 def publish(root, config_dir, key: str, label: str, room: str, edit: str, bridge_state: str, log=_log, now=None,
@@ -384,6 +425,7 @@ def publish(root, config_dir, key: str, label: str, room: str, edit: str, bridge
     now = time.time() if now is None else now
     with _lock(root):
         _settle_late(root, log)
+        clear_junk_request(config_dir)
         if busy(root, config_dir):
             return None
         nonce = str(uuid.uuid4())

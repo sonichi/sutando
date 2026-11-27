@@ -700,12 +700,15 @@ def account_env(cfg: dict, local) -> dict:
     return child_env(cfg)
 
 
-def other_agents_dirs(local) -> list:
-    """The Claude config dirs of every other installed job, for the "is this dir this agent's alone" check."""
+def other_agents_dirs(local, strict: bool = False) -> list:
+    """The Claude config dirs of every other installed job, for the "is this dir this agent's alone" check.
+    `strict`: a config root that cannot be listed raises, instead of reading as no other agent."""
     mine, found = config_path(local), []
     try:
         paths = sorted(cm.config_root().rglob("*.conf"))
     except OSError:
+        if strict:
+            raise
         return found
     for path in paths:
         if path != mine:

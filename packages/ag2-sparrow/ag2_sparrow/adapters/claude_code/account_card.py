@@ -46,6 +46,8 @@ INDEX, INDEX_MAX = "index.json", 64 << 10
 USE_BUTTONS = 5          # with "Switch account", the six buttons a card may carry
 KEY_RE = re.compile(r"[0-9a-f]{16}")
 NOT_SAVED = "That account is no longer saved on this computer. Send /account for a new card."
+OTHERS_UNKNOWN = ("I could not check whether another agent shares this agent's Claude config dir, so nothing "
+                  "was done")
 UNMATCHED = "I couldn't match that button. Send /account for a new card."
 
 
@@ -160,9 +162,9 @@ def config_dir_for_switch(cfg: dict) -> str:
     try:
         from .cli import other_agents_dirs
         from .shape import LOCAL
-        dirs = other_agents_dirs(LOCAL)
-    except Exception:  # noqa: BLE001 - the other checks still hold
-        dirs = []
+        dirs = other_agents_dirs(LOCAL, strict=True)
+    except Exception as e:  # noqa: BLE001 - fail closed: a dir shared with another agent cannot be ruled out
+        raise accounts.Refused(OTHERS_UNKNOWN) from e
     mine = accounts.own_dir(cfg, dirs)
     if os.environ.get(accounts.PROXY_VAR):
         raise accounts.Refused(accounts.PROXIED)
@@ -261,7 +263,7 @@ class AccountCard(account_switch.AccountSwitch):
                      result_file, tapped)
             return "account-not-asked"
         if nonce is None:
-            self.say(room, remote.note("info", remote.BUSY), result_file, tapped)
+            self.say(room, remote.note("info", remote.busy_words(self.root, config_dir)), result_file, tapped)
             return "account-busy"
         text = "Switching to %s…" % email
         if not remote.start(self.root, nonce, self.popen):

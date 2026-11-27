@@ -206,7 +206,11 @@ class Tap(Remote):
         self.assertIsNone(rm.publish(self.root, self.config, "k", A, DM, "$x", str(self.bridge)))
         self.request().unlink()
         (self.config / (rm.CLAIMED % "other")).write_text("{}")
-        self.assertIsNone(rm.publish(self.root, self.config, "k", A, DM, "$x", str(self.bridge)))
+        old = time.time() - 10 * rm.STALE_CLAIM_S
+        os.utime(self.config / (rm.CLAIMED % "other"), (old, old))
+        self.assertIsNone(rm.publish(self.root, self.config, "k", A, DM, "$x", str(self.bridge)),
+                          "a claim, however old, is the app's to release")
+        self.assertTrue((self.config / (rm.CLAIMED % "other")).exists())
         self.assertEqual(rm.outstanding(self.root), [])
 
     def test_the_exclusive_create_lets_only_one_writer_win(self):
@@ -273,7 +277,15 @@ class Tap(Remote):
             self.assertEqual(self.use_directly(CLAUDE_CONFIG_DIR=str(self.config)), "account-refused")
         self.assertIn(accounts.PROXIED, self.queued()[-1]["card"]["text"])
         with mock.patch("ag2_sparrow.adapters.claude_code.cli.other_agents_dirs", side_effect=RuntimeError("x")):
-            self.assertEqual(self.use_directly(CLAUDE_CONFIG_DIR=str(self.config)), "account-switching")
+            self.assertEqual(self.use_directly(CLAUDE_CONFIG_DIR=str(self.config)), "account-refused")
+            self.assertEqual(self.queued()[-1]["card"]["text"], "Could not switch: " + ac.OTHERS_UNKNOWN)
+            self.assertNotIn("Use " + A, [b["label"] for b in self.posted("$x")["buttons"]], "fail closed: no buttons")
+        self.assertFalse(self.request().exists())
+        from ag2_sparrow.adapters.claude_code import cli as cc
+        with mock.patch.object(Path, "rglob", side_effect=OSError("x")):
+            with self.assertRaises(OSError):
+                cc.other_agents_dirs(cc.LOCAL, strict=True)
+            self.assertEqual(cc.other_agents_dirs(cc.LOCAL), [], "the sign-in's own reading is as before")
 
     def test_an_account_no_longer_saved_and_a_request_that_cannot_be_written(self):
         self.index(self.appdata, {})
@@ -480,67 +492,115 @@ class Watch(Remote):
         self.answer = "not json"
         self.assertEqual(rm.watch(self.root, nonce), rm.UNREAD)
 
-    def stale(self, nonce, age=None):
-        path = self.config / (rm.CLAIMED % nonce)
-        old = time.time() - (rm.STALE_CLAIM_S + 5 if age is None else age)
-        os.utime(path, (old, old))
+    def aged(self, nonce, by):
+        rm.save(self.root, dict(rm.load(self.root, nonce), at=rm.load(self.root, nonce)["at"] - by))
 
-    def test_a_claim_left_unanswered_past_its_bound_stops_blocking_and_is_said_uncertain(self):
+    def test_a_claim_unanswered_past_its_bound_is_told_once_kept_and_never_removed(self):
         nonce = self.begun()
         self.claim_it(nonce)
         rm.save(self.root, dict(rm.load(self.root, nonce), gave_up=True))     # the watcher stopped at 10 min
-        self.stale(nonce, rm.STALE_CLAIM_S - 60)
-        self.assertEqual(rm.settle_late(self.root), [], "a claim within its bound is still the app's")
-        self.assertTrue(rm.busy(self.root, self.config))
-        self.stale(nonce)
-        self.assertFalse(rm.claimed_any(self.config), "a stale claim does not count as a switch running")
+        self.aged(nonce, rm.STALE_CLAIM_S - 60)
+        self.assertEqual(rm.settle_late(self.root), [], "within its bound: still the app's")
+        self.aged(nonce, 120)
+        said = rm.UNCERTAIN % A
         self.assertEqual(rm.recover(self.root), 0)
-        said = rm.STALE_ON % ac.account_switch.masked(SARAH)
+        self.assertEqual(rm.settle_late(self.root), [], "told once")
         self.assertEqual(self.texts(), [("$acct", said)])
         self.assertNotIn("Could not", said)
-        self.assertEqual((list(self.config.iterdir()), rm.outstanding(self.root)), ([], []))
-        self.assertFalse(rm.busy(self.root, self.config))
+        self.assertTrue((self.config / (rm.CLAIMED % nonce)).exists(), "sparrow never removes a claim")
+        self.assertTrue(rm.load(self.root, nonce)["told_uncertain"], "the record is kept")
+        self.assertTrue(rm.busy(self.root, self.config))
+        os.utime(self.config / (rm.CLAIMED % nonce), (time.time() - rm.STALE_CLAIM_S - 5,) * 2)
+        self.assertEqual(rm.busy_words(self.root, self.config), rm.UNRESOLVED)
+        self.posted("$b")
+        rc, out = self.tap("task-b", "Use " + B, event="$b")
+        self.assertIn("(account-busy)", out["refused"])
+        self.assertEqual(self.texts()[-1], ("$b", rm.UNRESOLVED))
         self.clear_outbox()
-        self.assertTrue(rm.publish(self.root, self.config, ac.saved_key(B), B, DM, "$b", str(self.bridge)))
+        self.result(nonce, ok=True, label=A)          # the app, reopened, answers
+        self.assertEqual(rm.settle_late(self.root), ["Switched to %s after all." % A])
+        self.assertEqual((list(self.config.iterdir()), rm.outstanding(self.root)), ([], []))
 
-    def test_a_stale_claim_is_removed_only_while_it_holds_its_nonce_and_a_late_answer_wins(self):
+    def test_a_late_answer_after_the_uncertain_line_says_its_real_outcome(self):
+        self.assertEqual(rm.told({"ok": True}, A, after_all=True)[1], rm.UNVERIFIED % (A + " after all"))
+        self.assertEqual(rm.told({"ok": False, "error": "locked"}, A, after_all=True)[1], "Could not switch: locked")
         nonce = self.begun()
         self.claim_it(nonce)
-        path = self.config / (rm.CLAIMED % nonce)
-        path.write_text(json.dumps({"v": 2, "nonce": "someone-else"}))
-        rm.drop_stale_claim(self.config, nonce)
-        self.assertTrue(path.exists(), "not that nonce's: left")
-        path.write_text("not json")
-        rm.drop_stale_claim(self.config, nonce)
-        self.assertTrue(path.exists())
-        with mock.patch.object(rm.os, "link", side_effect=FileExistsError("x")):
-            rm.drop_stale_claim(self.config, nonce)
-        rm.drop_stale_claim(self.config, nonce)     # gone already: nothing to do
-        self.assertTrue(rm.stale_claim(self.config, nonce) is False)
-        nonce = self.begun_after_clear()
-        self.claim_it(nonce)
-        self.stale(nonce)
-        self.result(nonce, ok=True, label=A)
-        os.utime(self.config / (rm.RESULT % nonce))
-        (self.config / (rm.CLAIMED % nonce)).write_text(json.dumps({"v": 2, "nonce": nonce}))
-        self.stale(nonce)
-        with mock.patch.object(rm, "receive", side_effect=[None, rm.RETRY]):
-            self.assertEqual(rm.settle_late(self.root), [], "unreadable just now: tried again later")
-        self.assertEqual(rm.settle_late(self.root), ["Switched to %s." % A], "an answer there is told, not unknown")
-        nonce = self.begun_after_clear()
-        self.claim_it(nonce)
-        self.stale(nonce)
-        with mock.patch.object(rm, "save", side_effect=OSError("disk full")):
-            self.assertEqual(rm.settle_late(self.root), [])
-        self.assertEqual(len(rm.outstanding(self.root)), 1, "kept, to be told when it can be")
+        rm.save(self.root, dict(rm.load(self.root, nonce), gave_up=True, told_uncertain=True))
+        (self.config / (rm.CLAIMED % nonce)).unlink()         # released by the app with no receipt: nothing to say
+        self.assertEqual(rm.settle_late(self.root), [])
+        self.assertEqual((self.texts(), rm.outstanding(self.root)), ([], []))
+        self.assertEqual(rm.busy_words(self.root, self.config), rm.BUSY)
 
-    def begun_after_clear(self):
-        for p in self.config.iterdir():
-            p.unlink()
-        for r in rm.outstanding(self.root):
-            rm.drop(self.root, r["nonce"])
-        self.clear_outbox()
-        return self.begun()
+    def test_the_uncertain_line_survives_a_failed_journal_write_and_a_restart_between_steps(self):
+        nonce = self.begun()
+        self.claim_it(nonce)
+        rm.save(self.root, dict(rm.load(self.root, nonce), gave_up=True))
+        self.aged(nonce, rm.STALE_CLAIM_S + 1)
+        real = rm.save
+
+        def failing(root, rec):
+            if rec.get("told_uncertain"):
+                raise OSError("disk full")
+            return real(root, rec)
+        with mock.patch.object(rm, "save", side_effect=failing):
+            self.assertEqual(rm.settle_late(self.root, log=lambda *a: None), [rm.UNCERTAIN % A])
+        self.assertNotIn("told_uncertain", rm.load(self.root, nonce))
+        self.assertEqual(rm.settle_late(self.root), [rm.UNCERTAIN % A], "the second upkeep journals it")
+        self.assertEqual(len(self.queued()), 1, "one card: the repeat is the same keyed card")
+        self.assertTrue(rm.load(self.root, nonce)["told_uncertain"])
+        with mock.patch.object(rm.card_desk, "post", return_value=False):
+            rm.save(self.root, dict(rm.load(self.root, nonce), told_uncertain=False))
+            self.assertEqual(rm.settle_late(self.root, log=lambda *a: None), [], "not queued: not marked told")
+            self.assertFalse(rm.load(self.root, nonce)["told_uncertain"])
+        rec = {k: v for k, v in rm.load(self.root, nonce).items() if k != "uncertain_at"}
+        rm.save(self.root, rec)
+        with mock.patch.object(rm, "save", side_effect=OSError("disk full")):
+            self.assertEqual(rm.settle_late(self.root, log=lambda *a: None), [], "not journalled: not told")
+        self.assertEqual(len(self.queued()), 1)
+        self.result(nonce, ok=True, label=A)          # a real receipt stays the answer, whatever came before
+        self.assertEqual(rm.settle_late(self.root), ["Switched to %s." % A])
+
+    def test_a_junk_request_file_stops_blocking_after_its_bound_and_is_removed_only_while_unchanged(self):
+        self.request().write_text("")
+        self.assertTrue(rm.busy(self.root, self.config), "fresh: it may be the app's, mid-write")
+        self.assertIsNone(rm.publish(self.root, self.config, "a" * 16, A, DM, "$x", str(self.bridge)))
+        old = time.time() - rm.JUNK_REQUEST_S - 5
+        os.utime(self.request(), (old, old))
+        self.assertFalse(rm.busy(self.root, self.config))
+        nonce = rm.publish(self.root, self.config, "a" * 16, A, DM, "$x", str(self.bridge))
+        self.assertEqual(rm.request_nonce(self.config), nonce, "removed, and the new request written")
+        rm.drop(self.root, nonce)
+        self.request().unlink()
+        for junk in ("{half", '{"v": 2}'):
+            self.request().write_text(junk)
+            os.utime(self.request(), (old, old))
+            self.assertIsNotNone(rm.junk_request(self.config))
+        real = rm.os.rename
+
+        def swapped(src, dst):
+            real(src, dst)
+            Path(dst).write_text("changed")         # another file took its place meanwhile
+        with mock.patch.object(rm.os, "rename", side_effect=swapped):
+            self.assertFalse(rm.clear_junk_request(self.config))
+        self.assertEqual(self.request().read_text(), "changed", "put back")
+        os.utime(self.request(), (old, old))
+        with mock.patch.object(rm.os, "rename", side_effect=swapped), \
+                mock.patch.object(rm.os, "link", side_effect=FileExistsError("x")):
+            self.assertFalse(rm.clear_junk_request(self.config))
+        self.request().write_text('{"nonce": "x"}')
+        os.utime(self.request(), (old, old))
+        self.assertIsNone(rm.junk_request(self.config), "a whole request is never junk")
+        self.request().unlink()
+        self.assertFalse(rm.clear_junk_request(self.config))
+        with mock.patch.object(rm, "request_nonce", return_value=""):
+            self.assertIsNone(rm.junk_request(self.config), "gone between the two looks")
+        self.request().write_text("")
+        os.utime(self.request(), (old, old))
+        with mock.patch.object(rm.os, "rename", side_effect=OSError("x")):
+            self.assertFalse(rm.clear_junk_request(self.config))
+        self.assertEqual(rm.claims(self.home / "none"), [])
+        self.assertIsNone(rm.claim_age(self.config, "nope"))
 
     def test_the_watchers_log_and_the_records_are_owner_only_whatever_the_umask(self):
         log = Path(self.root) / "state" / rm.LOG
