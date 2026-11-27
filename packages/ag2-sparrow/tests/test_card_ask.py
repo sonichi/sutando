@@ -296,6 +296,27 @@ class Desk(unittest.TestCase):
                                      card_desk.ASK_OWNER_ZH if card_words.is_zh(said) else card_desk.ASK_OWNER)
         self.assertEqual((self.offers(), self.by_card), ((0, [0, 0]), []))
 
+    def test_a_line_that_cannot_be_written_is_not_done_and_never_the_model_s(self):
+        # Review on #6877: the connector must not mark it done; Undelivered makes it serve the task again.
+        fails = [OSError("disk full")] * card_desk.SAY_TRIES
+
+        def publish(path, body):
+            if fails:
+                raise fails.pop()
+            self.written.append(body)
+        self.desk.publish = publish
+        with self.assertRaises(card_desk.Undelivered):
+            self.task("which account are you on?", tier="team", kind="room")
+        self.assertEqual((self.written, self.offers()), ([], (0, [0, 0])))
+        fails[:] = [OSError("once")]
+        self.assertEqual(self.task("which account are you on?", tier="team", kind="room"), "card-not-owner",
+                         "a retry that lands answers it")
+        self.assertEqual(self.written, [card_desk.ACCOUNT_OWNER_ONLY + "\n"])
+        from ag2_sparrow import result_publish
+        fails[:] = [result_publish.PublishedUnconfirmed("maybe")]
+        self.assertEqual(self.task("which account are you on?", tier="team", kind="room"), "card-not-owner",
+                         "a line that may have landed is not written twice")
+
     def test_an_owner_tier_collaborator_is_not_the_owner(self):
         self.model.current_name = lambda: "Opus"
         self.assertEqual(self.answered("which account are you on?", "owner", kind="dm", extra="collaborator: true\n"),

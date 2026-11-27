@@ -20,7 +20,8 @@ room or a DM, and never a card (`not_owner`): team the model's name as the model
 (`model_card.py status`), a guest to ask the owner; the account is told to no one but the owner.
 
 CLI: switch_card_intercept.py <task_file> --workspace W --results-dir R [--repo REPO]
-exit 0 = the card was posted and the task answered; 1 = not ours, or not done (the core takes it).
+exit 0 = the card was posted and the task answered; 1 = not ours, or not done (the core takes it);
+2 = recognised but its line not written (the watcher holds it and asks again, never the core).
 """
 from __future__ import annotations
 
@@ -40,6 +41,7 @@ sys.path.insert(0, str(_SRC))
 import card_words  # noqa: E402
 
 POST_TIMEOUT_S = 45
+ANSWERED, HELD = "switch-card-answered", "switch-card-held"
 
 _ACCOUNT = ("switch account", "switch accounts", "switch my account", "change account", "change my account",
             "switch the account", "change the account", "another account", "use another account",
@@ -305,52 +307,50 @@ def answer(results_dir: Path, filename: str, kind: str) -> bool:
 
 
 def intercept(task_file: Path, workspace: Path, results_dir: Path, repo: Path = _REPO,
-              run=subprocess.run, log=None) -> bool:
+              run=subprocess.run, log=None) -> str:
+    """ANSWERED, HELD (recognised, its line not written: never the core's, the watcher holds and retries it),
+    or '' (not ours, or not done: the core takes it)."""
     log = log or (lambda msg: print(f"switch-card: {msg}", file=sys.stderr, flush=True))
     try:
         text = Path(task_file).read_text(encoding="utf-8", errors="replace")
         req = request(text, workspace)
     except Exception as exc:  # noqa: BLE001 - never stand between a task and the core
         log(f"{Path(task_file).name}: not read ({type(exc).__name__}); the core takes it")
-        return False
+        return ""
     if req is None:
         try:
             asked = not_owner(text, workspace)
         except Exception as exc:  # noqa: BLE001 - never stand between a task and the core
             log(f"{Path(task_file).name}: not read ({type(exc).__name__}); the core takes it")
-            return False
+            return ""
         if asked is None:
-            return False
+            return ""
         line = not_owner_line(asked, workspace, repo, run)
         if not any(say_in_room(results_dir, Path(task_file).name, line) for _ in range(SAY_TRIES)):
-            # Recognised, so never the core's: left unanswered, read again at the next start.
             log(f"{Path(task_file).name}: the line to a {asked['tier']} sender was not written; held from the core")
-            return True
+            return HELD
         log(f"{Path(task_file).name}: a {asked['tier']} sender asked about the account or model; answered in one line")
-        return True
+        return ANSWERED
     line = in_room(text, workspace)
     if line:
         line = limit_in_room(workspace) or line     # out of usage: the limit is the answer in a room too
         if not say_in_room(results_dir, Path(task_file).name, line):
             log(f"{Path(task_file).name}: the in-room line was not written; the core takes it")
-            return False
+            return ""
         log(f"{Path(task_file).name}: a {req['kind']} request in a room; answered in one line, no card")
-        return True
+        return ANSWERED
     lead = limit_lead(workspace)
     if lead:
         req = dict(req, lead=lead, kind="quota", kinds=["quota"])   # one limit card, whatever was asked
     if not post(req, workspace, repo, run):
         log(f"{Path(task_file).name}: the {req['kind']} card was not posted; the core takes it")
-        return False
+        return ""
     what = " and ".join(req.get("kinds") or [req["kind"]])
     if not answer(results_dir, Path(task_file).name, what):
         log(f"{Path(task_file).name}: the {req['kind']} card was posted but the result was not written")
-        return True  # the card is out; a core answer now would be a second reply
+        return ANSWERED  # the card is out; a core answer now would be a second reply
     log(f"{Path(task_file).name}: posted the {req['kind']} card; answered without the core")
-    return True
-
-
-ANSWERED = "switch-card-answered"
+    return ANSWERED
 
 
 def main(argv=None) -> int:
@@ -360,10 +360,11 @@ def main(argv=None) -> int:
     ap.add_argument("--results-dir", required=True)
     ap.add_argument("--repo", default=str(_REPO))
     a = ap.parse_args(argv)
-    if not intercept(Path(a.task_file), Path(a.workspace), Path(a.results_dir), Path(a.repo)):
+    verdict = intercept(Path(a.task_file), Path(a.workspace), Path(a.results_dir), Path(a.repo))
+    if not verdict:
         return 1
-    print(ANSWERED, flush=True)  # the watcher needs this word, so a stub interpreter never swallows a task
-    return 0
+    print(verdict, flush=True)  # the watcher needs this word, so a stub interpreter never swallows a task
+    return 0 if verdict == ANSWERED else 2
 
 
 if __name__ == "__main__":

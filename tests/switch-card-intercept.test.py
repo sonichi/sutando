@@ -263,7 +263,7 @@ class InterceptEdges(Intercept):
         import io
         from unittest import mock
         argv = [str(self.file), "--workspace", str(self.ws), "--results-dir", str(self.results)]
-        for answered, code, word in ((True, 0, sci.ANSWERED), (False, 1, "")):
+        for answered, code, word in ((sci.ANSWERED, 0, sci.ANSWERED), (sci.HELD, 2, sci.HELD), ("", 1, "")):
             with self.subTest(answered=answered), mock.patch.object(sci, "intercept", return_value=answered):
                 out = io.StringIO()
                 with contextlib.redirect_stdout(out):
@@ -427,12 +427,16 @@ class NotOwner(Intercept):
         tries = []
         with mock.patch.object(sci, "say_in_room", side_effect=lambda *a: tries.append(a) or False):
             self.file.write_text(task_envelope.stamp_text(task("which account are you on", tier="team"), self.ws))
-            self.assertTrue(sci.intercept(self.file, self.ws, self.results, REPO, run=None, log=lambda m: None))
-        self.assertEqual(len(tries), sci.SAY_TRIES, "tried again before holding it")
+            self.assertEqual(sci.intercept(self.file, self.ws, self.results, REPO, run=None, log=lambda m: None),
+                             sci.HELD, "not answered: the watcher holds it and asks again")
+            self.assertEqual(sci.main([str(self.file), "--workspace", str(self.ws), "--results-dir",
+                                       str(self.results)]), 2)
+        self.assertEqual(len(tries), 2 * sci.SAY_TRIES, "tried again before holding it")
         self.assertFalse((self.results / "task-abc.txt").exists())
         landed = mock.Mock(side_effect=[False, True])
         with mock.patch.object(sci, "say_in_room", landed):
-            self.assertTrue(sci.intercept(self.file, self.ws, self.results, REPO, run=None, log=lambda m: None))
+            self.assertEqual(sci.intercept(self.file, self.ws, self.results, REPO, run=None, log=lambda m: None),
+                             sci.ANSWERED)
         self.assertEqual(landed.call_count, 2, "a retry that lands ends the tries")
 
     def test_a_missing_model_record_is_not_a_known_default(self):
@@ -522,6 +526,10 @@ class Watcher(unittest.TestCase):
         at = src.index("/src/switch_card_intercept.py\"")
         self.assertLess(at, src.index("read_handler_config_now\n  reconcile_dead_claims hold"))
         self.assertIn('[ -z "${SUTANDO_INSTANCE_ID:-}" ]', src[at - 300:at])
+        held = src.index('[ "$card_verdict" = switch-card-held ]')
+        self.assertIn('hold_task "$filename"', src[held:held + 300])
+        self.assertNotIn("record_admission", src[held:src.index("read_handler_config_now\n  reconcile_dead_claims hold")],
+                         "a held line is never admitted (tests/watch-tasks-stream-switch-card-held.test.py runs it)")
 
 
 if __name__ == "__main__":

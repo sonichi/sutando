@@ -20,6 +20,12 @@ MODEL_UNKNOWN, MODEL_UNKNOWN_ZH = card_words.MODEL_UNKNOWN, card_words.MODEL_UNK
 ACCOUNT_OWNER_ONLY, ACCOUNT_OWNER_ONLY_ZH = card_words.ACCOUNT_OWNER_ONLY, card_words.ACCOUNT_OWNER_ONLY_ZH
 SWITCH_OWNER_ONLY, SWITCH_OWNER_ONLY_ZH = card_words.SWITCH_OWNER_ONLY, card_words.SWITCH_OWNER_ONLY_ZH
 ASK_OWNER, ASK_OWNER_ZH = card_words.ASK_OWNER, card_words.ASK_OWNER_ZH
+SAY_TRIES = 3
+
+
+class Undelivered(OSError):
+    """A recognised ask from someone other than the owner whose one line could not be written: not done, and
+    never the model's; the connector serves the task again later."""
 
 
 class Desk:
@@ -143,8 +149,22 @@ class Desk:
         switch = switch or card_ask.switches(said)
         told = tier == "team" and not switch and "model" in kinds
         line = card_words.not_owner_line(tier, kinds, switch, card_words.is_zh(said), self.model_name() if told else "")
-        self.publish(result_file, self.quoted(line) + "\n")
+        self.say_to_non_owner(result_file, self.quoted(line) + "\n")
         return "card-not-owner"
+
+    def say_to_non_owner(self, result_file, body) -> None:
+        """Write the line, tried SAY_TRIES times; Undelivered when none lands, so the task is not marked done."""
+        from . import result_publish
+        why = None
+        for _ in range(SAY_TRIES):
+            try:
+                self.publish(result_file, body)
+                return
+            except result_publish.PublishedUnconfirmed:
+                return      # it may well be there: a second line would be a second answer
+            except OSError as e:
+                why = e
+        raise Undelivered("the line to a sender who is not the owner was not written (%s: %s)" % (type(why).__name__, why))
 
     def model_name(self) -> str:
         """The model in use as the model card names it, '' when it cannot be read."""

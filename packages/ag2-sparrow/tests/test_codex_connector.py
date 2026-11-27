@@ -977,6 +977,21 @@ class ModelCardTest(CardWorld, unittest.TestCase):
         self.assertTrue(self.serve("task-6", "hi", tier="team", **room).startswith("STUB echo:"),
                         "other words still reach Codex")
 
+    def test_a_line_to_anyone_else_that_cannot_be_written_is_served_again_never_by_codex(self):
+        # Review on #6877: not marked done, never given to Codex; the same running connector writes it later.
+        real, fails = cc.write_atomic, [OSError("disk full")] * (card_desk.SAY_TRIES + 1)
+
+        def flaky(path, text):
+            if path.endswith("task-3.txt") and fails:
+                raise fails.pop()
+            return real(path, text)
+        room = dict(extra=["--allow-non-owner", "--poll", "0.05"], channel="!room:s.space", kind="room")
+        with mock.patch.object(cc, "write_atomic", flaky), mock.patch.object(cc, "CARD_RETRY_S", 0.1):
+            self.assertEqual(self.serve("task-3", "which account are you on?", tier="team", **room),
+                             card_desk.ACCOUNT_OWNER_ONLY + "\n")
+        self.assertEqual(fails, [], "every failed write was tried, then the retry landed")
+        self.assertEqual([r.get("card") for r in metrics(self.work)], ["card-not-owner"], "done once, as a card")
+
     def test_the_task_archived_during_the_turn_still_shows_the_card(self):
         """A task the bridge archived while the turn ran (Codex wrote its result file itself) is not opened
         again: the card step reads the text kept from before the turn."""
