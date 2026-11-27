@@ -25,6 +25,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -88,7 +89,18 @@ _NOT_A_LOOKUP = re.compile(r"\b(?:why|how come|fail(?:ed|s|ing)?|error|broken|sw
 _ABOUT = (("account", re.compile(r"\baccounts?\b|账号|账户|帐号", re.I)),
           ("model", re.compile(r"\bmodels?\b|模型", re.I)),
           ("runtime", re.compile(r"\bcore\b|\bruntime\b|\bengine\b|运行时|内核", re.I)))
-_SELF = re.compile(r"\b(?:you|your|you're|ur|u)\b|\bam i\b|你|您|在用|现在|当前|用的|用什么|用哪|\busing\b|\bcurrent(?:ly)?\b|\bright now\b", re.I)
+# About the agent itself: "you"/"你" with a using verb ("are you using", "你在用"), or a Chinese using phrase with
+# no subject at all ("现在用的什么账号"). "you" alone ("what do you think…") or "current" alone ("my current account balance") is not.
+_YOU = re.compile(r"\b(?:you|your|you're|ur|u)\b|你|您", re.I)
+_USING = re.compile(r"\b(?:using|use|on|running)\b|在用|用的|用什么|用哪|用着", re.I)
+_ZH_USING = re.compile(r"在用|用的|用什么|用哪|用着")
+_MINE = re.compile(r"\b(?:i|i'm|my|me|mine)\b|我", re.I)
+
+
+def _about_self(text: str) -> bool:
+    if _YOU.search(text):
+        return bool(_USING.search(text))
+    return bool(_ZH_USING.search(text)) and not _MINE.search(text)
 _OTHER_THING = re.compile(r"\b(?:of|from|for|on (?:my|the|this))\b|\b(?:invoice|iphone|phone|car|bank|email|should|best|better)\b|我该|我应该|应该用|哪个好|写代码", re.I)
 QUESTION_MAX = 60
 
@@ -103,7 +115,7 @@ def kinds_of(words: str) -> list:
     asked = _ASKS.search(text) or re.search(r"[?？]\s*$", words or "")
     if not text or len(text) > QUESTION_MAX or not asked or _NOT_A_LOOKUP.search(text):
         return []
-    if not _SELF.search(text) or _OTHER_THING.search(text):
+    if not _about_self(text) or _OTHER_THING.search(text):
         return []
     return [kind for kind, about in _ABOUT if about.search(text)]
 
@@ -114,7 +126,8 @@ def request(task_text: str, workspace: Optional[Path] = None) -> Optional[dict]:
     import task_envelope
     parsed = task_envelope.attested_task_headers(task_text, workspace)
     h = parsed.headers
-    if (h.get("access_tier") or "").strip() != "owner" or (h.get("channel_kind") or "").strip() != "dm":
+    # A room (any channel kind but the DM) is taken too: there it gets IN_ROOM, never a card (in_room).
+    if (h.get("access_tier") or "").strip() != "owner" or not (h.get("channel_kind") or "").strip():
         return None
     if (h.get("interaction_type") or "message").strip() != "message" or not (h.get("channel_id") or "").strip():
         return None
@@ -128,6 +141,63 @@ def request(task_text: str, workspace: Optional[Path] = None) -> Optional[dict]:
             "reply_to": (h.get("source_message_id") or "").strip()}
 
 
+def _limit(workspace: Path, now=time.time) -> dict:
+    """The core's usage limit in force, as recorded; {} when none is (or it cannot be read)."""
+    try:
+        import core_quota_notice
+        rec = json.loads(Path(workspace).joinpath(*core_quota_notice.FILE).read_text(encoding="utf-8"))
+        return rec if core_quota_notice.in_force(rec, now()) else {}
+    except (OSError, ValueError, TypeError, ImportError):
+        return {}
+
+
+def limit_lead(workspace: Path, now=time.time) -> str:
+    """The limit in force, in the quota card's own words; '' when none is. Out of usage, the owner's ask
+    for any card is answered by the limit's card first."""
+    import core_quota_notice
+    rec = _limit(workspace, now)
+    return core_quota_notice.words(str(rec.get("name") or "The core"), str(rec.get("reset") or ""),
+                                   credits=bool(rec.get("credits"))) if rec else ""
+
+
+def limit_in_room(workspace: Path, now=time.time) -> str:
+    """The limit in force, as said in a shared room (no account, nothing that switches one); '' when none is."""
+    import core_quota_notice
+    rec = _limit(workspace, now)
+    return core_quota_notice.room_words(str(rec.get("name") or "The core"), str(rec.get("reset") or "")) if rec else ""
+
+
+# No switch is made in a room with other people in it, and no card that switches is posted there: the
+# owner asking there is told so in one line, in their language, and the core never sees it.
+IN_ROOM = "Switching the account or model isn't available in a room. Please ask me in our DM."
+IN_ROOM_ZH = "房间里不能切换账号或模型，请到私聊里找我。"
+_CJK = re.compile(r"[\u3400-\u9fff]")
+
+
+def in_room(task_text: str, workspace: Optional[Path] = None) -> str:
+    """The line a request in a room is answered with ('' in the owner's DM): IN_ROOM, or IN_ROOM_ZH when
+    the owner wrote Chinese."""
+    import local_task_protocol as ltp
+    import task_envelope
+    parsed = task_envelope.attested_task_headers(task_text, workspace)
+    if (parsed.headers.get("channel_kind") or "").strip() == "dm":
+        return ""
+    _reply, words = ltp.split_reply_context(ltp.sender_words(parsed))
+    return IN_ROOM_ZH if _CJK.search(words or "") else IN_ROOM
+
+
+def say_in_room(results_dir: Path, filename: str, line: str) -> bool:
+    """The answer to a request in a room: the one line, as the task's reply in that room."""
+    import result_publish
+    try:
+        result_publish.publish_text(Path(results_dir) / filename, line + "\n")
+    except result_publish.PublishedUnconfirmed:
+        return True
+    except OSError:
+        return False
+    return True
+
+
 def post(req: dict, workspace: Path, repo: Path = _REPO, run=subprocess.run) -> bool:
     """Every card the request asks for; True once any was posted, so the core never answers it twice."""
     kinds = req.get("kinds") or [req["kind"]]
@@ -136,9 +206,11 @@ def post(req: dict, workspace: Path, repo: Path = _REPO, run=subprocess.run) -> 
 
 
 def post_one(req: dict, workspace: Path, repo: Path = _REPO, run=subprocess.run) -> bool:
-    skill, script = SCRIPTS[req["kind"]]
+    skill, script = SCRIPTS["account" if req.get("lead") else req["kind"]]
     argv = [sys.executable, str(repo / "skills" / skill / "scripts" / script), "--workspace", str(workspace),
             "post", "--room", req["room"]]
+    if req.get("lead"):
+        argv += ["--retry", "--lead", req["lead"]]      # the quota card: the limit first, then the account
     if req.get("reply_to"):
         argv += ["--reply-to", req["reply_to"]]
     try:
@@ -176,6 +248,17 @@ def intercept(task_file: Path, workspace: Path, results_dir: Path, repo: Path = 
         return False
     if req is None:
         return False
+    line = in_room(text, workspace)
+    if line:
+        line = limit_in_room(workspace) or line     # out of usage: the limit is the answer in a room too
+        if not say_in_room(results_dir, Path(task_file).name, line):
+            log(f"{Path(task_file).name}: the in-room line was not written; the core takes it")
+            return False
+        log(f"{Path(task_file).name}: a {req['kind']} request in a room; answered in one line, no card")
+        return True
+    lead = limit_lead(workspace)
+    if lead:
+        req = dict(req, lead=lead, kind="quota", kinds=["quota"])   # one limit card, whatever was asked
     if not post(req, workspace, repo, run):
         log(f"{Path(task_file).name}: the {req['kind']} card was not posted; the core takes it")
         return False

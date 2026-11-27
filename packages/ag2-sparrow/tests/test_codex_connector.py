@@ -1464,11 +1464,12 @@ class AccountCardTest(CardWorld, unittest.TestCase):
             self.assertEqual(self.serve("task-w%d" % n, said), "[no-send] the account card answers\n", said)
             self.assertEqual(metrics(self.work)[-1]["card"], "account-card")
         self.assertEqual(len(self.posted()), 3)
-        # Another account, or the same words outside the owner's DM, is an ordinary turn.
+        # Another account is an ordinary turn; the same words in a room get the line to ask in the DM, no turn.
         self.assertNotIn("account card", self.serve("task-other", "create an account on github"))
         self.assertNotIn("card", metrics(self.work)[-1])
-        self.serve("task-room", "which account are you using?", channel="!room:s.space", kind="room")
-        self.assertNotIn("card", metrics(self.work)[-1])
+        said = self.serve("task-room", "which account are you using?", channel="!room:s.space", kind="room")
+        self.assertIn("isn't available in a room", said)
+        self.assertEqual(metrics(self.work)[-1]["card"], "card-in-room")
         self.assertEqual(self.posted(), [], "no card for either")
 
     def test_a_sign_in_page_that_is_not_an_https_address_is_never_opened_and_the_sign_in_is_given_up(self):
@@ -2538,6 +2539,9 @@ class HeldRootRefusalTest(unittest.TestCase):
 class QuotaCardTest(CardWorld, unittest.TestCase):
     """Out of usage: the connector itself queues the account card in the owner's DM, once per limit."""
 
+    class FakeCard:
+        ASK = "/model"
+
     def setUp(self):
         super().setUp()
         self.home = Path(self.tmp.name) / "codex-home"
@@ -2559,7 +2563,7 @@ class QuotaCardTest(CardWorld, unittest.TestCase):
         self.assertRegex(quota_notice.reset_from_epoch(late + 3660, now=late), "^%s$" % when)
         self.assertRegex(quota_notice.reset_from_epoch(late - 7200 + 3660, now=late - 7200), r"^\d{1,2}:\d\d [AP]M$")
 
-    def test_a_limit_queues_one_account_card_to_the_owner_dm_and_a_second_limit_tick_nothing(self):
+    def test_a_limit_queues_an_account_card_to_the_owner_dm_and_each_later_owner_message_one_more(self):
         self.assertEqual(self.serve("task-1", "[[limit]] hello"), cc.LIMITED_NO_SEND)
         (queued,) = self.outbox()
         card = queued["card"]
@@ -2570,23 +2574,163 @@ class QuotaCardTest(CardWorld, unittest.TestCase):
                                        r"answer until then\. Switch to another account or an API key to go on now\. "
                                        r"I'm using alice@example\.com\. " + re.escape(account_switch.BELOW) + "$")
         self.assertEqual(metrics(self.work)[-1]["quota"], "quota-card")
-        # Another message while still limited: no second card, and no error line in the room either.
+        # Another message while still limited: its own card, the same words, and no error line in the room.
         self.assertEqual(self.serve("task-2", "[[limit]] again"), cc.LIMITED_NO_SEND)
-        self.assertEqual(len(self.outbox()), 1)
-        ((room, _),) = self.posted()
-        self.assertEqual(room, self.DM)
-        self.serve("task-3", "[[limit-bare]] and again", channel="!room:s.space", kind="room")
-        self.assertEqual((self.outbox(), self.posted()), ([], []), "nothing more once the card is posted")
-        self.assertEqual(json.loads((self.work / "state" / quota_notice.FILE).read_text())["told"], True)
+        self.assertEqual(metrics(self.work)[-1]["quota"], "quota-task-card")
+        self.assertEqual([q["card"]["text"] for q in self.outbox()], [card["text"]] * 2)
+        self.assertEqual([room for room, _ in self.posted()], [self.DM] * 2)
+        # And the next, asked in a room: the card answers there, without the account's name; no error line.
+        room = "!room:s.space"
+        self.assertEqual(self.serve("task-3", "[[limit-bare]] and again", channel=room, kind="room"), cc.LIMITED_NO_SEND)
+        self.assertIn("quota-task-card", metrics(self.work)[-1]["quota"])
+        ((to, there),) = self.posted()
+        # In a room: the limit and its reset, no account named, and nothing that switches one.
+        self.assertEqual((to, there["id"], "account_controls" in there, there.get("buttons")),
+                         (room, account_switch.NOTE, False, None))
+        self.assertRegex(there["text"], r"^Codex has reached its usage limit \(resets [^)]+\), so I can't answer until "
+                                        r"then\. To switch account, message me in our direct message\.$")
+        rec = json.loads((self.work / "state" / quota_notice.FILE).read_text())
+        self.assertEqual((rec["told"], rec["tasks"]), (True, ["task-1", "task-2", "task-3"]))
 
-    def test_a_limit_hit_in_a_room_is_told_only_in_the_owners_dm_and_nothing_is_posted_in_the_room(self):
-        # Owner, 2026-11-25: usage limits and account switching belong to her DM; a room gets nothing about them.
+    def test_an_account_card_asked_for_while_out_of_usage_says_the_limit_too(self):
+        self.serve("task-0", "what account are you using")
+        plain = self.outbox()[-1]["card"]
+        self.assertEqual(plain["text"], "I'm using alice@example.com. " + account_switch.BELOW)
+        self.assertEqual(plain["account_controls"], {"runtime": "codex"})
+        self.serve("task-1", "[[limit]] hello")
+        self.serve("task-2", "what account are you using")
+        limit, asked = [q["card"] for q in self.outbox()[-2:]]
+        self.assertEqual((asked["text"], asked["account_controls"]), (limit["text"], limit["account_controls"]))
+        # Any card asked for while out is answered by the limit's card first: the model card too.
+        for n, ask in enumerate(("/model", "/account", "which model are you using")):
+            self.serve("task-m%d" % n, ask)
+            shown = self.outbox()[-1]["card"]
+            self.assertEqual((shown["id"], shown["text"]), (account_switch.CARD, limit["text"]), ask)
+        self.assertEqual(metrics(self.work)[-1]["card"], "quota-card-asked")
+        # Asked in a room: the limit in the room's words, not "ask in the DM", and no card there.
+        before = len(self.outbox())
+        said = self.serve("task-room-ask", "/model", channel="!room:s.space", kind="room")
+        self.assertRegex(said.strip(), r"^Codex has reached its usage limit \(resets [^)]+\), so I can't answer until then\. "
+                                       r"To switch account, message me in our direct message\.$")
+        self.assertEqual((metrics(self.work)[-1]["card"], len(self.outbox())), ("quota-in-room", before))
+        failing = cc.card_desk.Desk(self.work, lambda f, b: None, lambda t: t, [self.FakeCard()], room_limit=lambda: 1 / 0)
+        self.assertEqual(failing.in_room("/model", "/model", "r"), "card-in-room")
+        # A limit that cannot be read leaves the desk as it was: the card asked for is shown.
+        self.assertEqual(cc.card_desk.Desk(self.work, None, None, [], limit=lambda *a: 1 / 0).limited({}, ""), "")
+        # A limit whose words cannot be read never costs the owner the card they asked for.
+        notice = quota_notice.QuotaNotice(self.work / "state", self.bridge, "Codex", None, None, None)
+        self.assertTrue(notice.says().startswith("Codex has reached its usage limit"))
+        notice.now = lambda: time.time() + 10 ** 9
+        self.assertEqual(notice.says(), "", "past its reset: not said")
+        # The refusal is the limit even when no card of it could be queued anywhere (review of #6859).
+        bare = quota_notice.QuotaNotice(self.work / "bare-state", None, "Codex", None, None, lambda *a: None)
+        (self.work / "bare-state").mkdir()
+        self.assertEqual(bare.hit("3:05 PM"), "quota-no-room")
+        self.assertIn("(resets 3:05 PM)", bare.says())
+        self.assertEqual(bare.says_in_room(), quota_notice.room_words("Codex", "3:05 PM"))
+        # A limit that named no reset time ends by itself: a card ask runs no turn that could clear it.
+        notice.now = time.time
+        rec = notice.load()
+        notice.save({k: v for k, v in rec.items() if k != "reset_at"})
+        self.assertTrue(notice.says())
+        notice.now = lambda: time.time() + quota_notice.NO_RESET_S + 1
+        self.assertEqual(notice.says(), "")
+        # The one wording for a shared room, whatever the runtime.
+        self.assertEqual(quota_notice.room_words("Codex", "3:05 PM"),
+                         "Codex has reached its usage limit (resets 3:05 PM), so I can't answer until then. "
+                         "To switch account, message me in our direct message.")
+        self.assertEqual(quota_notice.room_words("Codex", ""),
+                         "Codex has reached its usage limit (it does not say when that resets), so I can't answer "
+                         "until then. To switch account, message me in our direct message.")
+        said = []
+        switch = account_switch.AccountSwitch(str(self.work / "state"), str(self.bridge), "Codex", None, None,
+                                              lambda *a: said.append(a[0]), lambda: "alice@example.com", None, None,
+                                              None, runtime="codex", limit=lambda: 1 / 0)
+        self.assertEqual(switch.asked()[1]["text"], plain["text"])
+        self.assertEqual(said, ["limit not read:"])
+
+    def test_someone_else_who_asks_while_out_of_usage_is_told_why_there_is_no_answer(self):
+        self.serve("task-1", "[[limit]] hello")
+        said = self.serve("task-c", "[[limit]] a collaborator asks", tier="team", channel="!room:s.space", kind="room",
+                          extra=["--allow-non-owner"])
+        self.assertEqual(said.strip(), cc.LIMITED_FOR_OTHERS)
+        self.assertEqual(len(self.outbox()), 1, "and no card of their own")
+
+    def test_a_message_served_twice_or_not_the_owners_gets_no_card_of_its_own(self):
+        self.serve("task-1", "[[limit]] hello")
+        notice = quota_notice.QuotaNotice(self.work / "state", self.bridge, "Codex",
+                                          lambda text: ("limit", {"id": "x"}), lambda: "", lambda *a: None)
+        self.assertEqual(notice._tell_task("task-1", "", ""), "", "told already: once per task id")
+        self.assertTrue(notice.answered("task-1"))
+        self.assertFalse(notice.answered("task-9"))
+        self.assertEqual(notice._tell_task("task-9", "access_tier: team\nuser_id: @b:s.space\ntask: hi\n", ""), "")
+        self.assertEqual(len(self.outbox()), 1)
+
+    def test_a_card_that_could_not_be_queued_for_a_later_message_is_owed_and_queued_once_on_a_later_tick(self):
+        self.serve("task-1", "[[limit]] hello")
+        (first,) = self.outbox()
+        self.assertEqual(len(self.posted()), 1)
+        clock = [time.time()]
+        notice = quota_notice.QuotaNotice(self.work / "state", self.bridge, "Codex",
+                                          lambda text: (first["body"], first["card"]), lambda: "", lambda *a: None,
+                                          now=lambda: clock[0])
+        mine = "id: task-2\nchannel_id: !room:s.space\nuser_id: @alice:s.space\naccess_tier: owner\ntask: again\n"
+        with mock.patch.object(connector_cards, "queue", side_effect=OSError("disk full")):
+            self.assertEqual(notice.hit(task="task-2", task_text=mine), "quota-card-posted quota-not-posted")
+            self.assertEqual((notice.owed(), notice.answered("task-2")), (["task-2"], False))
+            self.assertEqual(notice.hit(task="task-2", task_text=mine), "", "owed already: not a second entry")
+        self.assertEqual(notice.tick(), "", "too soon to try again")
+        clock[0] += quota_notice.RETRY_S + 1
+        self.assertEqual(notice.tick(), "quota-task-card")
+        self.assertEqual((notice.owed(), notice.answered("task-2")), ([], True))
+        clock[0] += quota_notice.RETRY_S + 1
+        self.assertEqual(notice.tick(), "")
+        self.assertEqual([room for room, _ in self.posted()], ["!room:s.space"], "one card, where it was asked")
+
+    def test_a_later_messages_card_says_why_it_is_not_queued_and_never_stops_the_limits_own(self):
+        self.serve("task-1", "[[limit]] hello")
+        (first,) = self.outbox()
+        self.assertEqual(len(self.posted()), 1)
+        said, clock = [], [time.time()]
+
+        def using():
+            raise RuntimeError("no account file")
+
+        notice = quota_notice.QuotaNotice(self.work / "state", self.bridge, "Codex",
+                                          lambda text: (first["body"], first["card"]), using,
+                                          lambda *a: said.append(" ".join(map(str, a))), now=lambda: clock[0])
+
+        def mine(tid):
+            return "id: %s\nchannel_id: %s\nuser_id: @alice:s.space\naccess_tier: owner\ntask: again\n" % (tid, self.DM)
+
+        # The record cannot be kept: nothing is owed, and it is said.
+        with mock.patch.object(notice, "save", return_value=False):
+            self.assertEqual(notice._tell_task("task-2", mine("task-2"), ""), "quota-not-posted")
+        # A failure reading the message never undoes what the limit's own card did.
+        with mock.patch.object(notice, "_tell_task", side_effect=RuntimeError("unreadable")):
+            self.assertEqual(notice.hit(task="task-2", task_text=mine("task-2")), "quota-card-posted")
+        self.assertIn("quota card for the message not queued: RuntimeError: unreadable", said)
+        # No DM room known: owed, and queued once one is; the account that cannot be read is left out.
+        with mock.patch.object(notice, "room", return_value=""):
+            self.assertEqual(notice._owed(clock[0], now_too=True), "")
+            rec = notice.load()
+            notice.save(dict(rec, owed={"task-2": {"key": "quota-task:task-2:k", "at": 1}}))
+            self.assertEqual(notice._owed(clock[0], now_too=True), "quota-no-room")
+        clock[0] += quota_notice.RETRY_S + 1
+        self.assertEqual(notice.tick(), "quota-task-card")
+        self.assertIn("account not read: RuntimeError: no account file", said)
+        self.assertEqual(len(self.posted()), 1)
+
+    def test_a_limit_hit_in_a_room_is_told_in_that_room_too_without_the_accounts_name(self):
+        # Owner, 2026-11-26: out of usage, whatever is sent is answered by the limit's card where it was sent.
         self.assertIn("STUB echo", self.serve("task-0", "hello"))
         room = "!room:s.space"
         self.assertEqual(self.serve("task-r", "[[limit]] in a room", channel=room, kind="room"), cc.LIMITED_NO_SEND)
-        (queued,) = self.outbox()
-        self.assertEqual((queued["room"], queued["card"]["account_controls"].get("limit")), (self.DM, True))
-        self.assertNotIn(room, [r for r, _ in self.posted()], "no card, no notice in the room")
+        cards = {q["room"]: q["card"] for q in self.outbox()}
+        self.assertEqual(sorted(cards), sorted([self.DM, room]), "the limit's own card in the DM, this message's here")
+        self.assertIn("alice@example.com", cards[self.DM]["text"])
+        self.assertNotIn("alice@example.com", cards[room]["text"])
+        self.assertNotIn("account_controls", cards[room])
 
     def test_a_turn_that_answers_clears_the_limit_and_a_later_limit_is_a_new_card(self):
         self.serve("task-1", "[[limit-bare]] hello")
@@ -2634,12 +2778,19 @@ class QuotaCardTest(CardWorld, unittest.TestCase):
         self.assertEqual([c.quota_hit(error) for _ in range(3)], ["quota-card-posted", "", ""])
         self.assertEqual(self.outbox(), [], "refusals after it queue no further card")
 
-    def test_with_no_owner_dm_seen_no_card_is_sent_and_the_room_gets_the_limit_in_words(self):
+    def test_with_no_owner_dm_seen_the_room_it_was_asked_in_still_gets_the_limits_card(self):
         said = self.serve("task-1", "[[limit-bare]] hi", channel="!room:s.space", kind="room")
-        self.assertEqual(self.outbox(), [])
-        self.assertIn("Codex has reached its usage limit", said)
-        self.assertNotIn("signed in", said)
-        self.assertEqual(metrics(self.work)[-1]["quota"], "quota-no-room")
+        (queued,) = self.outbox()
+        self.assertEqual(queued["room"], "!room:s.space")
+        self.assertIn("Codex has reached its usage limit", queued["card"]["text"])
+        self.assertEqual(said, cc.LIMITED_NO_SEND, "the card is the answer: no second line")
+        self.assertEqual(metrics(self.work)[-1]["quota"], "quota-no-room quota-task-card")
+        # Found on a really used-up account: the owner's next message, in their DM, gets the limit's card at
+        # once, and a card asked for after that is still answered by the limit's.
+        self.assertEqual(self.serve("task-2", "[[limit-bare]] hi"), cc.LIMITED_NO_SEND)
+        self.assertEqual(sorted(q["room"] for q in self.outbox()), [self.DM, "!room:s.space"])
+        self.serve("task-3", "/model")
+        self.assertEqual(metrics(self.work)[-1]["card"], "quota-card-asked")
 
     def test_a_dropped_card_is_queued_again_and_a_used_up_window_while_idle_is_a_limit(self):
         (self.work / "state").mkdir(parents=True)

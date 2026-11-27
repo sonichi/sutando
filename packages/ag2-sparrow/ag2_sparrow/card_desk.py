@@ -8,11 +8,17 @@ names; a tap no card claims gets the fixed line, and never reaches the model.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 from . import connector_cards
 
 ANSWERED = "[no-send] the card answers\n"
+# A switch can never be made in a room with other people in it, and no card that switches is shown
+# there: anyone asking for one in a room is told so, in their language, and the model never sees it.
+IN_ROOM = "Switching the account or model isn't available in a room. Please ask me in our DM."
+IN_ROOM_ZH = "房间里不能切换账号或模型，请到私聊里找我。"
+_CJK = re.compile(r"[\u3400-\u9fff]")
 
 
 class Desk:
@@ -21,8 +27,19 @@ class Desk:
     `asked_for(words, sent, result_file)`, `offer(sent, result_file)`, `expired(sent, result_file)`
     and `usable()`."""
 
-    def __init__(self, root, publish, quoted, cards):
+    def __init__(self, root, publish, quoted, cards, limit=None, room_limit=None):
         self.root, self.publish, self.quoted, self.cards = root, publish, quoted, list(cards)
+        # `room_limit()`: the limit in force as said in a shared room, '' for none; it answers before IN_ROOM.
+        self.room_limit = room_limit
+        # `limit(sent, result_file)`: out of usage, the owner's ask for any card is answered by the limit's
+        # card first; it returns what it did, '' when no limit is in force. A tap still acts.
+        self.limit = limit
+
+    def limited(self, sent, result_file) -> str:
+        try:
+            return (self.limit(sent, result_file) if self.limit else "") or ""
+        except Exception:  # noqa: BLE001 - the card asked for is shown as before
+            return ""
 
     def task(self, path, result_file) -> str:
         """What a task that was a card matter came to (a tap, or the owner's slash command in their DM),
@@ -50,27 +67,53 @@ class Desk:
             self.publish(result_file, self.quoted(verdict.say) + "\n")
             return "card-refused"
         ask, _, words = said.strip().partition(" ")
+        if in_room(sent):
+            return self.in_room(ask, said, result_file)
         if agent_card.owner_may_act(sent) is not None:
             return ""
-        for card in self.cards:
-            if ask.lower() == card.ASK and card.usable():
-                return self.drawn(card, result_file, lambda: card.asked_for(words.strip(), sent, result_file))
-        # The owner's own words naming one choice ("switch to haiku"): picked as a tap would be, no menu.
-        for card in self.cards:
-            named = getattr(card, "named_in", None)
-            choice = named(said.strip()) if named and card.usable() else ""
-            if choice:
-                return self.drawn(card, result_file, lambda: card.asked_for(choice, sent, result_file))
-        # A card may also name the owner's own words that are its matter (`asks`), read here and never by
-        # the model; one message may ask for several ("which account and model"), each shown once.
+        slash = [card for card in self.cards if ask.lower() == card.ASK and card.usable()]
+        named = [(card, card.named_in(said.strip())) for card in self.cards
+                 if getattr(card, "named_in", None) and card.usable()]
+        named = [(card, choice) for card, choice in named if choice]
         asking = {}
         for card in self.cards:
             if getattr(card, "asks", None) and card.KIND not in asking and card.asks(said) and card.usable():
                 asking[card.KIND] = card
+        if slash or named or asking:
+            told = self.limited(sent, result_file)
+            if told:
+                return told
+        if slash:
+            return self.drawn(slash[0], result_file, lambda: slash[0].asked_for(words.strip(), sent, result_file))
+        # The owner's own words naming one choice ("switch to haiku"): picked as a tap would be, no menu.
+        if named:
+            card, choice = named[0]
+            return self.drawn(card, result_file, lambda: card.asked_for(choice, sent, result_file))
+        # A card may also name the owner's own words that are its matter (`asks`), read here and never by
+        # the model; one message may ask for several ("which account and model"), each shown once.
         if len(asking) == 1:
             card = next(iter(asking.values()))
             return self.drawn(card, result_file, lambda: card.offer(sent, result_file))
         return self.offered_all(list(asking.values()), sent, result_file) if asking else ""
+
+    def in_room(self, ask, said, result_file) -> str:
+        """A room is no place for a switch: a slash command, a named pick or a card's own question there,
+        from anyone, gets the one line saying to ask in the DM, and no card. '' for anything else."""
+        said = said.strip()
+        for card in self.cards:
+            named = getattr(card, "named_in", None)
+            asks = getattr(card, "asks", None)
+            if ask.lower() == card.ASK or (named and named(said)) or (asks and asks(said)):
+                try:
+                    out = (self.room_limit() if self.room_limit else "") or ""
+                except Exception:  # noqa: BLE001 - the room is told what it was before
+                    out = ""
+                if out:     # out of usage: the limit is the answer, here too
+                    self.publish(result_file, self.quoted(out) + "\n")
+                    return "quota-in-room"
+                self.publish(result_file, self.quoted(IN_ROOM_ZH if _CJK.search(said) else IN_ROOM) + "\n")
+                return "card-in-room"
+        return ""
 
     def offered_all(self, cards, sent, result_file) -> str:
         """Offer each card in `cards` and publish one answer for them all: the words of any card that could
@@ -119,6 +162,12 @@ class Desk:
     def hint(self) -> str:
         """What an owner turn is told about the cards that can be shown, '' when none can."""
         return "\n\n".join(card.HINT for card in self.cards if card.usable())
+
+
+def in_room(sent) -> bool:
+    """Whether the task came in a room (any channel kind but the DM); a task that names none is not."""
+    kind = str((sent or {}).get("channel_kind") or "").strip()
+    return bool(kind) and kind != "dm"
 
 
 def read_task(path) -> str:

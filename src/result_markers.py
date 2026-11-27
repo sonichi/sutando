@@ -31,6 +31,7 @@ Marker spec (matches CLAUDE.md → "Result-body protocol markers"):
     [no-send]
     [REPLIED]
     [deduped: <task-id>]
+    a whole body that is only a card mark: [model-card], [account-card]
   When any of these is found, the bridge archives the task silently and
   delivers nothing to the user.
 
@@ -141,6 +142,9 @@ _SKIP_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # `*` not `+`: `[deduped:]` and `[deduped: ]` differ only by a space and
     # must parse alike, or one is audited and the other ships its own marker.
     (re.compile(r"^\s*\[deduped:\s*([^\]]*)\]\s*", re.IGNORECASE), "deduped"),
+    # A body that is only one of the two connector card marks asks the connector for that card. Written as
+    # a result by the runtime itself, it is closed silently. Any other bracketed word is an ordinary reply.
+    (re.compile(r"^\s*\[(?:model|account)-card\]\s*\Z"), "no-send"),
 ]
 
 # Redirect marker — Discord channel IDs are 17-20 digits; Slack channel IDs

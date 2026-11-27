@@ -161,11 +161,44 @@ class Desk(unittest.TestCase):
                 self.assertEqual(self.task(said), "")
         self.assertEqual((self.offers(), self.written), ((0, [0, 0]), []))
 
-    def test_anyone_else_another_room_or_another_account_goes_on_to_the_model(self):
+    def test_anyone_else_or_another_account_goes_on_to_the_model(self):
         self.assertEqual(self.task("你在用哪个账号和模型", tier="team"), "")
-        self.assertEqual(self.task("你在用哪个账号和模型", kind="room"), "")
         self.assertEqual(self.task("我的 GitHub 账号"), "")
         self.assertEqual(self.offers(), (0, [0, 0]))
+        self.assertEqual(self.written, [])
+
+    def test_in_a_room_anyone_asking_gets_the_one_line_and_no_card(self):
+        # A room is no place for a switch: the owner and anyone else get the line, never a card or the model.
+        for tier in ("owner", "team", "guest"):
+            for said, line in (("你在用哪个账号和模型", card_desk.IN_ROOM_ZH), ("switch account", card_desk.IN_ROOM),
+                               ("/model", card_desk.IN_ROOM), ("/account opus", card_desk.IN_ROOM),
+                               ("what model are you using?", card_desk.IN_ROOM)):
+                with self.subTest(tier=tier, said=said):
+                    self.written.clear()
+                    self.assertEqual(self.task(said, tier=tier, kind="room"), "card-in-room")
+                    self.assertEqual(self.written, [line + "\n"])
+        self.assertEqual(self.offers(), (0, [0, 0]))
+        self.assertEqual(self.by_card, [])
+
+    def test_a_pick_named_in_a_room_gets_the_line_and_picks_nothing(self):
+        self.model.named_in = lambda words: "haiku" if "haiku" in words else ""
+        picked = []
+        self.model.asked_for = lambda *a: picked.append(a) or "model-picked"
+        self.assertEqual(self.task("switch to haiku", kind="room"), "card-in-room")
+        self.assertEqual((picked, self.written), ([], [card_desk.IN_ROOM + "\n"]))
+        self.assertEqual(self.task("switch to haiku"), "model-picked", "in the DM the pick is made as before")
+
+    def test_ordinary_words_in_a_room_still_reach_the_model(self):
+        for said in ("Can you model this?", "我的 GitHub 账号", "hi there", "which model is best for coding?"):
+            with self.subTest(said=said):
+                self.assertEqual(self.task(said, kind="room"), "")
+        self.assertEqual((self.offers(), self.written), ((0, [0, 0]), []))
+
+    def test_a_task_naming_no_channel_kind_is_not_a_room(self):
+        self.assertFalse(card_desk.in_room({"channel_kind": ""}))
+        self.assertFalse(card_desk.in_room({"channel_kind": "dm"}))
+        self.assertTrue(card_desk.in_room({"channel_kind": "room"}))
+        self.assertTrue(card_desk.in_room({"channel_kind": "place"}))
 
 
 if __name__ == "__main__":

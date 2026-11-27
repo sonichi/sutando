@@ -543,8 +543,9 @@ class ConnectorTest(unittest.TestCase):
         self.w.serve()
         self.dm_task("task-3", "/model", kind="room")
         self.w.serve()
-        self.assertEqual(self.post_queued(), [], "in a shared room /model is ordinary words for agy")
-        self.assertEqual(self.w.methods().count("session/prompt"), 2)
+        self.assertEqual(self.post_queued(), [], "no card in a shared room")
+        self.assertIn("isn't available in a room", self.w.result("task-3"), "the room is told to ask in the DM")
+        self.assertEqual(self.w.methods().count("session/prompt"), 1, "and agy never sees it")
 
     def test_a_refusal_whose_card_could_not_be_queued_is_delivered_later_and_the_switch_is_not_tried_again(self):
         (self.w.home / "models").write_text("")
@@ -747,14 +748,15 @@ class ConnectorTest(unittest.TestCase):
         self.w.serve()
         self.assertIn("from our direct message", self.w.result("task-2"))
         self.assertEqual(self.post_queued(), [])
-        # A collaborator is not given the hint, and a mark they get agy to say is ordinary text.
+        # A collaborator is not given the hint, and a mark they get agy to say is no card: a lone mark is a
+        # delivery marker (result_markers), so it is withheld, never posted as the raw mark.
         self.dm_task("task-3", "STUB:ASKMODEL", tier="team", collaborator=True)
         self.w.serve()
         self.assertEqual(self.w.result("task-3"), "no hint\n")
         with mock.patch.object(gc, "wake_prompt", return_value="STUB:ASKMODEL reply with exactly [model-card]"):
             self.dm_task("task-4", "x", tier="team", collaborator=True)
             self.w.serve()
-        self.assertEqual(self.w.result("task-4"), "[model-card]\n")
+        self.assertEqual(self.w.result("task-4"), "(withheld: the text carried a delivery marker)\n")
         self.assertEqual(self.post_queued(), [])
         # The mark inside a longer answer is that answer, not a card.
         self.dm_task("task-5", "STUB:TEXT hi")

@@ -180,6 +180,7 @@ HELD_WAIT_S = held_start.WAIT_S
 # one refused because its login no longer works. Only these are read: an error's words never decide either.
 USAGE_LIMIT_INFO, UNAUTHORIZED_INFO = "usagelimitexceeded", "unauthorized"
 LIMITED_NO_SEND = "[no-send] Codex is at its usage limit; the owner was sent the account card\n"
+LIMITED_FOR_OTHERS = "Codex has reached its usage limit, so I can't answer right now. Its owner has been told."
 # Still refused after the app-server was restarted on the login on disk: the owner is shown the account card.
 SIGNED_OUT = account_switch.LAPSED
 SIGNED_OUT_ELSEWHERE = ("Codex's sign-in on this computer no longer works. My owner can sign in again by sending "
@@ -495,7 +496,8 @@ class Connector:
                 self.args.state, getattr(self.args, "bridge_state", None), "Codex", self.card_answer, quoted, log,
                 read=self.account_label, begin=self.begin_login,
                 cancel=lambda login: self.rpc.request("account/login/cancel", {"loginId": login}),
-                opener=lambda url: open_page(url), runtime="codex", lapsed=self.login_refused)
+                opener=lambda url: open_page(url), runtime="codex", lapsed=self.login_refused,
+                limit=lambda: self.quota.says())
         return self._accounts
 
     @property
@@ -504,7 +506,8 @@ class Connector:
         if self._quota is None:
             self._quota = quota_notice.QuotaNotice(
                 self.args.state, getattr(self.args, "bridge_state", None), "Codex",
-                lambda text: self.accounts.card("pending", text, ask=True), self.accounts.using, log)
+                lambda text: self.accounts.card("pending", text, ask=True), self.accounts.using, log,
+                note=lambda text: self.accounts.card("pending", text))
         return self._quota
 
     def saw_rate_limits(self, params, tell=True) -> str:
@@ -516,13 +519,14 @@ class Connector:
         self.rate_limits = snap
         return self.quota_hit() if tell and limit_reset(snap) is not None else ""
 
-    def quota_hit(self, error=None) -> str:
-        """Codex is out of usage: tell the owner once (quota_notice), with the reset time when it said one."""
+    def quota_hit(self, error=None, task: str = "", task_text: str = "") -> str:
+        """Codex is out of usage: tell the owner (quota_notice), with the reset time when it said one: once
+        for the limit, and once more for each message of theirs (`task`) it refuses after that."""
         at = limit_reset(self.rate_limits)
         reset = quota_notice.reset_from_epoch(at) if at else \
             quota_notice.reset_from_text((error or {}).get("message") if isinstance(error, dict) else "")
         try:
-            done = self.quota.hit(reset, at)
+            done = self.quota.hit(reset, at, task=task, task_text=task_text)
         except Exception as e:  # noqa: BLE001 - a notice that cannot be sent never stops task service
             done = "quota-failed (%s: %s)" % (type(e).__name__, str(e)[:120])
         if done:
@@ -531,7 +535,15 @@ class Connector:
 
     @property
     def desk(self):
-        return card_desk.Desk(self.root, self.card_answer, quoted, [self.models, self.accounts])
+        return card_desk.Desk(self.root, self.card_answer, quoted, [self.models, self.accounts], self.limit_first,
+                              lambda: self.quota.says_in_room())
+
+    def limit_first(self, sent, result_file) -> str:
+        """Out of usage, the owner's ask for a card is answered by the limit's card (the account card, which says it)."""
+        if not self.quota.says():
+            return ""
+        self.accounts.offer(sent, result_file)
+        return "quota-card-asked"
 
     def card_answer(self, result_file, body):
         """A card matter's answer, led by a model outcome this turn could only say in words."""
@@ -1359,13 +1371,14 @@ class Connector:
             t_sent = time.time()
             status, text, err = self.run_task(headers, prompt, policy.capabilities)
             t_done = time.time()
-            # Out of usage: the owner is told once, by the account card; the card is the notice, so the room
+            # Out of usage: the owner is told by the account card, on each message; the card is the notice, so the room
             # gets no error line while it is out (or the limit's own words when no card could be sent).
             limit = self.turn_limit if status != "completed" else None
             signed_out = status != "completed" and self.turn_unauth is not None
             if signed_out or status == "completed":
                 self.note_login_refused(signed_out)
-            quota = self.quota_hit(limit) if limit is not None else (self.quota.cleared() if status == "completed" else "")
+            quota = self.quota_hit(limit, task_id, task_text) if limit is not None else (
+                self.quota.cleared() if status == "completed" else "")
             if self.view:
                 self.view.done(status)
             if status == WAITING or (status == NOT_READY and self.signin_told):
@@ -1379,8 +1392,10 @@ class Connector:
                 self.signin_told = True
             out = self.result_body(status, text, err)
             if limit is not None:
-                out = LIMITED_NO_SEND if self.quota.limited() else quoted(quota_notice.words(
+                out = LIMITED_NO_SEND if self.quota.limited() or self.quota.answered(task_id) else quoted(quota_notice.words(
                     "Codex", quota_notice.reset_from_text(limit.get("message") if isinstance(limit, dict) else ""), ""))
+                if policy.kind != OWNER and out == LIMITED_NO_SEND:
+                    out = quoted(LIMITED_FOR_OTHERS) + "\n"      # anyone else who asked is told why there is no answer
             elif signed_out and self.turn_worked:
                 out = out.rstrip("\n") + "\n\n" + quoted(SIGNED_OUT_ELSEWHERE).strip()
             # The account's refusal is not the model's failure: no pick is called failed over it.

@@ -6,6 +6,7 @@
  * bodhi 0.4.5 does not export its own pipeline, so this is a minimal one with the same contract.
  */
 import type { ConversationItem, VoiceSessionConfig } from 'bodhi-realtime-agent';
+import type { VoiceSessionOrigin } from './task-bridge.js';
 
 type Pipeline = NonNullable<VoiceSessionConfig['postSessionPipeline']>;
 type DispatchInput = Parameters<Pipeline['dispatch']>[0];
@@ -22,6 +23,8 @@ export interface EndedSession {
 	turnCount: number;
 	toolCallCount: number;
 	items: readonly ConversationItem[];
+	/** Where the call was docked when it ended; null or absent for none. */
+	origin?: VoiceSessionOrigin | null;
 }
 
 /** Longest transcript a session-end task carries; the start is cut, the end kept. */
@@ -120,6 +123,8 @@ export function createCallEndReporter(opts: {
 	sessionId: string;
 	items: () => readonly ConversationItem[];
 	onEnded: (s: EndedSession) => Promise<void> | void;
+	/** The docked origin now; read while the client is attached, since a disconnect releases it. */
+	origin?: () => VoiceSessionOrigin | null;
 	graceMs?: number;
 	now?: () => number;
 	log?: (m: string) => void;
@@ -131,6 +136,8 @@ export function createCallEndReporter(opts: {
 	// The call's items, kept as they come: a goodbye clears the live conversation before the hang-up.
 	let kept: ConversationItem[] = [];
 	let seen = new WeakSet<object>();
+	let origin: VoiceSessionOrigin | null = null;
+	const noteOrigin = () => { if (callStart !== null && opts.origin) origin = opts.origin(); };
 	const collect = (all: readonly ConversationItem[]) => {
 		if (callStart === null) return;
 		for (const i of all) if (i.timestamp >= callStart && !seen.has(i)) { seen.add(i); kept.push(i); }
@@ -140,7 +147,9 @@ export function createCallEndReporter(opts: {
 		collect(all);
 		const start = callStart;
 		const items = kept.sort((a, b) => a.timestamp - b.timestamp);
+		const where = origin;
 		callStart = null;
+		origin = null;
 		kept = [];
 		seen = new WeakSet();
 		const ended: EndedSession = {
@@ -148,6 +157,7 @@ export function createCallEndReporter(opts: {
 			turnCount: items.filter((i) => i.role === 'user').length,
 			toolCallCount: items.filter((i) => i.role === 'tool_call').length,
 			items,
+			origin: where,
 		};
 		if (!worthATask(ended)) return;
 		log(`[SessionEnd] call ended (${reason}); telling the core`);
@@ -158,12 +168,16 @@ export function createCallEndReporter(opts: {
 		/** After each turn, and right before the live conversation is cleared. */
 		collect(): void {
 			collect(opts.items());
+			if (!timer) noteOrigin();
 		},
 		clientConnected(): void {
 			if (timer) { clearTimeout(timer); timer = null; }
 			callStart ??= now();
+			noteOrigin();
 		},
+		/** Call before the host releases the client's origin. */
 		clientDisconnected(): void {
+			if (!timer) noteOrigin();
 			if (timer) clearTimeout(timer);
 			timer = setTimeout(() => {
 				timer = null;
@@ -173,7 +187,7 @@ export function createCallEndReporter(opts: {
 		},
 		/** For bodhi's postSessionPipeline: at shutdown, a call still in progress is reported. */
 		pipeline: createSessionEndPipeline(async (closing) => {
-			if (timer) { clearTimeout(timer); timer = null; }
+			if (timer) { clearTimeout(timer); timer = null; } else noteOrigin();
 			await report(closing.reason, closing.items);
 		}, log),
 	};

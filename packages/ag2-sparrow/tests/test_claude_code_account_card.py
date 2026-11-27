@@ -152,7 +152,8 @@ class Account(Base):
         self.assertEqual(rc, 1)
         self.assertIn("couldn't match that button", (self.results / "task-c.txt").read_text())
         rc, out = self.claim(self.task("task-r", "/account", kind="room"))
-        self.assertEqual((rc, out.get("admission")), (0, "owner"), "outside the DM it is ordinary text")
+        self.assertEqual(rc, 1, "in a room /account is answered here, never by the session")
+        self.assertIn("isn't available in a room", (self.results / "task-r.txt").read_text())
 
     def test_signed_out_unreadable_and_proxied_are_said_as_such(self):
         cfg = cli.read_config(cli.config_path())
