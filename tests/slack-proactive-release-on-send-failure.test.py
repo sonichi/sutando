@@ -5,7 +5,7 @@ Drives the real `result_watcher` loop, so the failure path actually executes.
 """
 from __future__ import annotations
 
-from _helpers.hermetic_env import isolate_os_environ
+from _helpers.hermetic_env import cleanup_hermetic_temp_dirs, isolate_os_environ
 
 # Before anything reads the environment: no outer credential selector survives.
 isolate_os_environ()
@@ -223,4 +223,5 @@ if __name__ == "__main__":
     # interpreter finalization racing one of its stdout writes aborts the process.
     sys.stdout.flush()
     sys.stderr.flush()
+    cleanup_hermetic_temp_dirs()
     os._exit(rc)

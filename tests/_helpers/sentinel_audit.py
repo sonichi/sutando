@@ -52,6 +52,9 @@ _real_exit, _pid = os._exit, os.getpid()
 def _exit_after_write(code):
     if os.getpid() == _pid:  # a forked child's exit must not overwrite the parent's record
         _write()
+    helper = sys.modules.get("_helpers.hermetic_env")
+    if helper is not None:
+        helper.cleanup_hermetic_temp_dirs()
     _real_exit(code)
 
 
