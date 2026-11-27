@@ -113,8 +113,8 @@ class Home:
         for patch in (mock.patch.dict(os.environ, self.env), mock.patch.object(dl, "_user_home", return_value=self.user)):
             patch.start()
             self.addCleanup(patch.stop)
-        self.addCleanup(lambda: dl.cancel(self.dir, str(self.codex), self.env))
         self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(lambda: dl.cancel(self.dir, str(self.codex), self.env))     # first: cleanups run last-in first-out
 
     def mode(self, how):
         (self.bin / "mode").write_text(how)
@@ -637,6 +637,40 @@ class RemoteUnitTest(Home, unittest.TestCase):
                       homes=lambda: [])
         r.fresh = lambda sent: True
         return r
+
+    def queued(self, r):
+        return [(c.kwargs["edit"], c.args[1][1]) for c in r.accounts.post.call_args_list]
+
+    def test_a_new_add_after_an_ended_sign_in_withdraws_the_old_card(self):
+        self.mode("fail")
+        r = self.remote()
+        self.assertEqual(r.tapped(dl.ADD, dict(self.OWNER, reply_to_event="$old"), "out"), "account-device-started")
+        end = time.time() + 15
+        while not (r.dir / "result.json").exists() and time.time() < end:
+            time.sleep(0.05)
+        self.assertEqual(dl.current(r.dir), {}, "ended, never told: its card still shows the code")
+        self.mode("hang")
+        r.accounts.post.reset_mock()
+        self.assertEqual(r.tapped(dl.ADD, dict(self.OWNER, reply_to_event="$new"), "out"), "account-device-started")
+        queued = self.queued(r)
+        self.assertEqual([(e, c["id"]) for e, c in queued], [("$new", dl.DEVICE_CARD), ("$old", dl.WITHDRAWN_CARD)])
+        self.assertNotIn(CODE, json.dumps(queued[1][1]))
+        self.assertFalse((self.state / dl.WITHDRAW_FILE).exists())
+
+    def test_the_card_is_on_record_before_its_code_is_queued(self):
+        self.mode("hang")
+        r = self.remote()
+        seen = []
+        r.accounts.post.side_effect = lambda room, built, edit="": seen.append(
+            detached_login.read_json(r.dir / "meta.json").get("cards")) or (_ for _ in ()).throw(RuntimeError("stop"))
+        with self.assertRaises(RuntimeError):
+            r.tapped(dl.ADD, dict(self.OWNER, reply_to_event="$e"), "out")
+        self.assertEqual(seen, [["$e"]], "recorded before the edit was queued")
+        # Recovery: the sign-in is ended (here by a cancel), and its card is withdrawn.
+        restarted = self.remote()
+        restarted.stop()
+        self.assertEqual([(e, c["id"]) for e, c in self.queued(restarted)], [("$e", dl.WITHDRAWN_CARD)])
+        self.assertFalse((self.state / dl.WITHDRAW_FILE).exists())
 
     def test_a_tap_that_is_not_the_owners_in_their_dm_is_refused_here_too(self):
         r = self.remote()

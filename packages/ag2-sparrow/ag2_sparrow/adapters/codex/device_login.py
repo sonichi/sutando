@@ -181,9 +181,12 @@ def _staged_auth(d: Path) -> Path:
 
 def _discard(d: Path, codex: str, env: dict, run) -> bool:
     """Stop the sign-in, sign a staged login out on the staging home only, and delete it all; whether
-    there was anything. A logout that fails still deletes the staged login."""
+    there was anything. Every card it showed is owed a withdrawal first, whatever ends it. A logout that
+    fails still deletes the staged login."""
     if not d.exists():
         return False
+    meta = read_json(d / "meta.json")
+    _journal(d, meta.get("room") or "", meta.get("cards") or [])
     _stop(d)
     if _staged_auth(d).is_file():
         try:
@@ -280,6 +283,15 @@ def _journal(d: Path, room: str, cards) -> None:
         keep_owed(d, owed(d) + new)
 
 
+def forget_card(state_dir, event: str) -> None:
+    """`event` was noted but its card was never queued: it shows nothing of this sign-in."""
+    d = Path(state_dir)
+    with locked(d):
+        meta = read_json(d / "meta.json")
+        if meta and event in (meta.get("cards") or []):
+            write_private(d / "meta.json", dict(meta, cards=[c for c in meta["cards"] if c != event]))
+
+
 def paid(state_dir, room: str, event: str) -> None:
     """`event` shows something else now: its withdrawal is no longer owed."""
     left = [o for o in owed(state_dir) if (o["room"], o["event"]) != (room, event)]
@@ -302,7 +314,6 @@ def over(state_dir, codex: str, env: dict, run=subprocess.run, now=None, wait_s=
         if meta.get("phase") == CONFIRM_PHASE:
             if now - float(meta.get("asked_at") or 0) <= wait_s:
                 return {}
-            _journal(d, where["room"], where["cards"])
             _discard(d, codex, env, run)
             return dict(where, exit="unanswered")
         result = read_json(d / "result.json")
@@ -318,7 +329,6 @@ def over(state_dir, codex: str, env: dict, run=subprocess.run, now=None, wait_s=
             write_private(d / "meta.json", {"id": meta.get("id"), "phase": CONFIRM_PHASE, "email": email,
                                             "asked_at": now, **where})
             return dict(where, phase=CONFIRM_PHASE, email=email)
-        _journal(d, where["room"], where["cards"])
         _discard(d, codex, env, run)
     why = _why(said, meta.get("code") or "", meta.get("link") or "") if code != 0 else \
         "Codex finished, but I could not read which account it signed in"
@@ -409,7 +419,6 @@ def cancel(state_dir, codex: str = "codex", env=None, run=subprocess.run) -> dic
     d = Path(state_dir)
     with locked(d):
         meta = read_json(d / "meta.json")
-        _journal(d, meta.get("room") or "", meta.get("cards") or [])
         if not _discard(d, codex, dict(env or {}), run):
             return {}
         return {"room": meta.get("room") or "", "cards": meta.get("cards") or []}
@@ -552,12 +561,14 @@ class Remote:
                               result_file, tapped)
             return "account-not-started"
         built = self.confirm_card(meta["email"]) if meta["phase"] == CONFIRM_PHASE else self.code_card(meta)
+        note_card(self.dir, room, tapped)       # on record before the edit is queued: a stop between leaves no orphan
         if not self.accounts.post(room, built, edit=tapped):
+            forget_card(self.dir, tapped)
             if cancel(self.dir, self.codex, self.env, self.run):
                 self.retry()
             self.accounts.publish(result_file, self.accounts.quoted(NO_CARD) + "\n")
             return "account-not-started"
-        note_card(self.dir, room, tapped)
+        self.retry()        # a sign-in replaced by this one owes its cards' withdrawals
         self.accounts.publish(result_file, account_switch.ANSWERED)
         self.log("device sign-in", "shown again" if again else "started")
         return "account-device-again" if again else "account-device-started"
