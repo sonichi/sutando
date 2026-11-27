@@ -13,7 +13,7 @@ its room, the address asked for). A detached watcher per nonce (`await`, holding
 outcome in place of the card: switched or not from the result; a request still unclaimed after
 UNCLAIMED_S is withdrawn (only while it is still this nonce's) and said not picked up; a claimed one is
 said still in progress, and after GIVE_UP_S said untold (never failed) with the nonce kept, so a late
-result is still told: `reconcile`, on the next card or tap, and `recover`, which restarts a watcher a
+result is still told: `settle_late`, on the next card or tap, and `recover`, which restarts a watcher a
 restart left dead.
 
     python3 -m ag2_sparrow.adapters.claude_code.account_remote await --root ROOT --nonce NONCE
@@ -232,7 +232,7 @@ def settle(root, rec: dict, data: dict, log=_log) -> str:
     return words
 
 
-def reconcile(root, log=_log) -> list:
+def settle_late(root, log=_log) -> list:
     """Tell what came of switches no watcher is telling: a late result, or a request the app no longer holds
     in any form. What was told."""
     said = []
@@ -264,7 +264,7 @@ def publish(root, config_dir, key: str, label: str, room: str, edit: str, bridge
     written). Raises OSError when the request cannot be written; nothing is then kept."""
     now = time.time() if now is None else now
     with _lock(root):
-        reconcile(root, log)
+        settle_late(root, log)
         if busy(root, config_dir):
             return None
         nonce = str(uuid.uuid4())

@@ -205,9 +205,9 @@ class AccountCard(account_switch.AccountSwitch):
         if not ask:
             return body, card
         try:
-            remote.reconcile(self.root, self.log)     # a switch told late is told before the new card
+            remote.settle_late(self.root, self.log)     # a switch told late is told before the new card
         except OSError as e:
-            self.log("switches not reconciled:", "%s: %s" % (type(e).__name__, str(e)[:200]))
+            self.log("late switches not settled:", "%s: %s" % (type(e).__name__, str(e)[:200]))
         agent_card, _ = connector_cards._core()
         uses = []
         for key, email in self.offers().items():

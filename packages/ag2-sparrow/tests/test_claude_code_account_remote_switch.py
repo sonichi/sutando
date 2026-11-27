@@ -385,20 +385,20 @@ class Watch(Remote):
     def test_a_request_the_app_no_longer_holds_in_any_form_is_settled(self):
         nonce = self.begun()
         self.request().unlink()
-        self.assertEqual(rm.reconcile(self.root), [rm.UNTOLD])
+        self.assertEqual(rm.settle_late(self.root), [rm.UNTOLD])
         self.assertEqual(rm.outstanding(self.root), [])
         nonce = self.begun()
         rm.save(self.root, dict(rm.load(self.root, nonce), gave_up=True))
         self.request().unlink()
         self.clear_outbox()
-        self.assertEqual(rm.reconcile(self.root), [], "one already said untold is dropped quietly")
+        self.assertEqual(rm.settle_late(self.root), [], "one already said untold is dropped quietly")
         nonce = self.begun()
         self.request().unlink()
         self.assertEqual(rm.watch(self.root, nonce), rm.UNTOLD, "the watcher too")
         nonce = self.begun()
         with mock.patch.object(rm, "take_result", side_effect=[None, {"nonce": nonce, "ok": True, "label": A}]):
             self.request().unlink()
-            self.assertEqual(rm.reconcile(self.root), ["Switched to %s." % A], "written as the claim went")
+            self.assertEqual(rm.settle_late(self.root), ["Switched to %s." % A], "written as the claim went")
         nonce = self.begun()
         self.request().unlink()
         with mock.patch.object(rm, "take_result", side_effect=[None, {"nonce": nonce, "ok": True, "label": A}]):
@@ -417,7 +417,7 @@ class Watch(Remote):
         self.assertEqual(held, "", "a second watcher leaves it to the first")
         self.assertEqual(rm.recover(self.root), 0, "a live watcher is not doubled")
         self.assertTrue(rm.watcher_alive(self.root, nonce))
-        self.assertEqual(rm.reconcile(self.root), [], "a watched switch is the watcher's to tell")
+        self.assertEqual(rm.settle_late(self.root), [], "a watched switch is the watcher's to tell")
 
     def test_odd_records_and_the_detached_command(self):
         self.assertIsNone(rm.load(self.root, "../x"))
@@ -444,7 +444,7 @@ class Watch(Remote):
         self.assertFalse(rm.claimed_any(self.home / "none"))
         with mock.patch.object(rm.os, "open", side_effect=OSError("x")):
             self.assertFalse(rm.watcher_alive(self.root, nonce))
-        with mock.patch.object(ac.remote, "reconcile", side_effect=OSError("ro")):
+        with mock.patch.object(ac.remote, "settle_late", side_effect=OSError("ro")):
             self.posted("$ro")
 
     def test_the_supervisor_restarts_a_dead_watcher_every_so_often_and_never_stops_over_it(self):
