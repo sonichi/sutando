@@ -2746,9 +2746,8 @@ class QuotaCardTest(CardWorld, unittest.TestCase):
         (self.home / "auth.json").write_text(json.dumps({"tokens": {"account_id": account_id}}))
 
     def test_after_a_restart_on_an_account_out_of_usage_the_first_ask_gets_only_the_limits_card(self):
-        # RC6 acceptance (Dots): out of usage, the first owner message after the agent restarted was "account",
-        # "model" or "/model", and it got the plain card. Each serve is a new connector, as after a restart; the
-        # server, asked before any turn was refused here, says the account is out of usage.
+        # RC6 acceptance: out of usage, the first ask after a restart got the plain card. Each serve is a new
+        # connector (a restart); the server, asked before any turn was refused, says the account is out.
         self.sign_in("acct-a")
         (self.home / "stub-limits").write_text("out")
         for n, ask in enumerate(("account", "model", "/model")):

@@ -550,9 +550,8 @@ class LimitMenu(NoticeBase):
         self.assertEqual(quota_card.asked_in_room(self.root), "")
 
     def test_the_first_ask_after_a_restart_gets_the_limits_card_before_any_card_could_be_sent(self):
-        # RC6 acceptance (Dots): at the limit, the owner's first message after a restart was "account", "model" or
-        # "/model" and it got the plain card. The limit was on the pane, but its words were kept only once a card was
-        # queued, which needs the owner's DM room: a room not known yet left the desk with no limit to answer with.
+        # RC6 acceptance: the first ask after a restart got the plain card. The limit's words were kept only once a
+        # card was queued, which needs the owner's DM room, not known yet.
         from ag2_sparrow.adapters.claude_code import model_card
         self.assertEqual(self.tick(STARTUP_MENU), "quota-no-room")
         for n, ask in enumerate(("account", "model", "/model")):
