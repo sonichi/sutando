@@ -23,7 +23,7 @@ graceful-degrade); this file is the unified CLI that dispatches to them.
     python3 room_ops.py events pull [--cursor N] [--wait S]
     python3 room_ops.py events stream [--cursor-file PATH] [--once] [--max-events N]
     python3 room_ops.py action describe|read|execute <room> room.commons.<x> [--args JSON | --args-file PATH]
-                               [--task-file TASK] [--operation-id ID] [--agent mxid]  # Commons Actions
+                               (--task-file TASK | --no-task) [--operation-id ID] [--agent mxid]  # Commons Actions
     python3 room_ops.py capabilities                                 # supported commands + say flags
 
 Every subcommand prints a structured JSON result and **exits 0** for any
@@ -299,10 +299,13 @@ def _run(argv):
                    help="the Action's arguments, a JSON object")
     g.add_argument("--args-file", dest="args_file", default=None, metavar="PATH",
                    help="a UTF-8 file holding the Action's arguments, a JSON object")
-    p.add_argument("--task-file", dest="action_task_file", default=None, metavar="TASK",
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--task-file", dest="action_task_file", default=None, metavar="TASK",
                    help="the task an execute answers: the person who asked it (its asked_by or "
-                        "user_id header) is sent as asked_by, so the write is held to their rights. "
-                        "Leave it out only for work nobody asked for")
+                        "user_id header) is sent as asked_by, so the write is held to their rights")
+    g.add_argument("--no-task", dest="no_task", action="store_true",
+                   help="execute work nobody asked for, with the agent's own rights and no asked_by; "
+                        "an execute needs this or --task-file")
     p.add_argument("--operation-id", dest="operation_id", default=None,
                    help="execute: reuse the id of an earlier attempt to retry it without acting twice")
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
@@ -327,7 +330,8 @@ def _run(argv):
         print(json.dumps({"ok": True, "commands": sorted(sub.choices), "say": say_flags,
                           "say_extra_content_checked": True,
                           "action": {"verbs": sorted(_action.TOOLS), "actions": "room.commons.*",
-                                     "asked_by_from": "--task-file"}}, indent=2))
+                                     "asked_by_from": "--task-file",
+                                     "execute_needs_one_of": ["--task-file", "--no-task"]}}, indent=2))
         return 0
     if a.cmd == "read":
         res = _read.read_room(a.room_id, a.agent_mxid, a.limit, before=a.before,
@@ -400,6 +404,7 @@ def _run(argv):
                               "reason": f"the Action's arguments are not readable JSON ({type(e).__name__})"}))
             return 2
         res = _action.run(a.verb, a.room_id, a.action, arguments, task_file=a.action_task_file,
+                          no_task=a.no_task,
                           agent_mxid=a.agent_mxid, operation_id=a.operation_id)
         # Unlike the older verbs, a Commons Action that did not complete never exits 0.
         print(json.dumps(res, indent=2, ensure_ascii=False))

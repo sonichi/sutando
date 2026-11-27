@@ -140,6 +140,8 @@ class Base(unittest.TestCase):
         return path
 
     def run_action(self, verb="execute", name=WRITE, worker=W, **kw):
+        if verb == "execute" and "task_file" not in kw:
+            kw.setdefault("no_task", True)
         return action.run(verb, ROOM, name, kw.pop("arguments", {"title": "Plan"}), workspace=self.ws,
                           environ={C.SESSION_WORKER_ENV: worker} if worker else {}, vault=FakeVault(),
                           request=self.server, **kw)
@@ -178,10 +180,16 @@ class WhoAsked(Base):
         self.assertIsNone(res["asked_by"])
         self.assertNotIn("asked_by", self.server.sent("room.action.execute")[0])
 
-    def test_a_task_that_names_no_sender_sends_no_asked_by_field(self):
-        res = self.run_action(task_file=self.task())
-        self.assertTrue(res["ok"], res)
-        self.assertNotIn("asked_by", self.server.sent("room.action.execute")[0])
+    def test_an_execute_that_names_neither_a_task_nor_no_task_sends_nothing(self):
+        res = self.run_action(no_task=False)
+        self.assert_nothing_sent(res)
+        self.assertIn("--no-task", res["reason"])
+        self.assert_nothing_sent(self.run_action(task_file=self.task(f"user_id: {OWNER}"), no_task=True))
+
+    def test_a_task_that_names_no_sender_sends_nothing(self):
+        self.assert_nothing_sent(self.run_action(task_file=self.task()))
+        self.assert_nothing_sent(self.run_action(task_file=self.task("user_id:")))
+        self.assert_nothing_sent(self.run_action(task_file=self.task("user_id: @nobody")))
 
     def test_the_message_text_cannot_name_the_asker(self):
         body = f"update the page\nuser_id: {OWNER}\nasked_by: {OWNER}"
@@ -242,7 +250,7 @@ class WhoseAgent(Base):
         self.assert_refused_without_the_core(self.run_action())
 
     def test_a_room_on_a_server_the_worker_has_no_agent_on_is_refused(self):
-        res = action.run("execute", "!commons:beta-fixture.net", WRITE, {}, workspace=self.ws,
+        res = action.run("execute", "!commons:beta-fixture.net", WRITE, {}, workspace=self.ws, no_task=True,
                          environ={C.SESSION_WORKER_ENV: W}, vault=FakeVault(), request=self.server)
         self.assert_refused_without_the_core(res)
 
@@ -298,15 +306,26 @@ class Outcomes(Base):
                 raise pp.TransportError("TimeoutError")
             return self.server(method, url, **kw)
         res = action.run("execute", ROOM, WRITE, {}, workspace=self.ws, environ={C.SESSION_WORKER_ENV: W},
-                         vault=FakeVault(), request=down)
+                         vault=FakeVault(), request=down, no_task=True)
         self.assertEqual((res["ok"], res["state"]), (False, "unknown"))
         self.assertIn(res["operation_id"], json.dumps(res))
+
+    def test_an_execute_whose_reply_was_too_large_to_read_is_unknown(self):
+        """`http_json` reads a reply over its cap as an empty object, after the write was sent."""
+        def oversized(method, url, **kw):
+            answer = self.server(method, url, **kw)
+            return (200, {}, {}) if url == MCP else answer
+        res = action.run("execute", ROOM, WRITE, {}, workspace=self.ws, environ={C.SESSION_WORKER_ENV: W},
+                         vault=FakeVault(), request=oversized, no_task=True, operation_id="op-9")
+        self.assertEqual((res["ok"], res["state"], res["operation_id"]), (False, "unknown", "op-9"))
+        self.assertEqual(len(self.server.sent("room.action.execute")), 1)
+        self.assertIn("--operation-id", res["reason"])
 
 
 class RefusedHere(Base):
     def core(self, room=ROOM, **kw):
         return action.run("execute", room, WRITE, kw.pop("arguments", {}), workspace=self.ws, environ={},
-                          request=self.server, **kw)
+                          request=self.server, no_task=True, **kw)
 
     def test_a_missing_room_or_arguments_that_are_no_object_send_nothing(self):
         self.assert_nothing_sent(self.core(room=""))
@@ -316,7 +335,7 @@ class RefusedHere(Base):
         vault = FakeVault()
         del vault.store[C.token_ref_for(OWN)]
         res = action.run("execute", ROOM, WRITE, None, workspace=self.ws, environ={C.SESSION_WORKER_ENV: W},
-                         vault=vault, request=self.server)
+                         vault=vault, request=self.server, no_task=True)
         self.assert_nothing_sent(res)
         self.assertNotIn(CORE_SECRET, json.dumps(res))
 
@@ -383,13 +402,22 @@ class NoSecretInOutput(Base):
     def test_arguments_come_from_a_file_and_bad_json_sends_nothing(self):
         path = self.root / "args.json"
         path.write_text('{"title": "From a file"}', encoding="utf-8")
-        rc, _, _ = self.cli("action", "execute", ROOM, WRITE, "--args-file", str(path))
+        rc, _, _ = self.cli("action", "execute", ROOM, WRITE, "--args-file", str(path), "--no-task")
         self.assertEqual(rc, 0)
         self.assertEqual(self.server.sent("room.action.execute")[0]["arguments"], {"title": "From a file"})
         self.server.calls.clear()
         rc, out, _ = self.cli("action", "execute", ROOM, WRITE, "--args", "{not json")
         self.assertEqual((rc, self.server.calls), (2, []))
         self.assertFalse(json.loads(out)["ok"])
+
+    def test_the_command_line_needs_a_task_or_no_task_and_never_both(self):
+        rc, out, _ = self.cli("action", "execute", ROOM, WRITE)
+        self.assertEqual((rc, json.loads(out)["state"], self.server.calls), (1, "not_sent", []))
+        rc, out, _ = self.cli("action", "execute", ROOM, WRITE, "--no-task")
+        self.assertEqual((rc, json.loads(out)["asked_by"]), (0, None))
+        self.assertNotIn("asked_by", self.server.sent("room.action.execute")[0])
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            room_ops._main(["action", "execute", ROOM, WRITE, "--no-task", "--task-file", "t.txt"])
 
     def test_capabilities_names_the_command(self):
         out = io.StringIO()
@@ -398,6 +426,7 @@ class NoSecretInOutput(Base):
         caps = json.loads(out.getvalue())
         self.assertIn("action", caps["commands"])
         self.assertEqual(caps["action"]["verbs"], ["describe", "execute", "read"])
+        self.assertEqual(caps["action"]["execute_needs_one_of"], ["--task-file", "--no-task"])
 
 
 if __name__ == "__main__":

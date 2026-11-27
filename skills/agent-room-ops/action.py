@@ -4,7 +4,7 @@
     room_ops.py action describe <room> <action>
     room_ops.py action read     <room> <action> [--args JSON | --args-file PATH]
     room_ops.py action execute  <room> <action> [--args JSON | --args-file PATH]
-                                [--task-file TASK] [--operation-id ID]
+                                (--task-file TASK | --no-task) [--operation-id ID]
 
 Only `room.commons.*` Actions are sent. The session's relay credential is exchanged for a
 short-lived delegation and the Action runs on the server's MCP endpoint
@@ -15,9 +15,10 @@ Whose agent: the one a post from this session in that room goes out as
 (`connections.connection_for_room`, as `say` resolves it). A pool worker's session is refused
 when that is not the worker's own agent; it never falls back to the core's.
 
-For whom: an `execute` that answers a task passes `--task-file`; the person who asked is read
-from the task's own headers and sent as `asked_by`, so the server holds the write to that
-person's rights as well as the agent's. With no task there is no `asked_by`; nothing else sets it.
+For whom: an `execute` names its task with `--task-file`; the person who asked is read from the
+task's own headers and sent as `asked_by`, so the server holds the write to that person's rights
+as well as the agent's. A task that names no sender is refused. Work nobody asked for says so
+with `--no-task` and carries no `asked_by`; an execute with neither is refused.
 """
 from __future__ import annotations
 
@@ -69,9 +70,7 @@ def _owners():
 
 def requester(task_file, workspace=None) -> Optional[str]:
     """The person a task was asked by, from the headers its writer put above the body: the relay's
-    `asked_by`, else `user_id`. None for no task or a task that names nobody."""
-    if task_file is None:
-        return None
+    `asked_by`, else `user_id`. Refused for a task that cannot be read or names no room user."""
     try:
         text = Path(task_file).read_text(encoding="utf-8")
     except (OSError, UnicodeError) as e:
@@ -81,11 +80,9 @@ def requester(task_file, workspace=None) -> Optional[str]:
     from task_envelope import attested_task_headers
     headers = attested_task_headers(text, workspace).headers
     who = str(headers.get("asked_by") or headers.get("user_id") or "").strip()
-    if not who:
-        return None
-    if len(who) > ASKED_BY_MAX or not ASKED_BY_RE.fullmatch(who):
-        raise Refused("the task's sender is not a room user id (@name:server), so the write cannot be held to "
-                      "that person's rights; nothing was sent")
+    if not who or len(who) > ASKED_BY_MAX or not ASKED_BY_RE.fullmatch(who):
+        raise Refused("the task file names no sender that is a room user id (@name:server), so the write "
+                      "cannot be held to that person's rights; nothing was sent")
     return who
 
 
@@ -116,7 +113,7 @@ def credential(room_id: str, agent_mxid: Optional[str] = None, *, workspace=None
         acting = connections.room_agent_mxid(room_id, workspace=workspace, environ=environ)
     except connections.ConnectionsError as e:
         raise Refused(str(e)) from None
-    return base, bearer, acting or agent_mxid or None
+    return base, bearer, acting or None
 
 
 def _outcome(verb: str, env: Mapping[str, object], pp) -> dict:
@@ -143,6 +140,7 @@ def _outcome(verb: str, env: Mapping[str, object], pp) -> dict:
 
 
 def run(verb: str, room_id: str, action: str, arguments: Optional[dict] = None, *, task_file=None,
+        no_task: bool = False,
         agent_mxid: Optional[str] = None, operation_id: Optional[str] = None, workspace=None,
         environ: Optional[Mapping[str, str]] = None, vault=None,
         request: Optional[Callable[..., tuple]] = None, gate=None) -> dict:
@@ -160,7 +158,12 @@ def run(verb: str, room_id: str, action: str, arguments: Optional[dict] = None, 
         arguments = {} if arguments is None else arguments
         if not isinstance(arguments, dict):
             raise Refused("the Action's arguments must be a JSON object")
-        asked_by = requester(task_file, workspace) if verb == "execute" else None
+        asked_by = None
+        if verb == "execute":
+            if (task_file is None) != bool(no_task):
+                raise Refused("an execute names who it is for: --task-file <the task it answers>, or "
+                              "--no-task for work nobody asked for (never both); nothing was sent")
+            asked_by = None if no_task else requester(task_file, workspace)
         _, pp = _owners()
         relay, bearer, acting = credential(room_id, agent_mxid, workspace=workspace, environ=environ,
                                            vault=vault)
