@@ -282,9 +282,9 @@ class Tap(Remote):
             self.assertNotIn("Use " + A, [b["label"] for b in self.posted("$x")["buttons"]], "fail closed: no buttons")
         self.assertFalse(self.request().exists())
         from ag2_sparrow.adapters.claude_code import cli as cc
+        with mock.patch.object(cc.os, "walk", side_effect=OSError("x")), self.assertRaises(OSError):
+            cc.other_agents_dirs(cc.LOCAL, strict=True)
         with mock.patch.object(Path, "rglob", side_effect=OSError("x")):
-            with self.assertRaises(OSError):
-                cc.other_agents_dirs(cc.LOCAL, strict=True)
             self.assertEqual(cc.other_agents_dirs(cc.LOCAL), [], "the sign-in's own reading is as before")
 
     def test_a_peer_config_that_cannot_be_read_or_parsed_refuses_the_switch(self):
@@ -303,6 +303,29 @@ class Tap(Remote):
             (peer.rmdir() if peer.is_dir() else peer.unlink())
         (root / "peers" / "peer.conf").write_text("CLAUDE_CONFIG_DIR=%s\n" % (self.home / "elsewhere"))
         self.assertEqual(cc.other_agents_dirs(cc.LOCAL, strict=True), [str(self.home / "elsewhere")])
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root lists any directory")
+    def test_a_config_root_that_cannot_be_listed_whole_refuses_the_switch(self):
+        from ag2_sparrow.adapters.claude_code import cli as cc
+        root = cc.cm.config_root()
+        (root / "seen").mkdir(parents=True)
+        (root / "seen" / "peer.conf").write_text("CLAUDE_CONFIG_DIR=%s\n" % (self.home / "elsewhere"))
+        hidden = root / "hidden"
+        (hidden / "deeper").mkdir(parents=True)
+        (hidden / "deeper" / "peer.conf").write_text("CLAUDE_CONFIG_DIR=%s\n" % self.config)
+        hidden.chmod(0)
+        self.addCleanup(hidden.chmod, 0o700)
+        with self.assertRaises(PermissionError):
+            cc.other_agents_dirs(cc.LOCAL, strict=True)
+        self.assertEqual(cc.other_agents_dirs(cc.LOCAL), [str(self.home / "elsewhere")], "lenient: what it can")
+        self.assertEqual([b["label"] for b in self.posted("$h")["buttons"]], ["Switch account"])
+        self.assertEqual(self.use_directly("$hu", CLAUDE_CONFIG_DIR=str(self.config)), "account-refused")
+        self.assertEqual(self.queued()[-1]["card"]["text"], "Could not switch: " + ac.OTHERS_UNKNOWN)
+        self.assertFalse(self.request().exists())
+        hidden.chmod(0o700)
+        self.assertEqual(sorted(cc.other_agents_dirs(cc.LOCAL, strict=True)),
+                         sorted([str(self.home / "elsewhere"), str(self.config)]), "listed whole: every peer")
+        self.assertEqual(cc._strict_confs(self.home / "none"), [], "no config root: no other agent")
 
     def test_an_account_no_longer_saved_and_a_request_that_cannot_be_written(self):
         self.index(self.appdata, {})

@@ -706,7 +706,7 @@ def other_agents_dirs(local, strict: bool = False) -> list:
     instead of reading as no other agent (or one with no config dir)."""
     mine, found = config_path(local), []
     try:
-        paths = sorted(cm.config_root().rglob("*.conf"))
+        paths = _strict_confs(cm.config_root()) if strict else sorted(cm.config_root().rglob("*.conf"))
     except OSError:
         if strict:
             raise
@@ -716,6 +716,21 @@ def other_agents_dirs(local, strict: bool = False) -> list:
             read = cm.read_config if strict else cm.read_config_lenient
             found.append(read(path).get("CLAUDE_CONFIG_DIR") or "")
     return [d for d in found if d]
+
+
+def _strict_confs(root: Path) -> list:
+    """Every `*.conf` under `root` (what `rglob` finds, symlinked dirs not followed), raising on any directory
+    that cannot be listed: `rglob` skips one silently (Python 3.9 and later), so an incomplete listing would
+    read as fewer agents. A root that is not there is no agent."""
+    if not os.path.lexists(root):
+        return []
+
+    def refuse(e: OSError):
+        raise e
+    found = []
+    for top, dirs, files in os.walk(root, onerror=refuse, followlinks=False):
+        found += [Path(top) / n for n in dirs + files if n.endswith(".conf")]
+    return sorted(found)
 
 
 def sign_in_refused() -> str:
