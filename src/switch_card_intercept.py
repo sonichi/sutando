@@ -82,7 +82,8 @@ def request(task_text: str, workspace: Optional[Path] = None) -> Optional[dict]:
     import task_envelope
     parsed = task_envelope.attested_task_headers(task_text, workspace)
     h = parsed.headers
-    if (h.get("access_tier") or "").strip() != "owner" or (h.get("channel_kind") or "").strip() != "dm":
+    # A room (any channel kind but the DM) is taken too: there it gets IN_ROOM, never a card (in_room).
+    if (h.get("access_tier") or "").strip() != "owner" or not (h.get("channel_kind") or "").strip():
         return None
     if (h.get("interaction_type") or "message").strip() != "message" or not (h.get("channel_id") or "").strip():
         return None
@@ -94,6 +95,37 @@ def request(task_text: str, workspace: Optional[Path] = None) -> Optional[dict]:
         return None
     return {"kind": kind, "room": h["channel_id"].strip(),
             "reply_to": (h.get("source_message_id") or "").strip()}
+
+
+# No switch is made in a room with other people in it, and no card that switches is posted there: the
+# owner asking there is told so in one line, in their language, and the core never sees it.
+IN_ROOM = "Switching the account or model isn't available in a room. Please ask me in our DM."
+IN_ROOM_ZH = "房间里不能切换账号或模型，请到私聊里找我。"
+_CJK = re.compile(r"[\u3400-\u9fff]")
+
+
+def in_room(task_text: str, workspace: Optional[Path] = None) -> str:
+    """The line a request in a room is answered with ('' in the owner's DM): IN_ROOM, or IN_ROOM_ZH when
+    the owner wrote Chinese."""
+    import local_task_protocol as ltp
+    import task_envelope
+    parsed = task_envelope.attested_task_headers(task_text, workspace)
+    if (parsed.headers.get("channel_kind") or "").strip() == "dm":
+        return ""
+    _reply, words = ltp.split_reply_context(ltp.sender_words(parsed))
+    return IN_ROOM_ZH if _CJK.search(words or "") else IN_ROOM
+
+
+def say_in_room(results_dir: Path, filename: str, line: str) -> bool:
+    """The answer to a request in a room: the one line, as the task's reply in that room."""
+    import result_publish
+    try:
+        result_publish.publish_text(Path(results_dir) / filename, line + "\n")
+    except result_publish.PublishedUnconfirmed:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 def post(req: dict, workspace: Path, repo: Path = _REPO, run=subprocess.run) -> bool:
@@ -137,6 +169,13 @@ def intercept(task_file: Path, workspace: Path, results_dir: Path, repo: Path = 
         return False
     if req is None:
         return False
+    line = in_room(text, workspace)
+    if line:
+        if not say_in_room(results_dir, Path(task_file).name, line):
+            log(f"{Path(task_file).name}: the in-room line was not written; the core takes it")
+            return False
+        log(f"{Path(task_file).name}: a {req['kind']} request in a room; told to ask in the DM, no card")
+        return True
     if not post(req, workspace, repo, run):
         log(f"{Path(task_file).name}: the {req['kind']} card was not posted; the core takes it")
         return False

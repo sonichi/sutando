@@ -1464,11 +1464,12 @@ class AccountCardTest(CardWorld, unittest.TestCase):
             self.assertEqual(self.serve("task-w%d" % n, said), "[no-send] the account card answers\n", said)
             self.assertEqual(metrics(self.work)[-1]["card"], "account-card")
         self.assertEqual(len(self.posted()), 3)
-        # Another account, or the same words outside the owner's DM, is an ordinary turn.
+        # Another account is an ordinary turn; the same words in a room get the line to ask in the DM, no turn.
         self.assertNotIn("account card", self.serve("task-other", "create an account on github"))
         self.assertNotIn("card", metrics(self.work)[-1])
-        self.serve("task-room", "which account are you using?", channel="!room:s.space", kind="room")
-        self.assertNotIn("card", metrics(self.work)[-1])
+        said = self.serve("task-room", "which account are you using?", channel="!room:s.space", kind="room")
+        self.assertIn("isn't available in a room", said)
+        self.assertEqual(metrics(self.work)[-1]["card"], "card-in-room")
         self.assertEqual(self.posted(), [], "no card for either")
 
     def test_a_sign_in_page_that_is_not_an_https_address_is_never_opened_and_the_sign_in_is_given_up(self):

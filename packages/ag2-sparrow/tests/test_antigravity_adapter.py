@@ -543,8 +543,9 @@ class ConnectorTest(unittest.TestCase):
         self.w.serve()
         self.dm_task("task-3", "/model", kind="room")
         self.w.serve()
-        self.assertEqual(self.post_queued(), [], "in a shared room /model is ordinary words for agy")
-        self.assertEqual(self.w.methods().count("session/prompt"), 2)
+        self.assertEqual(self.post_queued(), [], "no card in a shared room")
+        self.assertIn("isn't available in a room", self.w.result("task-3"), "the room is told to ask in the DM")
+        self.assertEqual(self.w.methods().count("session/prompt"), 1, "and agy never sees it")
 
     def test_a_refusal_whose_card_could_not_be_queued_is_delivered_later_and_the_switch_is_not_tried_again(self):
         (self.w.home / "models").write_text("")

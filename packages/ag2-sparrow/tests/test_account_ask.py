@@ -114,7 +114,8 @@ class Desk(unittest.TestCase):
     def test_a_near_miss_anyone_else_or_another_room_goes_on_to_the_model(self):
         self.assertEqual(self.task("create an account on github"), "")
         self.assertEqual(self.task("which account are you using?", tier="team"), "")
-        self.assertEqual(self.task("which account are you using?", kind="room"), "")
+        self.assertEqual(self.task("which account are you using?", kind="room"), "card-in-room",
+                         "a room is told to ask in the DM, with no card")
         self.account.up = False
         self.assertEqual(self.task("which account are you using?"), "", "no card can be shown: the model answers")
         self.assertEqual(self.account.seen, [])
