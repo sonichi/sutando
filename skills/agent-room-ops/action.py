@@ -11,9 +11,9 @@ short-lived delegation and the Action runs on the server's MCP endpoint
 (`pool_provision.Actions`, the one client for that exchange); both tokens stay in this process's
 memory and are scrubbed from everything returned.
 
-Whose agent: a pool worker's session acts as that worker's own agent on the room's server
-(`connections.worker_mcp_credential`), and is refused when it has none; it never falls back to
-the core's. The core's session uses the credential `say` uses.
+Whose agent: the one a post from this session in that room goes out as
+(`connections.connection_for_room`, as `say` resolves it). A pool worker's session is refused
+when that is not the worker's own agent; it never falls back to the core's.
 
 For whom: an `execute` that answers a task passes `--task-file`; the person who asked is read
 from the task's own headers and sent as `asked_by`, so the server holds the write to that
@@ -38,6 +38,14 @@ TOOLS = {"describe": "room.actions.describe", "read": "room.action.read", "execu
 ASKED_BY_RE = re.compile(r"@[^\s:]+:[^\s]+")
 ASKED_BY_MAX = 255
 REPLY_MAX = 8 * 1024 * 1024
+
+
+_NOT_OWN = ("a post from this worker's session in this room goes out as the core's agent, and a Commons "
+            "Action is never sent as the core's agent; hand the write to the core, or give this worker "
+            "its own agent on the room's server")
+_NO_RECORD = ("this checkout's workspace records no connection of this worker's own, so its agent is "
+              "unknown; run the command from the install's own checkout, whose workspace holds the "
+              "connections record")
 
 
 class Refused(Exception):
@@ -83,28 +91,23 @@ def requester(task_file, workspace=None) -> Optional[str]:
 
 def credential(room_id: str, agent_mxid: Optional[str] = None, *, workspace=None,
                environ: Optional[Mapping[str, str]] = None, vault=None) -> Tuple[str, str, Optional[str]]:
-    """(relay URL, bearer, acting agent) for an Action in `room_id`. A worker's session gets its own
-    agent's or Refused; the acting agent is None only for a core install that records none."""
+    """(relay URL, bearer, acting agent) for an Action in `room_id`, resolved as a post there is. A
+    worker's session gets its own agent's or Refused; None only for a core install that records none."""
     connections, _ = _owners()
     worker = connections.session_worker(environ)
     if worker:
-        server = connections.server_of_room(room_id)
-        if not server:
-            raise Refused("the room id names no server, so this worker's own agent for it is unknown; "
-                          "nothing was sent")
         try:
-            cred = connections.worker_mcp_credential(worker, workspace=workspace, environ=environ,
-                                                     vault=vault, server=server)
+            row = connections.connection_for_room(room_id, workspace, environ)
+            acting = connections.room_agent_mxid(room_id, workspace=workspace, environ=environ)
+            if row is None or row.get("worker") != worker or not acting:
+                raise Refused(_NOT_OWN if row is not None else _NO_RECORD)
+            gateway_url, token = connections.connection_credential(row, environ, vault=vault)
         except connections.ConnectionsError as e:
             raise Refused(f"this worker's own credential is not usable ({e}); nothing was sent") from None
-        acting = cred.get("agent_id")
-        if cred.get("acts_as") != "worker" or not acting:
-            raise Refused("this worker has no agent of its own on the room's server, and a Commons "
-                          "Action is never sent as the core's agent; hand the write to the core, or "
-                          "give this worker its own agent")
         if agent_mxid and agent_mxid != acting:
             raise Refused(f"--agent names {agent_mxid}, but this worker acts as {acting}; nothing was sent")
-        return str(cred["relay"]), str(cred["bearer"]), str(acting)
+        relay = (connections.gateway_url_of(token) or gateway_url).rstrip("/")
+        return relay, connections.secret_of(token) or token.strip(), acting
     base, headers = _gateway.gateway(room_id)
     scheme, _, bearer = str(headers.get("Authorization") or "").partition(" ")
     if not base or scheme != "Bearer" or not bearer:

@@ -245,9 +245,29 @@ class WhoseAgent(Base):
         res = action.run("execute", "!commons:beta-fixture.net", WRITE, {}, workspace=self.ws,
                          environ={C.SESSION_WORKER_ENV: W}, vault=FakeVault(), request=self.server)
         self.assert_refused_without_the_core(res)
-        res = action.run("execute", "!nodomain", WRITE, {}, workspace=self.ws,
-                         environ={C.SESSION_WORKER_ENV: W}, vault=FakeVault(), request=self.server)
+
+    def test_a_checkout_whose_workspace_holds_no_record_says_so(self):
+        """A seat's command run from another checkout: the record is in the install's workspace only."""
+        empty = self.root / "other-checkout" / "workspace"
+        (empty / "state").mkdir(parents=True)
+        with mock.patch("workspace_default.resolve_workspace", return_value=empty):
+            res = action.run("describe", ROOM, WRITE, workspace=None, agent_mxid=OWN_AGENT,
+                             environ={C.SESSION_WORKER_ENV: W}, vault=FakeVault(), request=self.server)
         self.assert_refused_without_the_core(res)
+        self.assertIn("run the command from the install's own checkout", res["reason"])
+        res = self.run_action("describe", agent_mxid=OWN_AGENT)
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["acting_as"], OWN_AGENT)
+
+    def test_it_resolves_the_row_a_post_in_that_room_resolves(self):
+        rows = [row("alpha", CORE_AGENT, primary=True), row(OWN, OWN_AGENT, worker=W, dirs="own"),
+                row(C.worker_instance_for(SERVER, OTHER_W), f"@second:{SERVER}", worker=OTHER_W, dirs="own")]
+        self.record(rows)
+        posts_as = C.connection_for_room(ROOM, self.ws, {C.SESSION_WORKER_ENV: W})
+        res = self.run_action()
+        self.assertTrue(res["ok"], res)
+        self.assertEqual((posts_as["worker"], res["acting_as"]), (W, posts_as["agent_mxid"]))
+        self.assertEqual(self.server.calls[0]["bearer"], OWN_SECRET)
 
     def test_naming_another_agent_is_refused(self):
         self.assert_refused_without_the_core(self.run_action(agent_mxid=CORE_AGENT))
