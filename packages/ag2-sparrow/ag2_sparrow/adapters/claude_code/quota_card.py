@@ -176,11 +176,21 @@ def _card_words(card, limited: list, text: str, log) -> str:
     return words(limited, text, "" if who else card.using(), who)
 
 
-def new_session(root) -> None:
+def new_session(root, cfg: "dict | None" = None) -> None:
     """A session was just created (an account switch restarts it): what was told was about the session
-    before, so a limit on this one is a new incident, told again. The DM room is the claim's and stays."""
-    if load(root):
-        save(root, {})
+    before, so a limit on this one is a new incident, told again. The DM room is the claim's and stays. With
+    `cfg` (the agent's bridge), the old incident's cards still queued and not tried yet are taken back."""
+    rec = load(root)
+    if not rec:
+        return
+    if cfg is not None:
+        tasks = rec.get("tasks") if isinstance(rec.get("tasks"), dict) else {}
+        qids = [rec.get("qid")] + [e.get("qid") for e in tasks.values() if isinstance(e, dict)] + [
+            c.get("qid") for c in rec.get("covers") or [] if isinstance(c, dict)]
+        bridge = str(cb.bridge_state(cfg))
+        for qid in {q for q in qids if q}:
+            connector_cards.withdraw(bridge, qid)
+    save(root, {})
 
 
 def _limit_lines(text: str) -> list:

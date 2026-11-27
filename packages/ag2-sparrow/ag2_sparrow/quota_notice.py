@@ -138,8 +138,12 @@ class QuotaNotice:
         if kept:
             now = self.in_use()
             if now and now != kept:
+                # Nothing of it is said any more: what is still queued and not tried yet is taken back too.
+                taken = [q for q in [rec.get("qid")] + list(rec.get("queued_ids") or [])
+                         if q and self.bridge_state and connector_cards.withdraw(str(self.bridge_state), q)]
                 self.save({})
-                self.log("quota: the limit kept for another account no longer applies")
+                self.log("quota: the limit kept for another account no longer applies%s"
+                         % (" (%d queued card(s) taken back)" % len(taken) if taken else ""))
                 return {}
         return rec
 
@@ -267,7 +271,7 @@ class QuotaNotice:
             return ""
         if not now_too and at - float(rec.get("owed_tried") or 0) < RETRY_S:
             return ""
-        dm, sent, built = self.room(), [], {}
+        dm, sent, built, queued = self.room(), [], {}, []
         if card_desk.usable(self.bridge_state):
             for task, entry in owed.items():
                 to, there = entry.get("room") or dm, bool(entry.get("room"))
@@ -276,15 +280,18 @@ class QuotaNotice:
                 try:    # keyed: a card queued and not recorded is not queued a second time
                     if there not in built:
                         built[there] = self._card(rec, named=not there)
-                    connector_cards.queue(str(self.bridge_state), to, *built[there], key=entry["key"], at_ns=entry["at"])
+                    queued.append(connector_cards.queue(str(self.bridge_state), to, *built[there], key=entry["key"],
+                                                        at_ns=entry["at"]))
                 except (OSError, ValueError) as e:
                     self.log("quota card for %s not queued:" % task, "%s: %s" % (type(e).__name__, e))
                     continue
                 sent.append(task)
         told = [t for t in rec.get("tasks") or [] if isinstance(t, str)]
         rec = self.load()
+        # The queue ids are kept with the incident: a switch takes back what of it was not sent yet (current).
         self.save(dict(rec, owed={t: e for t, e in (rec.get("owed") or {}).items() if t not in sent}, owed_tried=at,
-                       tasks=(told + sent)[-TASKS_KEEP:]))
+                       tasks=(told + sent)[-TASKS_KEEP:],
+                       **({"queued_ids": (list(rec.get("queued_ids") or []) + queued)[-TASKS_KEEP:]} if queued else {})))
         reachable = dm or any(e.get("room") for e in owed.values())
         return "quota-task-card" if sent else ("quota-not-posted" if reachable else "quota-no-room")
 
@@ -323,8 +330,12 @@ class QuotaNotice:
 
     def tick(self) -> str:
         """Between turns: settle a queued card's fate, and queue again one the bridge dropped. '' when idle.
-        The account is not read here (each tick): a switch is seen by the next message's `current`."""
+        Before anything is sent or queued again, the account is read: a limit kept for an account no longer in
+        use (the owner switched) is dropped with whatever of it was owed, and nothing of it is sent."""
         rec = self.load()
+        if not rec.get("since") or (rec.get("told") and not rec.get("owed")):
+            return ""            # nothing to send: the account is not read on every idle tick
+        rec = self.current()
         if not rec.get("since"):
             return ""
         return ("" if rec.get("told") else self._deliver(rec, self.now())) or self._owed(self.now())

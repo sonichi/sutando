@@ -2787,6 +2787,61 @@ class QuotaCardTest(CardWorld, unittest.TestCase):
         self.assertEqual(self.outbox()[-1]["card"]["account_controls"], {"runtime": "codex"}, "the plain account card")
         self.assertTrue(self.serve("task-5", "hello").startswith("STUB echo"))
 
+    def test_after_a_switch_nothing_of_the_old_accounts_limit_is_sent_or_sent_again(self):
+        # Review of #6879: the idle tick re-sent an owed or dropped notice of the account before the switch, with
+        # the old reset time beside the new account's name. Nothing of it may go out once another account is in use.
+        self.sign_in("acct-a")
+        self.serve("task-1", "[[limit]] hello")
+        (first,) = self.outbox()            # queued, not posted yet
+        state = self.work / "state"
+        kept = json.loads((state / quota_notice.FILE).read_text())
+        self.assertTrue(kept["account"], "kept with the account it was recorded on")
+        account, said = [kept["account"]], []
+        mine = "id: task-2\nchannel_id: %s\nuser_id: @alice:s.space\naccess_tier: owner\ntask: again\n" % self.DM
+
+        def notice():
+            return quota_notice.QuotaNotice(state, self.bridge, "Codex", lambda text: (first["body"], first["card"]),
+                                            lambda: "", lambda *a: said.append(" ".join(map(str, a))),
+                                            now=lambda: time.time() + quota_notice.RETRY_S + 1,
+                                            account=lambda: account[0])
+
+        # A message's card that could not be queued is owed; the incident's own card is still in the outbox.
+        with mock.patch.object(connector_cards, "queue", side_effect=OSError("disk full")):
+            notice().hit(task="task-2", task_text=mine)
+        self.assertEqual(notice().owed(), ["task-2"])
+        account[0] = "another account"      # the owner switched; no message comes after it
+        self.assertEqual(notice().tick(), "")
+        self.assertEqual(self.outbox(), [], "the queued card was taken back, the owed one never queued")
+        self.assertEqual(json.loads((state / quota_notice.FILE).read_text()), {})
+        self.assertIn("1 queued card(s) taken back", " ".join(said))
+        self.assertEqual(self.posted(), [])
+        # A notice owed for want of a DM room, then the room seen after the switch: not sent either.
+        account[0] = "acct-a"
+        (state / quota_notice.ROOM_FILE).unlink()
+        self.assertEqual(notice().hit("3:05 PM"), "quota-no-room")
+        (state / quota_notice.ROOM_FILE).write_text(json.dumps({"room": self.DM}))
+        account[0] = "another account"
+        self.assertEqual(notice().tick(), "")
+        self.assertEqual(self.outbox(), [])
+        # One the bridge dropped is not queued again for an account no longer in use.
+        account[0] = "acct-a"
+        self.assertEqual(notice().hit("3:05 PM"), "quota-card")
+        (sent,) = self.outbox()
+        for p in (self.bridge / "agent-cards" / "outbox").iterdir():
+            p.unlink()                      # gone from the outbox with no record: past its deadline, dropped
+        rec = json.loads((state / quota_notice.FILE).read_text())
+        (state / quota_notice.FILE).write_text(json.dumps(dict(rec, queued=0)))
+        account[0] = "another account"
+        self.assertEqual(notice().tick(), "")
+        self.assertEqual(self.outbox(), [])
+        # A card whose send was already tried stands: it is not taken back.
+        account[0] = "acct-a"
+        notice().hit("3:05 PM")
+        (entry,) = (self.bridge / "agent-cards" / "outbox").iterdir()
+        entry.write_text(json.dumps(dict(json.loads(entry.read_text()), attempted=True)))
+        self.assertFalse(connector_cards.withdraw(self.bridge, entry.stem))
+        self.assertFalse(connector_cards.withdraw(self.bridge, "not-a-queue-id"))
+
     def test_a_limit_kept_for_another_account_is_not_this_ones(self):
         self.sign_in("acct-b")
         state = self.work / "state"

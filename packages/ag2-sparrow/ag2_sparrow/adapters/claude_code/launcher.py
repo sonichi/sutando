@@ -515,7 +515,7 @@ class Launcher:
     def new_quota_incident(self) -> None:
         """A session being created (an account switch restarts it) may be on an account at its limit too."""
         try:
-            quota_card.new_session(self.root)
+            quota_card.new_session(self.root, self.cfg)
         except Exception as e:  # noqa: BLE001 - advisory
             self.log("quota: new session not recorded (%s: %s)" % (type(e).__name__, str(e)[:120]))
 

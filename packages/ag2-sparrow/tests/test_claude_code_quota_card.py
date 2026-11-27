@@ -470,6 +470,18 @@ class LimitMenu(NoticeBase):
         self.assertEqual(self.tick(STARTUP_MENU, 5.0), "quota-card")
         self.assertEqual(len(self.queued()), 2)
 
+    def test_an_account_switch_takes_back_the_old_limits_cards_not_sent_yet(self):
+        # Review of #6879: nothing of the account before the switch is sent once the new session runs.
+        quota_card.remember_room(self.root, DM)
+        self.assertEqual(self.tick(STARTUP_MENU), "quota-card")
+        self.at[0] += 5.0                   # a message sent after that card: it gets its own
+        self.task("task-w", "are you there?")
+        self.assertEqual(self.tick(STARTUP_MENU, 1.0), "quota-task-card x1")
+        self.assertEqual(len(self.queued()), 2)
+        launcher.Launcher.new_quota_incident(types.SimpleNamespace(root=self.root, cfg=self.cfg, log=self.logs.append))
+        self.assertEqual((self.queued(), quota_card.load(self.root)), ([], {}), "both taken back, the incident over")
+        self.assertEqual(self.sweep(self.at[0]), [], "the bridge posts nothing of it")
+
     def test_only_the_owners_own_unanswered_messages_get_it(self):
         quota_card.remember_room(self.root, DM)
         self.task("task-g", "hi", tier="guest")
@@ -706,7 +718,7 @@ class Supervisor(unittest.TestCase):
         lc, logs = self.lc()
         with mock.patch.object(quota_card, "new_session") as new:
             launcher.Launcher.new_quota_incident(lc)
-        new.assert_called_once_with("/r")
+        new.assert_called_once_with("/r", {})
         self.assertEqual(logs, [])
         with mock.patch.object(quota_card, "new_session", side_effect=OSError("ro")):
             launcher.Launcher.new_quota_incident(lc)
