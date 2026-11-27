@@ -216,6 +216,7 @@
 6 tests/connections-cli.test.py
 18 tests/connections-lane-keeper.test.py
 1 tests/connections-mcp-lanes.test.py
+1 tests/connections-moved-mcp-servers.test.py
 1 tests/connections-no-cloud-trust.test.py
 1 tests/connections-room-routing.test.py
 5 tests/connections-worker-identity.test.py

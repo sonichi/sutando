@@ -64,6 +64,10 @@
                                (stdout only; exit 1 refused; the core's token never)
   worker-mcp-credential-argv --worker ID --repo DIR [--python PY]
                                the JSON argv a worker seat exports as AG2_MCP_WORKER_CREDENTIAL
+  moved-mcp-servers [--mcp-config PATH]
+                               one line per Claude Code MCP entry that connects straight to a server
+                               that moved, naming the entry, the successor and the remove command
+                               (nothing when there is none; always exit 0)
   primary                      the primary row's instance ('' = the legacy bridge); exit 2 when none
   enabled                      each row a bridge serves (neither disabled nor parked), one instance per
                                line ('' = the legacy bridge); exit 1 when there is none
@@ -385,6 +389,16 @@ def cmd_worker_mcp_credential_argv(args) -> int:
     return 0
 
 
+def cmd_moved_mcp_servers(args) -> int:
+    """One line per Claude Code MCP entry on a server that moved; the config is only read."""
+    for e in connections.moved_mcp_servers(args.mcp_config):
+        name = json.dumps(e["name"])
+        to = f"{e['successor']} ({e['mcp_url']})" if e["mcp_url"] else e["successor"]
+        print(f"MCP server {name} connects to {e['server']}, which moved to {to}; it will not connect. "
+              f"Remove it with: claude mcp remove --scope user {name}")
+    return 0
+
+
 def cmd_launch_plan(args) -> int:
     for e in connections.launch_plan(os.environ, workspace=args.workspace):
         print(f"{e['instance']}\t{e['token_ref']}\t{e['channel_dir']}\t{1 if e['primary'] else 0}")
@@ -473,6 +487,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(fn=cmd_worker_mcp_credential_argv)
     s = sub.add_parser("lane-mcp-credential"); s.add_argument("--lane", required=True)
     s.set_defaults(fn=cmd_lane_mcp_credential)
+    s = sub.add_parser("moved-mcp-servers")
+    s.add_argument("--mcp-config", type=Path, default=None, help="the Claude Code config (default: discovered)")
+    s.set_defaults(fn=cmd_moved_mcp_servers)
     sub.add_parser("primary").set_defaults(fn=cmd_primary)
     sub.add_parser("enabled").set_defaults(fn=cmd_enabled)
     s = sub.add_parser("sync-mcp-lanes"); s.add_argument("--json", action="store_true")

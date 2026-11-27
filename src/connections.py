@@ -4741,6 +4741,27 @@ def _claude_config_servers(mcp_config: Optional[Path]):
         return {}
 
 
+def moved_mcp_servers(mcp_config: Optional[Path] = None, space_of=None) -> "list[dict]":
+    """Claude Code MCP entries (`mcp_config`, default `<claude home>/.claude.json`) whose `url` is the
+    MCP endpoint of a server that moved, in entry order: [{name, server, successor, mcp_url}], `mcp_url`
+    the successor's endpoint ('' when it registers none). Such an entry is refused on every connect; a
+    proxy entry is not listed, its descriptor being what `repoint_mcp_descriptor` moves."""
+    out = []
+    servers = _claude_config_servers(mcp_config)
+    for name, entry in servers.items() if isinstance(servers, Mapping) else []:
+        url = entry.get("url") if isinstance(entry, Mapping) else None
+        host = host_of_url(url) if isinstance(url, str) else ""
+        space = _space(host, space_of) if host else None
+        server = str(getattr(space, "server", "") or "")
+        if not server or host != host_of_url(str(getattr(space, "mcp_url", "") or "")):
+            continue
+        successor = successor_server(server, space_of)
+        if successor:
+            out.append({"name": str(name), "server": server, "successor": successor,
+                        "mcp_url": str(getattr(_space(successor, space_of), "mcp_url", "") or "")})
+    return out
+
+
 def _codex_config_path(environ: Mapping[str, str]) -> Optional[Path]:
     """`config.toml` of the Codex home: `CODEX_HOME`, else the codex `core_config_dirs` entry."""
     home = (environ.get("CODEX_HOME") or "").strip()

@@ -11,3 +11,12 @@ worker_mcp_credential() {
   rm -f "$err"
   printf '%s\n' "$out"
 }
+
+# worker_mcp_moved_servers REPO PYTHON [CLAUDE_CONFIG_DIR] warns, one line each, about the seat's MCP
+# entries that connect to a server that moved; it never fails the launch and never edits the config.
+worker_mcp_moved_servers() {
+  local repo="$1" py="$2" ccd="${3:-}" line
+  "${py:-python3}" "$repo/scripts/connections.py" moved-mcp-servers ${ccd:+--mcp-config "$ccd/.claude.json"} 2>/dev/null \
+    | while IFS= read -r line; do [ -z "$line" ] || echo "  ⚠ $line" >&2; done
+  return 0
+}

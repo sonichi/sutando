@@ -691,6 +691,13 @@ enabled identity whose token cannot be read (`no_token`, exit 1), answers every 
 refusal rather than mint as the core. A Codex worker's proxy inherits no environment, so it does
 not yet take this path.
 
+A seat's Claude config can also hold an MCP entry that connects straight to a server (`url`, no
+proxy). When that server has moved, the entry is refused on every connect, and the move re-points
+only the proxy's descriptor. `scripts/connections.py moved-mcp-servers`
+(`connections.moved_mcp_servers`) lists such entries with the successor's endpoint and the
+`claude mcp remove` command; the Claude worker launcher prints one warning per entry when the seat
+starts, and never edits the config.
+
 The proxy decides whom it acts as once, when the seat starts. A worker given its own agent while
 its seat runs keeps acting as the core's, and once the worker's credential exists every call
 fails with "descriptor changed during the call": the identity changed under the seat, and the fix

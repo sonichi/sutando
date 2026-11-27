@@ -96,6 +96,7 @@
 7 tests/skills/worker-pool/launch-worker-session-forwards-mcp-credential.test.sh
 4 tests/skills/worker-pool/launch-worker-session-forwards-worker-id.test.sh
 15 tests/skills/worker-pool/launch-worker-session-proxy-routing.test.sh
+1 tests/skills/worker-pool/launch-worker-session-warns-moved-mcp-server.test.sh
 6 tests/skills/worker-pool/worker-watcher-supervisor.test.sh
 5 tests/skills/worker-pool/worker-writes-its-beat.test.sh
 6 tests/start-cli-bash-timeout-ceiling.test.sh
