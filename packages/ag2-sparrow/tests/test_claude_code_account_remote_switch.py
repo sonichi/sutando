@@ -20,7 +20,7 @@ from test_claude_code_account_card import Base, DM  # noqa: E402
 from claude_code_fixtures import cli  # noqa: E402
 
 from ag2_sparrow import connector_cards  # noqa: E402
-from ag2_sparrow.adapters.claude_code import account as accounts, account_card as ac  # noqa: E402
+from ag2_sparrow.adapters.claude_code import account as accounts, account_card as ac, account_remote as rm  # noqa: E402
 
 AGENT = "@bot:s.space"
 A, B, SARAH = "ann@example.com", "bob@example.com", "sarah@example.com"
@@ -42,7 +42,7 @@ class Remote(Base):
         p.start()
         self.addCleanup(p.stop)
         self.spawned = []
-        p = mock.patch.object(ac, "_popen", lambda argv, **kw: self.spawned.append(argv))
+        p = mock.patch.object(rm, "_popen", lambda argv, **kw: self.spawned.append(argv))
         p.start()
         self.addCleanup(p.stop)
 
@@ -71,7 +71,34 @@ class Remote(Base):
         return self.claim(self.task(task_id, words, reply_to=event, click={"card_id": card_id, "action": words}, **kw))
 
     def request(self):
-        return self.config / ac.REQUEST
+        return self.config / rm.REQUEST
+
+    def nonce(self):
+        return json.loads(self.request().read_text())["nonce"]
+
+    def claim_it(self, nonce):
+        """The app takes the request: renamed to its in-progress marker."""
+        self.request().rename(self.config / (rm.CLAIMED % nonce))
+
+    def result(self, nonce, **data):
+        (self.config / (rm.RESULT % nonce)).write_text(json.dumps(dict({"v": 2, "nonce": nonce}, **data)))
+        (self.config / (rm.CLAIMED % nonce)).unlink(missing_ok=True)
+
+    def clear_outbox(self):
+        for p in self.bridge.joinpath(*connector_cards.OUTBOX).glob("*.json"):
+            p.unlink()
+
+    def begun(self):
+        """A tap on a fresh card that asked the app to switch to A; its nonce."""
+        self.posted()
+        self.taps = getattr(self, "taps", 0) + 1
+        rc, out = self.tap("task-u%d" % self.taps, "Use " + A)
+        self.assertIn("(account-switching)", out["refused"])
+        self.clear_outbox()
+        return self.nonce()
+
+    def texts(self):
+        return [(q.get("edit"), q["card"]["text"]) for q in self.queued()]
 
 
 class Offer(Remote):
@@ -127,7 +154,7 @@ class Offer(Remote):
 
 
 class Tap(Remote):
-    def test_a_tap_writes_the_apps_request_owner_only_and_shows_switching_in_place(self):
+    def test_a_tap_writes_the_apps_v2_request_owner_only_and_shows_switching_in_place(self):
         self.posted()
         rc, out = self.tap("task-u", "Use " + A)
         self.assertEqual(rc, 1)
@@ -135,17 +162,53 @@ class Tap(Remote):
         self.assertEqual(stat.S_IMODE(self.request().stat().st_mode), 0o600)
         req = json.loads(self.request().read_text())
         self.assertEqual(sorted(req), ["at", "key", "nonce", "v"])
-        self.assertEqual((req["v"], req["key"]), (1, ac.saved_key(A)))
-        self.assertTrue(ac.NONCE_RE.fullmatch(req["nonce"]))
+        self.assertEqual((req["v"], req["key"]), (2, ac.saved_key(A)))
+        self.assertTrue(rm.NONCE_RE.fullmatch(req["nonce"]))
         self.assertIsInstance(req["at"], int)
-        self.assertEqual([p.name for p in self.config.iterdir()], [ac.REQUEST], "no temp file left")
-        queued, = self.queued()
-        self.assertEqual((queued["edit"], queued["card"]["text"], queued["card"]["id"]),
-                         ("$acct", "Switching to %s…" % A, ac.account_switch.NOTE))
+        self.assertEqual([p.name for p in self.config.iterdir()], [rm.REQUEST], "no temp file left")
+        self.assertEqual(self.texts(), [("$acct", "Switching to %s…" % A)])
+        self.assertEqual(self.queued()[0]["card"]["id"], ac.account_switch.NOTE)
         argv, = self.spawned
         self.assertEqual(argv[-5:], ["await", "--root", self.root, "--nonce", req["nonce"]])
-        pending = Path(self.root) / "state" / ac.PENDING / (req["nonce"] + ".json")
-        self.assertEqual(stat.S_IMODE(pending.stat().st_mode), 0o600)
+        rec = rm.folder(self.root) / (req["nonce"] + ".json")
+        self.assertEqual(stat.S_IMODE(rec.stat().st_mode), 0o600)
+        self.assertEqual({k: rm.load(self.root, req["nonce"])[k] for k in ("label", "room", "edit")},
+                         {"label": A, "room": DM, "edit": "$acct"})
+
+    def test_a_second_tap_while_one_is_outstanding_is_refused_and_writes_nothing(self):
+        first = self.begun()
+        self.posted("$second")
+        rc, out = self.tap("task-2", "Use " + B, event="$second")
+        self.assertIn("(account-busy)", out["refused"])
+        self.assertEqual(self.texts(), [("$second", rm.BUSY)])
+        self.assertEqual(self.nonce(), first, "the first request is untouched")
+        self.assertEqual([r["nonce"] for r in rm.outstanding(self.root)], [first])
+        self.claim_it(first)        # claimed by the app: still one outstanding
+        self.clear_outbox()
+        self.posted("$third")
+        rc, out = self.tap("task-3", "Use " + B, event="$third")
+        self.assertIn("(account-busy)", out["refused"])
+        self.assertFalse(self.request().exists())
+        self.assertEqual(len(self.spawned), 1)
+
+    def test_a_request_or_claim_left_by_anything_else_also_blocks(self):
+        self.request().write_text("{}")
+        self.assertIsNone(rm.publish(self.root, self.config, "k", A, DM, "$x", str(self.bridge)))
+        self.request().unlink()
+        (self.config / (rm.CLAIMED % "other")).write_text("{}")
+        self.assertIsNone(rm.publish(self.root, self.config, "k", A, DM, "$x", str(self.bridge)))
+        self.assertEqual(rm.outstanding(self.root), [])
+
+    def test_the_exclusive_create_lets_only_one_writer_win(self):
+        rm.write_request(self.config, "a" * 16, "11111111-1111-4111-8111-111111111111", 1)
+        with self.assertRaises(FileExistsError):
+            rm.write_request(self.config, "b" * 16, "22222222-2222-4222-8222-222222222222", 2)
+        self.assertEqual(rm.request_nonce(self.config), "11111111-1111-4111-8111-111111111111")
+        self.assertEqual(sorted(p.name for p in self.config.iterdir()), [rm.REQUEST], "the loser leaves no temp file")
+        self.request().unlink()
+        with mock.patch.object(rm, "write_request", side_effect=FileExistsError("raced")), self.assertRaises(OSError):
+            rm.publish(self.root, self.config, "k", A, DM, "$x", str(self.bridge))
+        self.assertEqual(rm.outstanding(self.root), [], "a lost race keeps nothing")
 
     def refused(self, rc, task_id):
         self.assertEqual(rc, 1)
@@ -168,19 +231,18 @@ class Tap(Remote):
         self.refused(rc, "task-5")
         rc, _ = self.tap("task-6", "Use " + A, card_id="model-switch")
         self.refused(rc, "task-6")
-        card = ac.AccountCard(self.root, self.cfg(), lambda path, body: self.said.append(body), print)
-        self.said = []
+        said = []
+        card = ac.AccountCard(self.root, self.cfg(), lambda path, body: said.append(body), print)
         sent = {"channel_id": DM, "reply_to_event": "$nothere"}
         self.assertEqual(card.tapped(ac.saved_key(A), sent, "x"), "account-unknown")
         self.assertEqual(card.tapped(ac.saved_key(SARAH), dict(sent, reply_to_event="$acct"), "x"), "account-unknown")
         self.assertEqual(card.tapped(ac.saved_key(A), {"channel_id": DM}, "x"), "account-unknown")
-        self.assertIn(ac.UNMATCHED, self.said[0])
+        self.assertIn(ac.UNMATCHED, said[0])
         self.assertFalse(self.request().exists())
 
     def use_directly(self, **over):
         self.configure(BRIDGE_STATE_DIR=str(self.bridge), AGENT_ID=AGENT, **over)
-        cfg = self.cfg()
-        card = ac.AccountCard(self.root, cfg, lambda *a: None, print)
+        card = ac.AccountCard(self.root, self.cfg(), lambda *a: None, print)
         _, issued = connector_cards._core()
         built = card.card("pending", "x", ask=True)[1]
         built["buttons"].insert(0, {"label": "Use " + A, "kind": "reply", "reply": "Use " + A,
@@ -208,87 +270,197 @@ class Tap(Remote):
         self.assertEqual(self.use_directly(CLAUDE_CONFIG_DIR=str(self.config)), "account-not-saved")
         self.assertEqual(self.queued()[-1]["card"]["text"], ac.NOT_SAVED)
         self.index(self.appdata, {ac.saved_key(A): A})
-        with mock.patch.object(ac, "write_request", side_effect=OSError("read-only")):
+        with mock.patch.object(rm, "write_request", side_effect=OSError("read-only")):
             self.assertEqual(self.use_directly(CLAUDE_CONFIG_DIR=str(self.config)), "account-not-asked")
         self.assertIn("could not be written", self.queued()[-1]["card"]["text"])
-        with mock.patch.object(ac.os, "replace", side_effect=OSError("x")), self.assertRaises(OSError):
-            ac.write_request(self.config, ac.saved_key(A))
+        self.assertEqual(rm.outstanding(self.root), [])
+        with mock.patch.object(rm.os, "link", side_effect=OSError("x")), self.assertRaises(OSError):
+            rm.write_request(self.config, ac.saved_key(A), "33333333-3333-4333-8333-333333333333", 0)
         self.assertEqual(list(self.config.iterdir()), [], "the half-written request is removed")
 
     def test_a_watcher_that_cannot_start_is_said(self):
-        with mock.patch.object(ac, "_popen", side_effect=OSError("no fork")):
+        with mock.patch.object(rm, "_popen", side_effect=OSError("no fork")):
             self.assertEqual(self.use_directly(CLAUDE_CONFIG_DIR=str(self.config)), "account-switching")
         self.assertIn("won't confirm here", self.queued()[-1]["card"]["text"])
 
 
-class Answer(Remote):
-    def begun(self):
-        self.posted()
-        self.taps = getattr(self, "taps", 0) + 1
-        self.tap("task-u%d" % self.taps, "Use " + A)
-        for p in self.bridge.joinpath(*connector_cards.OUTBOX).glob("*.json"):
-            p.unlink()
-        return json.loads(self.request().read_text())["nonce"]
-
-    def result(self, **data):
-        (self.config / ac.RESULT).write_text(json.dumps(dict({"v": 1}, **data)))
-
-    def test_switched_and_could_not_switch_are_shown_in_place_and_the_answer_taken(self):
-        nonce = self.begun()
-        self.result(nonce=nonce, ok=True, label=A + " (max)", error=None)
-        self.assertEqual(ac.await_answer(self.root, nonce, sleep=lambda s: None), "Switched to %s." % A)
-        self.assertFalse((self.config / ac.RESULT).exists())
-        queued, = self.queued()
-        self.assertEqual((queued["edit"], queued["card"]["state"]), ("$acct", "done"))
-        self.assertFalse((Path(self.root) / "state" / ac.PENDING / (nonce + ".json")).exists())
-        self.assertEqual(ac.await_answer(self.root, nonce), "", "told once")
-        nonce = self.begun()
-        self.result(nonce=nonce, ok=False, error="the saved sign-in\nhas expired")
-        self.assertEqual(ac.await_answer(self.root, nonce), "Could not switch: the saved sign-in has expired")
-        self.assertEqual(ac.told({"ok": False}, A), ("error", "Could not switch: the app gave no reason"))
-        self.assertEqual(ac.told({"ok": True}, A), ("done", "Switched to %s." % A))
-
-    def test_no_answer_in_90_seconds_is_said_and_the_request_withdrawn(self):
-        nonce = self.begun()
-        self.result(nonce="00000000-0000-4000-8000-000000000000", ok=True, label=B)
-        now = [0.0]
+class Watch(Remote):
+    def clock(self, start):
+        now = [start]
 
         def sleep(s):
             now[0] += s
-        words = ac.await_answer(self.root, nonce, sleep=sleep, clock=lambda: now[0], log=print)
-        self.assertEqual(words, "Could not switch: " + ac.NO_ANSWER)
-        self.assertGreaterEqual(now[0], ac.AWAIT_S)
-        self.assertFalse(self.request().exists(), "a late app does not switch unseen")
-        self.assertTrue((self.config / ac.RESULT).exists(), "another request's answer is left for its watcher")
-        self.assertEqual(self.queued()[-1]["card"]["text"], "Could not switch: " + ac.NO_ANSWER)
+        return sleep, (lambda: now[0])
 
-    def test_odd_files_and_nonces_are_not_answers(self):
+    def test_switched_and_could_not_switch_are_told_in_place_and_the_receipt_taken(self):
         nonce = self.begun()
-        self.assertIsNone(ac.answer(self.config, nonce), "no answer yet")
-        (self.config / ac.RESULT).write_text("not json")
-        self.assertIsNone(ac.answer(self.config, nonce))
-        (self.config / ac.RESULT).write_text("[]")
-        self.assertIsNone(ac.answer(self.config, nonce))
+        self.claim_it(nonce)
+        self.result(nonce, ok=True, label=A + " (max)")
+        self.assertEqual(rm.watch(self.root, nonce, sleep=lambda s: None), "Switched to %s." % A)
+        self.assertEqual(list(self.config.iterdir()), [], "the receipt is taken")
+        self.assertEqual(self.texts(), [("$acct", "Switched to %s." % A)])
+        self.assertEqual(self.queued()[0]["card"]["state"], "done")
+        self.assertEqual(rm.outstanding(self.root), [])
+        self.assertEqual(rm.watch(self.root, nonce), "", "told once")
+        self.clear_outbox()
+        nonce = self.begun()
+        self.claim_it(nonce)
+        self.result(nonce, ok=False, error="the saved sign-in\nhas expired")
+        self.assertEqual(rm.watch(self.root, nonce), "Could not switch: the saved sign-in has expired")
+        self.assertEqual(rm.told({"ok": False}, A), ("error", "Could not switch: the app gave no reason"))
+        self.assertEqual(rm.told({"ok": True}, A), ("done", "Switched to %s." % A))
+
+    def test_a_result_for_a_different_nonce_is_ignored(self):
+        nonce = self.begun()
+        other = "44444444-4444-4444-8444-444444444444"
+        self.result(other, ok=True, label=B)
+        (self.config / (rm.RESULT % nonce)).write_text(json.dumps({"v": 2, "nonce": other, "ok": True, "label": B}))
+        self.assertEqual(rm.take_result(self.config, nonce)["ok"], False, "a receipt naming another nonce is no success")
+        self.assertTrue((self.config / (rm.RESULT % other)).exists(), "another request's receipt is left alone")
+        self.assertIsNone(rm.take_result(self.config, nonce))
+        (self.config / (rm.RESULT % nonce)).write_text("not json")
+        self.assertEqual(rm.take_result(self.config, nonce)["error"], "the app's answer could not be read")
+        self.assertEqual(rm._watch(self.root, "66666666-6666-4666-8666-666666666666", None, None, print), "",
+                         "a switch settled meanwhile is not told again")
+
+    def test_unclaimed_after_90_seconds_is_withdrawn_only_while_it_is_its_own(self):
+        nonce = self.begun()
+        at = rm.load(self.root, nonce)["at"]
+        sleep, clock = self.clock(at)
+        self.assertEqual(rm.watch(self.root, nonce, sleep=sleep, clock=clock), rm.UNCLAIMED)
+        self.assertGreaterEqual(clock(), at + rm.UNCLAIMED_S)
+        self.assertFalse(self.request().exists())
+        self.assertEqual(self.texts(), [("$acct", rm.UNCLAIMED)])
+        self.assertEqual(rm.outstanding(self.root), [])
+        other = "55555555-5555-4555-8555-555555555555"
+        rm.write_request(self.config, "a" * 16, other, 0)
+        self.assertFalse(rm.withdraw(self.config, nonce), "another nonce's request is not taken")
+        with mock.patch.object(rm.os, "link", side_effect=FileExistsError("newer")):
+            self.assertFalse(rm.withdraw(self.config, nonce))
+        self.assertFalse(self.request().exists(), "nothing newer is ever overwritten")
+        rm.write_request(self.config, "a" * 16, other, 0)
+        self.assertEqual(rm.request_nonce(self.config), other)
         self.request().write_text("not json")
-        self.assertEqual(ac.await_answer(self.root, nonce, sleep=lambda s: None, clock=iter([0, 0, 999]).__next__),
-                         "Could not switch: " + ac.NO_ANSWER)
-        self.assertTrue(self.request().exists(), "a request that is not this one's is left")
-        self.assertEqual(ac.await_answer(self.root, "../x"), "")
-        bad = Path(self.root) / "state" / ac.PENDING / (nonce + ".json")
-        bad.write_text("not json")
-        self.assertEqual(ac.await_answer(self.root, nonce), "")
-        with mock.patch.object(ac.card_desk, "post", return_value=False):
-            nonce = self.begun()
-            self.result(nonce=nonce, ok=True, label=A)
-            self.assertEqual(ac.await_answer(self.root, nonce, log=lambda *a: None), "Switched to %s." % A)
+        self.assertFalse(rm.withdraw(self.config, nonce))
+        self.assertEqual(rm.request_nonce(self.config), "")
+        self.request().unlink()
+        self.assertFalse(rm.withdraw(self.config, nonce), "claimed meanwhile")
 
-    def test_the_detached_step_runs_by_its_command(self):
+    def test_claimed_past_90_seconds_is_in_progress_never_failed_then_untold_and_kept(self):
         nonce = self.begun()
-        self.result(nonce=nonce, ok=True, label=A)
+        self.claim_it(nonce)
+        at = rm.load(self.root, nonce)["at"]
+        sleep, clock = self.clock(at)
+        said = rm.watch(self.root, nonce, sleep=sleep, clock=clock)
+        self.assertEqual(said, rm.UNTOLD)
+        self.assertEqual([t for _, t in self.texts()], [rm.WORKING % A, rm.UNTOLD])
+        self.assertFalse(any("Could not" in t for _, t in self.texts()), "never reported failed")
+        rec, = rm.outstanding(self.root)
+        self.assertTrue(rec["gave_up"], "the nonce is kept for a late result")
+        self.assertEqual(rm.recover(self.root), 0, "a watcher that gave up is not restarted")
+
+    def test_a_late_result_is_told_on_the_next_card_after_the_watcher_gave_up(self):
+        nonce = self.begun()
+        self.claim_it(nonce)
+        rm.save(self.root, dict(rm.load(self.root, nonce), gave_up=True))
+        self.result(nonce, ok=True, label=A)
+        self.clear_outbox()
+        rc, out = self.claim(self.task("task-late", "/account"))
+        self.assertIn("(account-card)", out["refused"])
+        told, fresh = self.texts()
+        self.assertEqual(told, ("$acct", "Switched to %s." % A), "told in place of the card tapped, first")
+        self.assertIsNone(fresh[0], "then the new card")
+        self.assertEqual(rm.outstanding(self.root), [])
+
+    def test_a_late_result_is_told_on_the_next_tap_which_then_goes_ahead(self):
+        nonce = self.begun()
+        self.claim_it(nonce)
+        rm.save(self.root, dict(rm.load(self.root, nonce), gave_up=True))
+        self.result(nonce, ok=False, error="locked")
+        self.clear_outbox()
+        new = rm.publish(self.root, self.config, ac.saved_key(B), B, DM, "$b", str(self.bridge))
+        self.assertTrue(new and new != nonce)
+        self.assertEqual(self.texts(), [("$acct", "Could not switch: locked")])
+
+    def test_a_request_the_app_no_longer_holds_in_any_form_is_settled(self):
+        nonce = self.begun()
+        self.request().unlink()
+        self.assertEqual(rm.reconcile(self.root), [rm.UNTOLD])
+        self.assertEqual(rm.outstanding(self.root), [])
+        nonce = self.begun()
+        rm.save(self.root, dict(rm.load(self.root, nonce), gave_up=True))
+        self.request().unlink()
+        self.clear_outbox()
+        self.assertEqual(rm.reconcile(self.root), [], "one already said untold is dropped quietly")
+        nonce = self.begun()
+        self.request().unlink()
+        self.assertEqual(rm.watch(self.root, nonce), rm.UNTOLD, "the watcher too")
+        nonce = self.begun()
+        with mock.patch.object(rm, "take_result", side_effect=[None, {"nonce": nonce, "ok": True, "label": A}]):
+            self.request().unlink()
+            self.assertEqual(rm.reconcile(self.root), ["Switched to %s." % A], "written as the claim went")
+        nonce = self.begun()
+        self.request().unlink()
+        with mock.patch.object(rm, "take_result", side_effect=[None, {"nonce": nonce, "ok": True, "label": A}]):
+            self.assertEqual(rm.watch(self.root, nonce), "Switched to %s." % A)
+
+    def test_restart_recovery_starts_a_watcher_for_an_outstanding_nonce(self):
+        nonce = self.begun()
+        self.spawned.clear()
+        self.assertEqual(rm.recover(self.root), 1)
+        argv, = self.spawned
+        self.assertEqual(argv[-2:], ["--nonce", nonce])
+        fd = rm.os.open(str(rm.folder(self.root) / (nonce + ".lock")), rm.os.O_RDWR)
+        self.addCleanup(rm.os.close, fd)
+        self.assertTrue(rm.try_lock_fd(fd))
+        held = rm.watch(self.root, nonce)      # flock is per open file: a second open conflicts
+        self.assertEqual(held, "", "a second watcher leaves it to the first")
+        self.assertEqual(rm.recover(self.root), 0, "a live watcher is not doubled")
+        self.assertTrue(rm.watcher_alive(self.root, nonce))
+        self.assertEqual(rm.reconcile(self.root), [], "a watched switch is the watcher's to tell")
+
+    def test_odd_records_and_the_detached_command(self):
+        self.assertIsNone(rm.load(self.root, "../x"))
+        self.assertEqual(rm.watch(self.root, "../x"), "")
+        nonce = self.begun()
+        (rm.folder(self.root) / (nonce + ".json")).write_text("not json")
+        self.assertIsNone(rm.load(self.root, nonce))
+        self.assertEqual(rm.outstanding(self.root), [])
+        rm.drop(self.root, nonce)
+        self.request().unlink()
+        nonce = self.begun()
+        self.claim_it(nonce)
+        self.result(nonce, ok=True, label=A)
         with mock.patch("builtins.print") as said:
-            self.assertEqual(ac.main(["await", "--root", self.root, "--nonce", nonce]), 0)
-            self.assertEqual(ac.main(["await", "--root", self.root, "--nonce", nonce]), 0)
-        self.assertEqual([c.args[0] for c in said.call_args_list], ["Switched to %s." % A, "no such request"])
+            self.assertEqual(rm.main(["await", "--root", self.root, "--nonce", nonce]), 0)
+            self.assertEqual(rm.main(["await", "--root", self.root, "--nonce", nonce]), 0)
+        self.assertEqual([c.args[0] for c in said.call_args_list], ["Switched to %s." % A, "nothing to watch"])
+        with mock.patch.object(rm.card_desk, "post", return_value=False):
+            nonce = self.begun()
+            self.result(nonce, ok=True, label=A)
+            self.request().unlink()
+            self.assertEqual(rm.watch(self.root, nonce, log=lambda *a: None), "Switched to %s." % A)
+        self.assertEqual(rm.outstanding(self.home / "none"), [])
+        self.assertFalse(rm.claimed_any(self.home / "none"))
+        with mock.patch.object(rm.os, "open", side_effect=OSError("x")):
+            self.assertFalse(rm.watcher_alive(self.root, nonce))
+        with mock.patch.object(ac.remote, "reconcile", side_effect=OSError("ro")):
+            self.posted("$ro")
+
+    def test_the_supervisor_restarts_a_dead_watcher_every_so_often_and_never_stops_over_it(self):
+        from ag2_sparrow.adapters.claude_code import launcher
+        logged, now = [], [100.0]
+        sup = mock.Mock(root=self.root, clock=lambda: now[0], log=logged.append, spec=["root", "clock", "log"])
+        self.begun()
+        self.spawned.clear()
+        launcher.Launcher.account_switches(sup)
+        launcher.Launcher.account_switches(sup)
+        self.assertEqual(len(self.spawned), 1, "checked once per ACCOUNT_SWITCH_CHECK_S")
+        now[0] += launcher.ACCOUNT_SWITCH_CHECK_S
+        with mock.patch.object(rm, "recover", side_effect=RuntimeError("broken")):
+            launcher.Launcher.account_switches(sup)
+        self.assertEqual(logged[0], "account switch: its watcher restarted")
+        self.assertIn("not recovered (RuntimeError: broken)", logged[1])
 
 
 if __name__ == "__main__":
