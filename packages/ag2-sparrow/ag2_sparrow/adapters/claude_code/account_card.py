@@ -264,8 +264,8 @@ class AccountCard(account_switch.AccountSwitch):
         if verb == "switch":
             # From the phone (owner 11-27): never "open this on the computer". Accounts switchable here are offered
             # in place; only an account another agent keeps needs a sign-in here, said as such.
-            text, refused = self.status()       # first: what is in use now decides what may be offered
-            offered = self.offers()
+            text, refused = self.status()
+            offered = self.offers()             # after status(): the account in use decides what is offered
             self.say(sent.get("channel_id"), self.card("pending", "%s %s" % (text, PICK if offered else self.none_here()),
                                                        ask=True, signed_out=refused, offered=offered),
                      result_file, card_desk.tapped_event(sent))
