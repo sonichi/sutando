@@ -28,6 +28,8 @@ import os
 import re
 import shutil
 import tempfile
+from multiprocessing import parent_process
+from multiprocessing.util import Finalize
 from pathlib import Path
 
 from _helpers import ORIGINAL_ENVIRON
@@ -76,6 +78,9 @@ def _temp_dir(prefix: str) -> str:
     pid = os.getpid()
     _temp_dirs.setdefault(pid, []).append(path)
     atexit.register(_cleanup_temp_dir, pid, path)
+    # Python 3.9 fork workers run multiprocessing finalizers, then os._exit(), skipping atexit.
+    if parent_process() is not None:
+        Finalize(None, _cleanup_temp_dir, args=(pid, path), exitpriority=-100)
     return path
 
 

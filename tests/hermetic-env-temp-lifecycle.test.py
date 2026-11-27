@@ -195,27 +195,30 @@ assert not Path(Path({str(child_record)!r}).read_text()).exists()
         self.assertTrue(audit_record.is_file())
         self.assert_removed(child_record.read_text())
 
-    def test_multiprocessing_workers_remove_their_directories(self) -> None:
+    def test_multiprocessing_finalizers_remove_worker_directories(self) -> None:
         methods = [method for method in ("spawn", "fork")
                    if method in multiprocessing.get_all_start_methods()]
         script = self.root / "multiprocessing-worker.py"
         script.write_text(textwrap.dedent(f"""
+            import atexit
             import json
             import multiprocessing
             import sys
             from pathlib import Path
 
             sys.path.insert(0, {str(TESTS)!r})
-            from _helpers.hermetic_env import coverage_bootstrap, hermetic_env
+            import _helpers.hermetic_env as hermetic
 
-            def worker(out, source):
-                payload = {{"home": hermetic_env()["HOME"],
-                           "coverage": coverage_bootstrap(source)}}
+            def worker(out, source, explicit_home):
+                payload = {{"home": hermetic.hermetic_env()["HOME"],
+                           "coverage": hermetic.coverage_bootstrap(source),
+                           "explicit": hermetic.hermetic_env(explicit_home)["HOME"]}}
                 Path(out).write_text(json.dumps(payload))
+                atexit.unregister(hermetic._cleanup_temp_dir)
 
             if __name__ == "__main__":
                 context = multiprocessing.get_context(sys.argv[1])
-                process = context.Process(target=worker, args=(sys.argv[2], sys.argv[3]))
+                process = context.Process(target=worker, args=(sys.argv[2], sys.argv[3], sys.argv[4]))
                 process.start()
                 process.join(30)
                 if process.is_alive():
@@ -230,7 +233,8 @@ assert not Path(Path({str(child_record)!r}).read_text()).exists()
             with self.subTest(method=method):
                 record = self.root / f"{method}.json"
                 proc = subprocess.run(
-                    [sys.executable, str(script), method, str(record), str(self.coverage_source)],
+                    [sys.executable, str(script), method, str(record), str(self.coverage_source),
+                     str(self.explicit_home)],
                     cwd=REPO,
                     capture_output=True,
                     text=True,
@@ -239,6 +243,7 @@ assert not Path(Path({str(child_record)!r}).read_text()).exists()
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 payload = json.loads(proc.stdout)
                 self.assert_removed(payload["home"], payload["coverage"])
+                self.assertTrue(self.explicit_home.is_dir())
 
     def test_module_hard_exits_clean_up_first(self) -> None:
         failures = []
