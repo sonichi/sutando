@@ -61,19 +61,25 @@ else
     echo "switch-model: refused '$MODEL' — not a model alias or claude-* id" >&2; exit 2
   fi
 fi
-# A worker: its running session must be in a Claude folder of its own, where /model saves the pick.
+# A worker: the pane this send reaches, on this socket, must run in a Claude folder of its own.
 # In the core's (or one that cannot be read) it is refused (exit 15): nothing sent, nothing recorded.
-REC_DIR="$STATE_DIR"
+REC_DIR="$STATE_DIR"; EXPECT=(); CHECKED=""
+worker_check() { "$PY" "$HERE/worker_target.py" folder --core-folder "$BRAIN" --worker "$WORKER" --session "$SESSION" --socket "$SOCK" 2>&1; }
+# The same pane, process and folder as first checked; the core's switch has no such check.
+same_pane() { [ "$KIND" = core ] || [ "$(worker_check)" = "$CHECKED" ]; }
+pane_changed() { echo "switch-model: refused — worker $WORKER's pane or its Claude folder changed $1; nothing recorded" >&2; exit 15; }
 if [ "$KIND" = worker ]; then
   REC_DIR="$STATE_DIR/workers/$WORKER"
   if [ -n "$OFFLINE" ]; then echo "switch-model: refused — --offline writes the core's settings; worker $WORKER is switched while it runs. Nothing changed." >&2; exit 2; fi
-  TMUX_SOCKET="$SOCK"; . "$REPO/src/agent/claude/cli/session-launch.sh"
-  OWN="$("$PY" "$HERE/worker_target.py" folder --core-folder "$BRAIN" --worker "$WORKER" --session "$SESSION" --pids "$(claude_named_pids | sort -u | tr '\n' ' ')" 2>&1)"; ORC=$?
+  CHECKED="$(worker_check)"; ORC=$?
+  OWN="${CHECKED%%$'\n'*}"; PANE_PID="${CHECKED##*$'\n'}"
+  case "$PANE_PID" in ''|*[!0-9]*) ORC=1;; esac
   if [ "$ORC" != 0 ] || [ ! -d "$OWN" ]; then
+    OWN="$CHECKED"
     if [ -n "$DRY" ]; then echo "dry-run: session kind=worker ($WORKER, tmux -S $SOCK -t $SESSION); record $REC_DIR/model-switch.json; would refuse (exit 15): ${OWN:-its Claude folder could not be checked}"; exit 0; fi
     echo "switch-model: refused — ${OWN:-its Claude folder could not be checked}; nothing sent, nothing recorded" >&2; exit 15
   fi
-  CFG="$OWN/settings.json"
+  CFG="$OWN/settings.json"; EXPECT=(--expected-pid "$PANE_PID")
   if [ -n "$DRY" ]; then
     echo "dry-run: session kind=worker ($WORKER, tmux -S $SOCK -t $SESSION); would record $REC_DIR/model-switch.json (previous read from $CFG) and send '/model $MODEL'; would not refuse: the running session uses its own Claude folder; the core's record and default are untouched"; exit 0
   fi
@@ -214,12 +220,13 @@ PYEOF
 # Baseline the acceptance lines for THIS model already on screen, so a stale one cannot pass as new.
 BASE="$(bash "$OBS" "$SESSION" --socket "$SOCK" --model "$MODEL" --settings "$CFG" --count)"; BRC=$?
 case "$BRC:$BASE" in 0:[0-9]*) ;; *) echo "switch-model: could not read the core pane before sending (rc=$BRC, '$BASE'); nothing sent, nothing recorded" >&2; exit 7;; esac
+same_pane || pane_changed "before the send; nothing sent"
 # Attribute any picker this send leaves on screen to us, so the supervisor may Esc it later (CLI > env > manifest).
 [ -n "$DISMISS_AFTER" ] || DISMISS_AFTER="${MODEL_SWITCH_PICKER_DISMISS_AFTER_S:-$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["config"]["MODEL_SWITCH_PICKER_DISMISS_AFTER_S"])' "$REPO/skills/model-switch/manifest.json" 2>/dev/null)}"
 GATE="$REPO/src/self_opened_gate.py"
 "$PY" "$GATE" record --state-dir "$REC_DIR" --session "$SESSION" --opener model-switch \
   --dismiss-after "${DISMISS_AFTER:-0}" --claim-window "$((ACCEPT_TIMEOUT * 2 + 30))" || echo "switch-model: could not write the picker attribution; a picker left behind will wait for a human" >&2
-bash "$SENDER" "$SESSION" "/model $MODEL" --socket "$SOCK" --refuse-if-pending > /dev/null; SEND_RC=$?
+bash "$SENDER" "$SESSION" "/model $MODEL" --socket "$SOCK" --refuse-if-pending ${EXPECT[@]+"${EXPECT[@]}"} > /dev/null; SEND_RC=$?
 if [ "$SEND_RC" = 125 ]; then
   "$PY" "$GATE" close --state-dir "$REC_DIR" --session "$SESSION"
   echo "switch-model: send may have applied (rc=125); picker attribution retained, nothing recorded" >&2; exit 7
@@ -232,7 +239,8 @@ case "$VERDICT" in
   ACCEPTED) "$PY" "$GATE" clear --state-dir "$REC_DIR" --session "$SESSION";;
   DIALOG)
     if [ -n "$CONFIRM" ]; then
-      VERDICT="$(bash "$OBS" "$SESSION" --socket "$SOCK" --model "$MODEL" --settings "$CFG" --wait --baseline "$BASE" --timeout "$ACCEPT_TIMEOUT" --answer-enter)"; ANSWER_RC=$?
+      same_pane || { "$PY" "$GATE" close --state-dir "$REC_DIR" --session "$SESSION"; pane_changed "before the confirming Enter; not confirmed"; }
+      VERDICT="$(bash "$OBS" "$SESSION" --socket "$SOCK" --model "$MODEL" --settings "$CFG" --wait --baseline "$BASE" --timeout "$ACCEPT_TIMEOUT" --answer-enter ${EXPECT[@]+"${EXPECT[@]}"})"; ANSWER_RC=$?
       case "$ANSWER_RC" in
         0|11) CONFIRMED=true;;
         125) "$PY" "$GATE" close --state-dir "$REC_DIR" --session "$SESSION"
@@ -243,7 +251,7 @@ case "$VERDICT" in
       [ "$VERDICT" = ACCEPTED ] || { "$PY" "$GATE" close --state-dir "$REC_DIR" --session "$SESSION"; echo "switch-model: confirmed the dialog but no acceptance within ${ACCEPT_TIMEOUT}s; nothing recorded" >&2; exit 8; }
       "$PY" "$GATE" clear --state-dir "$REC_DIR" --session "$SESSION"
     else
-      bash "$OBS" "$SESSION" --socket "$SOCK" --cancel > /dev/null; CANCEL_RC=$?
+      bash "$OBS" "$SESSION" --socket "$SOCK" --cancel ${EXPECT[@]+"${EXPECT[@]}"} > /dev/null; CANCEL_RC=$?
       if [ "$CANCEL_RC" != 0 ]; then
         "$PY" "$GATE" close --state-dir "$REC_DIR" --session "$SESSION"
         echo "switch-model: dialog cancel failed (rc=$CANCEL_RC); picker attribution retained, nothing recorded" >&2
@@ -255,6 +263,7 @@ case "$VERDICT" in
   *) "$PY" "$GATE" close --state-dir "$REC_DIR" --session "$SESSION"
      echo "switch-model: sent '/model $MODEL' but saw no acceptance OF THAT MODEL within ${ACCEPT_TIMEOUT}s; nothing recorded. A picker it left on screen is dismissed after ${DISMISS_AFTER:-0}s unless someone answers it (0 = never)" >&2; exit 8;;
 esac
+same_pane || pane_changed "after the send, so the session that took it is gone"
 # Record only now, with the previous model snapshotted before the send.
 OUT="$("$PY" - "$CFG" "$MODEL" "$REC_DIR" "$CONFIRMED" "$PREV" "$PREV_SRC" "$WORKER" <<'PYEOF'
 import json, os, sys, time, tempfile

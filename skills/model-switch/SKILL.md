@@ -75,14 +75,24 @@ other worker's. So the script first tells whose session it targets (`scripts/wor
 - **The core's** (any session that is not a worker's): everything above, unchanged.
 - **A worker's** (`sutando-worker-<worker id>`, from `--session` or the session's own
   `SUTANDO_TMUX_SESSION`): switched only while its running session uses a Claude folder of its own
-  (`skills/worker-pool/scripts/worker_claude_folder.py`, `<core folder>-workers/<worker id>`). The
-  folder is read from the running process, not from disk: every `claude` process of the session
-  (the launcher's `claude_named_pids`) must carry that session's name and one `CLAUDE_CONFIG_DIR`,
-  which must be the worker's own folder with a `settings.json` of its own. The core's folder, any
-  other folder, no running process or an environment that cannot be read is **exit 15**: nothing
-  sent, nothing recorded; the message says to give the worker its own folder
+  (`skills/worker-pool/scripts/worker_claude_folder.py`, `<core folder>-workers/<worker id>`). What
+  is checked is the pane the send reaches, not a name: the one pane that session has on the selected
+  tmux socket (several panes, or no such session there: refused), its process and any `claude` child
+  of it. A same-named session on another tmux server never counts. Each of those processes must
+  carry that session's name and one `CLAUDE_CONFIG_DIR`, read from the running process, not from
+  disk. That folder must be the worker's own slot: a real directory, in a real `<core folder>-workers`
+  directory, with a `settings.json` of its own. A slot (or the directory holding the slots) that is a
+  link is refused wherever it points, another worker's folder and the core's included. The core's
+  folder, any other folder, no Claude process in the pane or an environment that cannot be read is
+  **exit 15**: nothing sent, nothing recorded; the message says to give the worker its own folder
   (`worker_claude_folder.py ensure <core folder> <worker id>`) and restart it. A folder made while
   the worker runs is not in use until that restart.
+- **The pane must stay the one that was checked.** The check is repeated right before the send,
+  before the confirming Enter and before the record; a different pane process or folder is exit 15
+  with nothing recorded. The send, the confirming Enter and the cancelling Escape are also bound to
+  the checked pane pid in tmux itself (`--expected-pid`, through `scripts/tmux-send-line.sh` and
+  `src/tmux-pane-keys.sh`), so keys never reach a pane replaced after the last check (exit 7 on the
+  send, 8 on the Enter or Escape).
 - **Not told apart** is **exit 14**, never a switch of the core: a worker session naming no worker
   id; a session and a `SUTANDO_WORKER_ID` that name different workers (pass `--session` to name the
   one meant); a worker's session (`SUTANDO_WORKER_ID` set) whose target resolved to the core's;

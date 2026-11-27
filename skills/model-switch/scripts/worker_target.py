@@ -10,14 +10,16 @@ core instead.
   worker_target.py resolve --session S --session-source flag|env|descriptor [--target core|worker]
                            [--caller-worker ID]
       prints `core` or `worker <id>`; exit 14 when the target cannot be told.
-  worker_target.py folder --core-folder DIR --worker ID --session S --pids "PID ..."
-      prints the worker's own Claude folder when every running process of the session uses it;
-      exit 15 otherwise (the core's folder, another one, or an environment that cannot be read).
+  worker_target.py folder --core-folder DIR --worker ID --session S --socket PATH
+      prints the worker's own Claude folder and, on the next line, the pid of the pane a send to S on
+      that socket reaches, when that pane's processes run in that folder; exit 15 otherwise (the
+      core's folder, another one, a linked folder, or an environment that cannot be read).
 """
 from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -63,6 +65,57 @@ def resolve(session: str, source: str, target: str = "", caller_worker: str = ""
     return "worker", named
 
 
+def _core(name: str):
+    if str(REPO / "src") not in sys.path:
+        sys.path.insert(0, str(REPO / "src"))
+    return __import__(name)
+
+
+def _run(argv: list):
+    """One bounded read-only probe; None when it could not be run."""
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def receiving_pane(socket: str, session: str, run=_run) -> str:
+    """The pid of the one pane `session` has on the tmux server at `socket`: the pane a send to that
+    session reaches. Raises Refused when that server has no such session or it has several panes."""
+    out = run(["tmux", "-S", socket, "list-panes", "-s", "-t", f"={session}", "-F", "#{pane_pid}"])
+    if out is None or out.returncode != 0:
+        raise Refused(f"session '{session}' was not found on the selected tmux socket")
+    pids = [ln.strip() for ln in (out.stdout or "").splitlines() if ln.strip()]
+    if len(pids) != 1 or not pids[0].isdigit():
+        raise Refused(f"session '{session}' does not have exactly one pane, so the pane a send reaches "
+                      "cannot be told")
+    return pids[0]
+
+
+def _is_claude(args: str) -> bool:
+    # Program path up to the first flag: an install path may contain spaces.
+    return os.path.basename(args.strip().split(" -")[0]) in ("claude", "claude.exe")
+
+
+def pane_processes(pane_pid: str, run=_run) -> list:
+    """The pane's own process and each `claude` child of it (the CLI can re-exec as a child)."""
+    pids, claude = [pane_pid], False
+    kids = run(["pgrep", "-P", pane_pid])
+    for pid in [pane_pid] + [k for k in ((kids.stdout or "").split() if kids is not None else []) if k.isdigit()]:
+        args = run(["ps", "-p", pid, "-o", "args="])
+        if args is None or args.returncode != 0:
+            if pid == pane_pid:
+                raise Refused(f"the pane's process {pid} could not be read")
+            continue
+        if _is_claude(args.stdout or ""):
+            claude = True
+            if pid != pane_pid:
+                pids.append(pid)
+    if not claude:
+        raise Refused("no Claude process runs in the session's pane")
+    return pids
+
+
 def _session_env(pid: str, ps_runner=None) -> dict:
     quota = _core("quota_availability")
     try:
@@ -74,26 +127,34 @@ def _session_env(pid: str, ps_runner=None) -> dict:
     return quota._env_pairs((proc.stdout or "").strip())
 
 
-def _core(name: str):
-    if str(REPO / "src") not in sys.path:
-        sys.path.insert(0, str(REPO / "src"))
-    return __import__(name)
-
-
-def own_folder(core_folder: str, worker: str, session: str, pids: list, ps_runner=None) -> Path:
-    """The worker's own Claude folder, only when every running process of `session` runs in it."""
-    restart = (f"give worker {worker} a Claude folder of its own "
-               f"(skills/worker-pool/scripts/worker_claude_folder.py ensure <core folder> {worker}) "
-               "and restart it so its session runs there")
+def private_slot(core_folder: str, worker: str) -> Path:
+    """The worker's folder, only when it is a real directory in its own slot beside the core's: a
+    link at the slot or at the folder holding the slots could point at the core's or another worker's."""
     try:
         own = _pool("worker_claude_folder").folder(core_folder, worker)
     except ValueError as e:
         raise Refused(f"worker {worker} can have no folder of its own ({e})")
-    if not pids:
-        raise Refused(f"no running Claude process was found for session '{session}', so the folder it "
-                      f"uses could not be read; {restart}")
+    for part, what in ((own.parent, "the folder holding the workers' Claude folders"),
+                       (own, f"worker {worker}'s Claude folder")):
+        if part.is_symlink():
+            raise Refused(f"{what} is a link, not a folder of its own; replace it with a real folder")
+        if not part.is_dir():
+            raise Refused(f"{what} is not there")
+    slot = os.path.join(os.path.realpath(Path(core_folder).parent), own.parent.name, own.name)
+    if os.path.realpath(own) != slot or slot == os.path.realpath(core_folder):
+        raise Refused(f"worker {worker}'s Claude folder resolves outside its own slot")
+    return own
+
+
+def own_folder(core_folder: str, worker: str, session: str, socket: str, run=_run, ps_runner=None) -> tuple:
+    """(the worker's own Claude folder, the receiving pane's pid), only when the processes of the
+    pane `session` has on `socket` run in that folder. A same-named process elsewhere never counts."""
+    restart = (f"give worker {worker} a Claude folder of its own "
+               f"(skills/worker-pool/scripts/worker_claude_folder.py ensure <core folder> {worker}) "
+               "and restart it so its session runs there")
+    pane_pid = receiving_pane(socket, session, run)
     live = set()
-    for pid in pids:
+    for pid in pane_processes(pane_pid, run):
         env = _session_env(pid, ps_runner)
         # The launcher stamps the session on its process: without it this is not that session's
         # environment (or it could not be read), and nothing in it is trusted.
@@ -109,12 +170,13 @@ def own_folder(core_folder: str, worker: str, session: str, pids: list, ps_runne
     if running == os.path.realpath(core_folder):
         raise Refused(f"worker {worker}'s running session uses the core's Claude folder, so /model there "
                       f"would change the core's default and every other worker's; {restart}")
+    own = private_slot(core_folder, worker)
     if running != os.path.realpath(own):
         raise Refused(f"worker {worker}'s running session uses a Claude folder that is not its own; {restart}")
     settings = own / "settings.json"
     if settings.is_symlink() or not settings.is_file():
         raise Refused(f"worker {worker}'s folder has no settings file of its own; {restart}")
-    return own
+    return own, pane_pid
 
 
 def main(argv=None) -> int:
@@ -129,7 +191,7 @@ def main(argv=None) -> int:
     f.add_argument("--core-folder", required=True)
     f.add_argument("--worker", required=True)
     f.add_argument("--session", required=True)
-    f.add_argument("--pids", default="")
+    f.add_argument("--socket", required=True)
     a = ap.parse_args(argv)
     try:
         if a.cmd == "resolve":
@@ -137,7 +199,7 @@ def main(argv=None) -> int:
                 raise Refused(f"--target is core or worker, not '{a.target}'")
             print(" ".join(resolve(a.session, a.session_source, a.target, a.caller_worker)).strip())
             return 0
-        print(own_folder(a.core_folder, a.worker, a.session, a.pids.split()))
+        print(*own_folder(a.core_folder, a.worker, a.session, a.socket), sep="\n")
         return 0
     except Refused as e:
         print(str(e), file=sys.stderr)

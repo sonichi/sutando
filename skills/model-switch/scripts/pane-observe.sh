@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# pane-observe.sh <session> --socket PATH --model M [--settings FILE] (--count | --wait --baseline N [--timeout S] [--answer-enter] | --cancel)
+# pane-observe.sh <session> --socket PATH --model M [--settings FILE] [--expected-pid PID] (--count | --wait --baseline N [--timeout S] [--answer-enter] | --cancel)
 # Acceptance = a "Set model to <family> [<version>]" line for the REQUESTED model; any other model's line does not count.
 set -u
 SESSION="${1:?session}"; shift
-SOCK=""; MODE=""; BASE=0; TIMEOUT=20; ANSWER=""; REQ=""; SETTINGS=""
+SOCK=""; MODE=""; BASE=0; TIMEOUT=20; ANSWER=""; REQ=""; SETTINGS=""; EXPECT=()
 while [ $# -gt 0 ]; do case "$1" in
   --socket) SOCK="${2:?}"; shift;; --count) MODE=count;; --wait) MODE=wait;; --cancel) MODE=cancel;;
-  --baseline) BASE="${2:?}"; shift;; --timeout) TIMEOUT="${2:?}"; shift;; --answer-enter) ANSWER=1;; --model) REQ="${2:?}"; shift;; --settings) SETTINGS="${2:?}"; shift;;
+  --baseline) BASE="${2:?}"; shift;; --timeout) TIMEOUT="${2:?}"; shift;; --answer-enter) ANSWER=1;; --model) REQ="${2:?}"; shift;; --settings) SETTINGS="${2:?}"; shift;; --expected-pid) EXPECT=(--expected-pid "${2:?}"); shift;;
   *) echo "pane-observe: unknown arg $1" >&2; exit 2;;
 esac; shift; done
 [ -n "$SOCK" ] || { echo "pane-observe: --socket required" >&2; exit 2; }
@@ -27,12 +27,12 @@ COUNT_ARGS=(count "$REQ"); [ -n "$SETTINGS" ] && COUNT_ARGS=(baseline "$REQ" --s
 count() { out="$(cap)" || { echo "CAPTURE-FAILED"; return 12; }; printf '%s\n' "$out" | "$PY" "$REPO_ROOT/src/claude_model_switch.py" "${COUNT_ARGS[@]}"; return 0; }
 case "$MODE" in
   count) count; exit $?;;
-  cancel) bash "$PANE_KEYS" --python "$PY" -S "$SOCK" -t "$SESSION" -- Escape || exit $?; echo CANCELLED; exit 0;;
+  cancel) bash "$PANE_KEYS" --python "$PY" -S "$SOCK" -t "$SESSION" ${EXPECT[@]+"${EXPECT[@]}"} -- Escape || exit $?; echo CANCELLED; exit 0;;
   wait) ;;
   *) echo "pane-observe: one of --count/--wait/--cancel" >&2; exit 2;;
 esac
 # The sender's status (1 not sent, 75 busy, 124 revoked, 125 may have applied) is the verdict, not a timeout.
-if [ -n "$ANSWER" ]; then bash "$PANE_KEYS" --python "$PY" -S "$SOCK" -t "$SESSION" -- Enter || exit $?; fi
+if [ -n "$ANSWER" ]; then bash "$PANE_KEYS" --python "$PY" -S "$SOCK" -t "$SESSION" ${EXPECT[@]+"${EXPECT[@]}"} -- Enter || exit $?; fi
 # A NEW matching line (count above baseline) is the switch; the dialog means the CLI waits on a human.
 deadline=$(( $(date +%s) + TIMEOUT ))
 while :; do
