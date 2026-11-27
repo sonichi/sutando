@@ -13,6 +13,9 @@ import os
 from pathlib import Path
 
 _DEFAULT_BASE = Path.home() / ".ag2-sparrow"
+# An installed agent's own folder under its work root (<agents dir>/<agent>/workspace): where a connector's
+# Session works and the one place besides results/ its `[file:]` markers may send from (send_allowlist).
+WORKSPACE_DIRNAME = "workspace"
 _injected = None  # dict(task/result/state -> Path) set by internal sutando
 
 
@@ -55,6 +58,22 @@ def task_dir_configured() -> bool:
 def agents_dir():
     # Read HOME per call: _DEFAULT_BASE is fixed at import.
     return (_injected or {}).get("agents") or Path.home() / ".ag2-sparrow" / "agents"
+
+
+def agent_workspace_dir():
+    """The installed agent's own workspace, as a real path, when this process's task and result dirs are the
+    tasks/ and results/ of one work root directly under agents_dir(); else None. Both sides are resolved, so
+    a symlinked home or agents dir names the same folder; a workspace that is itself a symlink is none."""
+    results, tasks = Path(os.path.abspath(result_dir())), Path(os.path.abspath(task_dir()))
+    root = results.parent
+    if results.name != "results" or tasks != root / "tasks":
+        return None
+    workspace = root / WORKSPACE_DIRNAME
+    if os.path.islink(workspace) or not os.path.isdir(workspace):
+        return None
+    if Path(os.path.realpath(root)).parent != Path(os.path.realpath(agents_dir())):
+        return None
+    return Path(os.path.realpath(workspace))
 
 
 def bridge_host() -> str:

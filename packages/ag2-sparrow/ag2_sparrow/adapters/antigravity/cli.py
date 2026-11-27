@@ -41,8 +41,10 @@ LOCAL = Shape(name=SHAPE, command=COMMAND, description="Antigravity CLI on Sparr
               required_keys=REQUIRED_KEYS, config_keys=CONFIG_KEYS, env_keep=ENV_KEEP,
               kept="the Antigravity sign-in (agy's own, in the Keychain) and the session store with every room's session id",
               run_args=("run", "--launchd"), keep_alive_on_success=False)
-WORK_DIRS = ("tasks", "results", "state", "workspace")
-DEFAULT_CWD = "workspace"   # under the work root: the Session directory when --cwd is not given
+# under the work root: the Session directory when --cwd is not given, and the folder its bridge sends
+# `[file:]` attachments from (_dirs.agent_workspace_dir)
+DEFAULT_CWD = _dirs.WORKSPACE_DIRNAME
+WORK_DIRS = ("tasks", "results", "state", DEFAULT_CWD)
 LABELS = ("launcher", "connector")
 PROBE_TIMEOUT_S = 60.0
 
