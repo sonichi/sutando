@@ -657,6 +657,37 @@ class RemoteUnitTest(Home, unittest.TestCase):
         self.assertNotIn(CODE, json.dumps(queued[1][1]))
         self.assertFalse((self.state / dl.WITHDRAW_FILE).exists())
 
+    def ended_on(self, r, event):
+        """A sign-in shown on `event` that ended without being told: its card still shows the first code."""
+        self.mode("fail")
+        self.assertEqual(r.tapped(dl.ADD, dict(self.OWNER, reply_to_event=event), "out"), "account-device-started")
+        end = time.time() + 15
+        while not (r.dir / "result.json").exists() and time.time() < end:
+            time.sleep(0.05)
+        self.mode("hang")
+        r.accounts.post.reset_mock()
+
+    def test_a_new_add_on_the_same_card_keeps_its_new_code_and_owes_nothing(self):
+        r = self.remote()
+        self.ended_on(r, "$e")
+        self.assertEqual(r.tapped(dl.ADD, dict(self.OWNER, reply_to_event="$e"), "out"), "account-device-started")
+        self.assertEqual([(e, c["id"]) for e, c in self.queued(r)], [("$e", dl.DEVICE_CARD)], "the live card stays")
+        self.assertFalse((self.state / dl.WITHDRAW_FILE).exists(), "the old withdrawal is superseded")
+        r.tick()
+        self.assertEqual(len(self.queued(r)), 1, "and is never queued later")
+
+    def test_a_new_add_on_the_same_card_whose_edit_fails_still_withdraws_the_first_code(self):
+        r = self.remote()
+        self.ended_on(r, "$e")
+        r.accounts.post.return_value = False
+        self.assertEqual(r.tapped(dl.ADD, dict(self.OWNER, reply_to_event="$e"), "out"), "account-not-started")
+        self.assertEqual([o["event"] for o in dl.owed(r.dir)], ["$e"], "still owed")
+        r.accounts.post.reset_mock()
+        r.accounts.post.return_value = True
+        self.assertEqual(r.tick(), "")
+        self.assertEqual([(e, c["id"]) for e, c in self.queued(r)], [("$e", dl.WITHDRAWN_CARD)])
+        self.assertFalse((self.state / dl.WITHDRAW_FILE).exists())
+
     def test_the_card_is_on_record_before_its_code_is_queued(self):
         self.mode("hang")
         r = self.remote()

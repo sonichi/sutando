@@ -326,8 +326,10 @@ def over(state_dir, codex: str, env: dict, run=subprocess.run, now=None, wait_s=
         found = signin_watch.codex_identity(str(d / STAGING)) if code == 0 and _staged_auth(d).is_file() else None
         email = account_switch.shown(found[1]) if found else ""
         if email:
+            # The question goes on the newest card only: every other copy of the code is owed its withdrawal.
+            _journal(d, where["room"], [c for c in where["cards"] if c != where["edit"]])
             write_private(d / "meta.json", {"id": meta.get("id"), "phase": CONFIRM_PHASE, "email": email,
-                                            "asked_at": now, **where})
+                                            "asked_at": now, **dict(where, cards=[where["edit"]] if where["edit"] else [])})
             return dict(where, phase=CONFIRM_PHASE, email=email)
         _discard(d, codex, env, run)
     why = _why(said, meta.get("code") or "", meta.get("link") or "") if code != 0 else \
@@ -492,7 +494,8 @@ class Remote:
         gone = agent_card.build(WITHDRAWN_CARD, "expired", title="Account", body="Account of %s" % self.accounts.name,
                                 text="This sign-in card is no longer in use.")
         owed = self.owed()
-        left = [o for o in owed if not self.accounts.post(o["room"], gone, edit=o["event"])]
+        live = set(read_json(self.dir / "meta.json").get("cards") or [])     # the running sign-in's: never withdrawn
+        left = [o for o in owed if o["event"] in live or not self.accounts.post(o["room"], gone, edit=o["event"])]
         for o in left:
             self.log("device sign-in card not withdrawn yet:", str(o["event"])[:40])
         if left != owed:
@@ -568,6 +571,7 @@ class Remote:
                 self.retry()
             self.accounts.publish(result_file, self.accounts.quoted(NO_CARD) + "\n")
             return "account-not-started"
+        paid(self.dir, room, tapped)        # this edit supersedes a withdrawal owed for the same card
         self.retry()        # a sign-in replaced by this one owes its cards' withdrawals
         self.accounts.publish(result_file, account_switch.ANSWERED)
         self.log("device sign-in", "shown again" if again else "started")
@@ -636,12 +640,12 @@ class Remote:
         shown = bool(done["room"]) and self.accounts.post(done["room"], built, edit=done["edit"])
         if not shown:
             self.log("device sign-in outcome not shown:", outcome)      # its card is withdrawn instead
-        if done.get("phase") == CONFIRM_PHASE:
-            self.withdraw(done["room"], done["cards"], keep=done["edit"] if shown else "")
-        else:
-            if shown:
-                paid(self.dir, done["room"], done["edit"])
-            self.retry()
+        if done.get("phase") == CONFIRM_PHASE and not shown:
+            forget_card(self.dir, done["edit"])
+            self.withdraw(done["room"], [done["edit"]])
+        elif shown:
+            paid(self.dir, done["room"], done["edit"])
+        self.retry()
         self.log("device sign-in ->", outcome)
         return outcome
 
