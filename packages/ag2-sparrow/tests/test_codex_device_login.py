@@ -9,6 +9,7 @@ token. HOME itself is left alone: the stub app-server (run under coverage in CI)
 import errno
 import json
 import os
+import random
 import subprocess
 import sys
 import tempfile
@@ -69,12 +70,13 @@ if mode == "stubborn":
     with open(os.path.join(here, "grandpid"), "w") as f:
         f.write(str(kid.pid))
     time.sleep(600)
-if mode.startswith("wait "):
+quick = mode.startswith("wait ")
+if quick:
     while not os.path.exists(os.path.join(here, "go")):
         time.sleep(0.05)
     mode = "ok " + mode[5:]
 if mode.startswith("ok "):
-    time.sleep(1.0)
+    time.sleep(0 if quick else 1.0)
     claims = base64.urlsafe_b64encode(json.dumps({"email": mode[3:]}).encode()).decode().rstrip("=")
     with open(os.path.join(home, "auth.json"), "w") as f:
         json.dump({"tokens": {"account_id": "acct-1", "id_token": "e30." + claims + ".sig"}}, f)
@@ -688,6 +690,21 @@ class RemoteUnitTest(Home, unittest.TestCase):
         self.assertEqual([(e, c["id"]) for e, c in self.queued(r)], [("$e", dl.WITHDRAWN_CARD)])
         self.assertFalse((self.state / dl.WITHDRAW_FILE).exists())
 
+    def test_a_failed_edit_of_a_card_already_showing_the_code_keeps_it_and_the_sign_in(self):
+        self.mode("hang")
+        r = self.remote()
+        r.tapped(dl.ADD, dict(self.OWNER, reply_to_event="$a"), "out")
+        r.accounts.post.return_value = False
+        self.assertEqual(r.tapped(dl.ADD, dict(self.OWNER, reply_to_event="$a"), "out"), "account-device-not-shown")
+        self.assertEqual(r.tapped(dl.ADD, dict(self.OWNER, reply_to_event="$b"), "out"), "account-device-not-shown")
+        meta = detached_login.read_json(r.dir / "meta.json")
+        self.assertEqual((meta["cards"], meta["edit"]), (["$a"], "$a"), "still the live card, and the next word goes there")
+        self.assertTrue(dl.current(r.dir), "the running sign-in goes on")
+        self.assertEqual(self.said[-1], dl.NO_CARD_AGAIN + "\n")
+        r.accounts.post.return_value = True
+        r.stop()
+        self.assertEqual([e for e, c in self.queued(r) if c["id"] == dl.WITHDRAWN_CARD], ["$a"])
+
     def test_the_card_is_on_record_before_its_code_is_queued(self):
         self.mode("hang")
         r = self.remote()
@@ -801,6 +818,89 @@ class RemoteUnitTest(Home, unittest.TestCase):
             time.sleep(0.05)
         self.assertEqual(r.tick(), "account-device-failed")
         self.assertEqual(r.tick(), "")
+
+
+class CardInvariantTest(Home, unittest.TestCase):
+    """Every card ever queued with a code stays in exactly one of {the running sign-in's live cards, the
+    withdrawal journal} until a code-free edit of it is queued, whatever happens in between: random,
+    seeded sequences of taps, failed and working edits, finishes, expiries, cancels, answers and restarts."""
+
+    # 8, 21 and 22 forgot a card still showing a code before the fix; all forty seeds 1-40 pass after it.
+    SEEDS, STEPS, EVENTS = (1, 2, 8, 21, 22), 24, ("$a", "$b", "$c")
+    OWNER = {"access_tier": "owner", "channel_kind": "dm", "user_id": "@alice:s.space", "channel_id": "!dm:s"}
+
+    def remote(self):
+        accounts = mock.Mock(name="accounts", publish=lambda path, body: None, quoted=lambda t: t, pending=lambda: {},
+                             using=lambda: "I'm using a.", post=self.post,
+                             card=lambda state, text, **kw: ("b", {"id": account_switch.CARD, "text": text}))
+        accounts.name = "Codex"
+        r = dl.Remote(accounts, self.state, Path(self.tmp.name), str(self.codex), self.env, lambda *a: None,
+                      homes=lambda: [])
+        r.fresh = lambda sent: True
+        return r
+
+    def post(self, room, built, edit=""):
+        if not self.ok:
+            return False
+        if CODE in json.dumps(built[1]):
+            self.shown.add(edit)
+        else:
+            self.shown.discard(edit)
+        return True
+
+    def check(self, step):
+        meta = detached_login.read_json(self.dir / "meta.json")
+        live = set(meta.get("cards") or []) if self.dir.exists() else set()
+        owed = {o["event"] for o in dl.owed(self.dir)}
+        for event in self.shown:
+            self.assertTrue((event in live) != (event in owed),
+                            "%s: %s live=%s owed=%s" % (step, event, sorted(live), sorted(owed)))
+
+    def finish(self):
+        """Let the running sign-in sign in now, and wait until it has ended."""
+        if not (self.dir / "pids.json").exists():
+            return
+        (self.bin / "go").write_text("")
+        end = time.time() + 10
+        while self.dir.exists() and not (self.dir / "result.json").exists() and time.time() < end:
+            time.sleep(0.02)
+        (self.bin / "go").unlink()
+
+    def test_no_card_with_a_code_is_ever_forgotten(self):
+        for seed in self.SEEDS:
+            with self.subTest(seed=seed):
+                rnd, self.shown, self.ok = random.Random(seed), set(), True
+                self.mode("wait bob@example.org")
+                r = self.remote()
+                for step in range(self.STEPS):
+                    op = rnd.choice(("add", "add", "add-fail", "finish", "tick", "tick-fail", "expire", "cancel",
+                                     "yes", "no", "restart"))
+                    event = rnd.choice(self.EVENTS)
+                    self.ok = not op.endswith("-fail")
+                    if op.startswith("add"):
+                        r.tapped(dl.ADD, dict(self.OWNER, reply_to_event=event), "out")
+                    elif op == "finish":
+                        self.finish()
+                        r.tick()
+                    elif op.startswith("tick"):
+                        r.tick()
+                    elif op == "expire":
+                        r.tick(now=time.time() + 10 * dl.LOGIN_WAIT_S)
+                    elif op == "cancel":
+                        r.stop()
+                    elif op in ("yes", "no"):
+                        target = detached_login.read_json(self.dir / "meta.json").get("edit") or event
+                        r.tapped(dl.USE if op == "yes" else dl.DISCARD, dict(self.OWNER, reply_to_event=target), "out")
+                    else:
+                        r = self.remote()
+                    self.check("seed %d step %d %s %s" % (seed, step, op, event))
+                self.ok = True
+                r.stop()
+                r.retry()
+                self.check("seed %d end" % seed)
+                self.assertEqual(self.shown, set(), "every code card withdrawn in the end")
+                if (self.home / "auth.json").exists():
+                    (self.home / "auth.json").unlink()
 
 
 if __name__ == "__main__":

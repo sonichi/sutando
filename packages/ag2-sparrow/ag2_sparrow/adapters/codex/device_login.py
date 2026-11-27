@@ -76,6 +76,7 @@ NOT_OWNER = "Only the owner can add an account, and only from our direct message
 STALE_CARD = "That card is too old to start a sign-in, so nothing changed. Send /account for a new one."
 NO_CARD = "I couldn't show the sign-in card here, so I stopped the sign-in. Send /account in our direct message."
 UNANSWERED = "You didn't answer within %d minutes, so I signed that account out again. %s"
+NO_CARD_AGAIN = "I couldn't show the sign-in on this card; the earlier sign-in card still works."
 ANSWERED_ALREADY = "That sign-in was already answered or is over, so nothing changed."
 
 
@@ -249,15 +250,19 @@ def _start(codex, env, d, popen, wait_s, sleep, login_wait_s):
         sleep(0.2)
 
 
-def note_card(state_dir, room: str, edit: str) -> None:
+def note_card(state_dir, room: str, edit: str) -> "dict | None":
     """Where the sign-in's next word is shown (the room, and the card it replaces), and one more card that
-    shows it, to withdraw when it is over."""
+    shows it, to withdraw when it is over. What `forget_card` needs to undo it; None when there is no
+    sign-in to note it on (its card must then not be queued)."""
     d = Path(state_dir)
     with locked(d):
         meta = read_json(d / "meta.json")
-        if meta:
-            cards = [c for c in meta.get("cards") or [] if c != edit] + ([edit] if edit else [])
-            write_private(d / "meta.json", dict(meta, room=room, edit=edit, cards=cards))
+        if not meta or not edit:
+            return None
+        before = {"edit": meta.get("edit") or "", "shown": edit in (meta.get("cards") or [])}
+        cards = [c for c in meta.get("cards") or [] if c != edit] + [edit]
+        write_private(d / "meta.json", dict(meta, room=room, edit=edit, cards=cards))
+        return before
 
 
 def owed(state_dir) -> list:
@@ -283,13 +288,18 @@ def _journal(d: Path, room: str, cards) -> None:
         keep_owed(d, owed(d) + new)
 
 
-def forget_card(state_dir, event: str) -> None:
-    """`event` was noted but its card was never queued: it shows nothing of this sign-in."""
+def forget_card(state_dir, event: str, before=None) -> None:
+    """`event` was noted but its card was never queued. One that already showed this sign-in's code still does,
+    and stays on record; any other is dropped, and the next word goes back to the card noted before it."""
     d = Path(state_dir)
+    before = before or {}
     with locked(d):
         meta = read_json(d / "meta.json")
-        if meta and event in (meta.get("cards") or []):
-            write_private(d / "meta.json", dict(meta, cards=[c for c in meta["cards"] if c != event]))
+        if not meta or before.get("shown"):
+            return
+        cards = [c for c in meta.get("cards") or [] if c != event]
+        edit = meta.get("edit") if meta.get("edit") != event else (before.get("edit") or (cards[-1] if cards else ""))
+        write_private(d / "meta.json", dict(meta, cards=cards, edit=edit))
 
 
 def paid(state_dir, room: str, event: str) -> None:
@@ -564,9 +574,15 @@ class Remote:
                               result_file, tapped)
             return "account-not-started"
         built = self.confirm_card(meta["email"]) if meta["phase"] == CONFIRM_PHASE else self.code_card(meta)
-        note_card(self.dir, room, tapped)       # on record before the edit is queued: a stop between leaves no orphan
-        if not self.accounts.post(room, built, edit=tapped):
-            forget_card(self.dir, tapped)
+        before = note_card(self.dir, room, tapped)      # on record before the edit is queued: a stop between leaves no orphan
+        if before is None or not self.accounts.post(room, built, edit=tapped):
+            if before is not None:
+                forget_card(self.dir, tapped, before)
+            if again and before is not None:
+                # The sign-in already shows on another card: it goes on there, and this card is left as it was.
+                self.retry()
+                self.accounts.publish(result_file, self.accounts.quoted(NO_CARD_AGAIN) + "\n")
+                return "account-device-not-shown"
             if cancel(self.dir, self.codex, self.env, self.run):
                 self.retry()
             self.accounts.publish(result_file, self.accounts.quoted(NO_CARD) + "\n")
@@ -641,8 +657,8 @@ class Remote:
         if not shown:
             self.log("device sign-in outcome not shown:", outcome)      # its card is withdrawn instead
         if done.get("phase") == CONFIRM_PHASE and not shown:
+            _journal(self.dir, done["room"], [done["edit"]])     # owed before it stops being the live card
             forget_card(self.dir, done["edit"])
-            self.withdraw(done["room"], [done["edit"]])
         elif shown:
             paid(self.dir, done["room"], done["edit"])
         self.retry()
