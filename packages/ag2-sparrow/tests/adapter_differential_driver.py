@@ -226,8 +226,11 @@ def codex(work, calls, extra=()):
         # served path byte for byte; the gate itself is pinned in test_codex_connector.
         rc = cc.main(["--server", "stub", "--work", str(work), "--poll", "0.01", "--allow-non-owner", *extra])
     if log.exists():
+        # The usage read at start (#6879) is new since the merge base and changes nothing; it is pinned in
+        # test_codex_connector, so the recording still compares every other call.
         calls += [{"method": m["method"], "params": m.get("params")}
-                  for m in map(json.loads, log.read_text().splitlines()) if m.get("method")]
+                  for m in map(json.loads, log.read_text().splitlines())
+                  if m.get("method") and m["method"] != "account/rateLimits/read"]
         log.unlink()
     return rc
 

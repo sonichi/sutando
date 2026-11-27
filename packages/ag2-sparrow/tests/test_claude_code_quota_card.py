@@ -470,6 +470,18 @@ class LimitMenu(NoticeBase):
         self.assertEqual(self.tick(STARTUP_MENU, 5.0), "quota-card")
         self.assertEqual(len(self.queued()), 2)
 
+    def test_an_account_switch_takes_back_the_old_limits_cards_not_sent_yet(self):
+        # Review of #6879: nothing of the account before the switch is sent once the new session runs.
+        quota_card.remember_room(self.root, DM)
+        self.assertEqual(self.tick(STARTUP_MENU), "quota-card")
+        self.at[0] += 5.0                   # a message sent after that card: it gets its own
+        self.task("task-w", "are you there?")
+        self.assertEqual(self.tick(STARTUP_MENU, 1.0), "quota-task-card x1")
+        self.assertEqual(len(self.queued()), 2)
+        launcher.Launcher.new_quota_incident(types.SimpleNamespace(root=self.root, cfg=self.cfg, log=self.logs.append))
+        self.assertEqual((self.queued(), quota_card.load(self.root)), ([], {}), "both taken back, the incident over")
+        self.assertEqual(self.sweep(self.at[0]), [], "the bridge posts nothing of it")
+
     def test_only_the_owners_own_unanswered_messages_get_it(self):
         quota_card.remember_room(self.root, DM)
         self.task("task-g", "hi", tier="guest")
@@ -536,6 +548,28 @@ class LimitMenu(NoticeBase):
         quota_card.save(self.root, {})
         self.assertEqual(quota_card.asked(self.root, self.cfg, {"channel_id": DM}, "r.txt", None, None), "")
         self.assertEqual(quota_card.asked_in_room(self.root), "")
+
+    def test_the_first_ask_after_a_restart_gets_the_limits_card_before_any_card_could_be_sent(self):
+        # RC6 acceptance: the first ask after a restart got the plain card. The limit's words were kept only once a
+        # card was queued, which needs the owner's DM room, not known yet.
+        from ag2_sparrow.adapters.claude_code import model_card
+        self.assertEqual(self.tick(STARTUP_MENU), "quota-no-room")
+        for n, ask in enumerate(("account", "model", "/model")):
+            rc, _ = self.claim(self.task("task-first%d" % n, ask))
+            self.assertEqual(rc, 1, "answered here, never by the session")
+            card = self.queued()[-1]["card"]
+            self.assertEqual((card["id"], card["account_controls"]["limit"]), (account_switch.CARD, True), ask)
+            self.assertTrue(card["text"].startswith("sarah@example.com (Claude Code) has hit its usage limit; "
+                                                    "resets Nov 28, 1pm."), card["text"])
+        self.assertEqual(len(self.queued()), 3, "one card per ask")
+        # That card told the owner: no unasked card follows once their DM is known.
+        self.assertEqual(self.tick(STARTUP_MENU, quota_card.RETRY_S), "")
+        self.assertEqual(len(self.queued()), 3)
+        # A new session (an account switch restarts it) is not at that limit: the ask gets its own card.
+        quota_card.new_session(self.root)
+        self.task("task-after", "/model")
+        self.assertEqual(model_card.card_matter(self.root, "task-after", self.cfg)[0], "model-card")
+        self.assertEqual(self.queued()[-1]["card"]["id"], model_card.model_switch.CARD)
 
     def test_a_task_card_whose_send_was_unsure_is_queued_again_under_its_own_id(self):
         quota_card.remember_room(self.root, DM)
@@ -683,7 +717,7 @@ class Supervisor(unittest.TestCase):
         lc, logs = self.lc()
         with mock.patch.object(quota_card, "new_session") as new:
             launcher.Launcher.new_quota_incident(lc)
-        new.assert_called_once_with("/r")
+        new.assert_called_once_with("/r", {})
         self.assertEqual(logs, [])
         with mock.patch.object(quota_card, "new_session", side_effect=OSError("ro")):
             launcher.Launcher.new_quota_incident(lc)

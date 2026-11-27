@@ -8,17 +8,24 @@ names; a tap no card claims gets the fixed line, and never reaches the model.
 from __future__ import annotations
 
 import os
-import re
 from pathlib import Path
 
-from . import connector_cards
+from . import card_ask, card_words, connector_cards
 
 ANSWERED = "[no-send] the card answers\n"
-# A switch can never be made in a room with other people in it, and no card that switches is shown
-# there: anyone asking for one in a room is told so, in their language, and the model never sees it.
-IN_ROOM = "Switching the account or model isn't available in a room. Please ask me in our DM."
-IN_ROOM_ZH = "房间里不能切换账号或模型，请到私聊里找我。"
-_CJK = re.compile(r"[\u3400-\u9fff]")
+# A room is no place for a switch; anyone but the owner hears one line (card_words, shared with the core).
+IN_ROOM, IN_ROOM_ZH = card_words.IN_ROOM, card_words.IN_ROOM_ZH
+MODEL_NAME, MODEL_NAME_ZH = card_words.MODEL_NAME, card_words.MODEL_NAME_ZH
+MODEL_UNKNOWN, MODEL_UNKNOWN_ZH = card_words.MODEL_UNKNOWN, card_words.MODEL_UNKNOWN_ZH
+ACCOUNT_OWNER_ONLY, ACCOUNT_OWNER_ONLY_ZH = card_words.ACCOUNT_OWNER_ONLY, card_words.ACCOUNT_OWNER_ONLY_ZH
+SWITCH_OWNER_ONLY, SWITCH_OWNER_ONLY_ZH = card_words.SWITCH_OWNER_ONLY, card_words.SWITCH_OWNER_ONLY_ZH
+ASK_OWNER, ASK_OWNER_ZH = card_words.ASK_OWNER, card_words.ASK_OWNER_ZH
+SAY_TRIES = 3
+
+
+class Undelivered(OSError):
+    """A recognised ask from someone other than the owner whose one line could not be written: not done, and
+    never the model's; the connector serves the task again later."""
 
 
 class Desk:
@@ -42,8 +49,8 @@ class Desk:
             return ""
 
     def task(self, path, result_file) -> str:
-        """What a task that was a card matter came to (a tap, or the owner's slash command in their DM),
-        else ''."""
+        """What a task that was a card matter came to (a tap, or the owner's slash command in their DM, or
+        anyone else's ask about the account or model, answered in one line), else ''."""
         agent_card, issued_cards = connector_cards._core()
         # The card rules read the task as the core does (the trusted header parse), not the connector's.
         with open(path, encoding="utf-8") as f:
@@ -67,10 +74,11 @@ class Desk:
             self.publish(result_file, self.quoted(verdict.say) + "\n")
             return "card-refused"
         ask, _, words = said.strip().partition(" ")
+        if agent_card.owner_may_act(sent, dm_only=False) is not None:
+            # Anyone else asking which account or model, or to switch, is answered here; other words go on.
+            return self.not_owner(sent, ask, said, result_file)
         if in_room(sent):
-            # Only the owner hears the room line; anyone else's words go on to the model.
-            owner = agent_card.owner_may_act(sent, dm_only=False) is None
-            return self.in_room(ask, said, result_file) if owner else ""
+            return self.in_room(ask, said, result_file)
         if agent_card.owner_may_act(sent) is not None:
             return ""
         slash = [card for card in self.cards if ask.lower() == card.ASK and card.usable()]
@@ -113,8 +121,59 @@ class Desk:
                 if out:     # out of usage: the limit is the answer, here too
                     self.publish(result_file, self.quoted(out) + "\n")
                     return "quota-in-room"
-                self.publish(result_file, self.quoted(IN_ROOM_ZH if _CJK.search(said) else IN_ROOM) + "\n")
+                self.publish(result_file, self.quoted(IN_ROOM_ZH if card_words.is_zh(said) else IN_ROOM) + "\n")
                 return "card-in-room"
+        return ""
+
+    def not_owner(self, sent, ask, said, result_file) -> str:
+        """A sender who is not the owner asking which account or model this agent is on, or asking it to switch
+        (a slash command, a named pick, or the card words), in a room or a DM: one line, in their language,
+        and no card. Team: the model's name for a model question, else that only the owner may switch or hear
+        about the account. Guest: to ask the owner. '' for any other words, and for any other sender."""
+        tier = sender_tier(sent)
+        said = said.strip()
+        if not tier or not said:
+            return ""
+        kinds, switch = set(), card_ask.names_a_pick(said)
+        for card in self.cards:
+            named = getattr(card, "named_in", None)
+            asks = getattr(card, "asks", None)
+            if ask.lower() == card.ASK or (named and named(said)):
+                kinds.add(card.KIND)
+                switch = True
+            elif asks and asks(said):
+                kinds.add(card.KIND)
+        kinds |= card_words.owner_only_kinds(said)     # any length: the account and model are not the model's to tell
+        if not kinds and not switch:
+            return ""
+        switch = switch or card_ask.switches(said)
+        told = tier == "team" and not switch and "model" in kinds
+        line = card_words.not_owner_line(tier, kinds, switch, card_words.is_zh(said), self.model_name() if told else "")
+        self.say_to_non_owner(result_file, self.quoted(line) + "\n")
+        return "card-not-owner"
+
+    def say_to_non_owner(self, result_file, body) -> None:
+        """Write the line, tried SAY_TRIES times; Undelivered when none lands, so the task is not marked done."""
+        from . import result_publish
+        why = None
+        for _ in range(SAY_TRIES):
+            try:
+                self.publish(result_file, body)
+                return
+            except result_publish.PublishedUnconfirmed:
+                return      # it may well be there: a second line would be a second answer
+            except OSError as e:
+                why = e
+        raise Undelivered("the line to a sender who is not the owner was not written (%s: %s)" % (type(why).__name__, why))
+
+    def model_name(self) -> str:
+        """The model in use as the model card names it, '' when it cannot be read."""
+        for card in self.cards:
+            if card.KIND == "model" and getattr(card, "current_name", None):
+                try:
+                    return " ".join(str(card.current_name() or "").split())
+                except Exception:  # noqa: BLE001 - said as not known, never guessed
+                    return ""
         return ""
 
     def offered_all(self, cards, sent, result_file) -> str:
@@ -164,6 +223,12 @@ class Desk:
     def hint(self) -> str:
         """What an owner turn is told about the cards that can be shown, '' when none can."""
         return "\n\n".join(card.HINT for card in self.cards if card.usable())
+
+
+def sender_tier(sent) -> str:
+    """'team' or 'guest' for a sender who is not the owner, by the trusted headers (card_words.sender_tier)."""
+    connector_cards._core()      # the bundled modules, on the path
+    return card_words.sender_tier(sent)
 
 
 def in_room(sent) -> bool:

@@ -807,6 +807,27 @@ def run_prompt(client_factory, args, headers, task_id, prompt, decide, store, st
         client.close(args.interrupt_grace)
 
 
+def start_only(client_factory, args, stderr_name, log) -> bool:
+    """Start the agent, `initialize` and open a Session in its working directory, with no prompt, then stop it: what
+    an agent does on start (agy renews its sign-in) without a turn. True when the Session opened."""
+    client = None
+    try:
+        client = client_factory(args.acp_argv, cwd=args.cwd, env=args.child_env,
+                                stderr_path=os.path.join(args.state, stderr_name),
+                                on_permission=lambda params: {"outcome": {"outcome": "cancelled"}},
+                                on_update=lambda update: None)
+        client.initialize(args.rpc_timeout)
+        client.call("session/new", {"cwd": args.cwd, "mcpServers": []}, args.rpc_timeout)
+        return True
+    except Exception as e:  # noqa: BLE001 - not started: the caller says why it could not
+        log("started without a turn: failed:", "%s: %s" % (type(e).__name__, str(e)[:120]))
+        return False
+    finally:
+        if client is not None:
+            with contextlib.suppress(Exception):
+                client.close()
+
+
 def _set_mode(client, session_id, modes, isolated, timeout):
     """'' once the mode `isolated.choose_mode` names is set on the Session; else why the turn is refused."""
     mode = isolated.choose_mode(modes)
