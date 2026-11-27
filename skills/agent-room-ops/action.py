@@ -55,7 +55,7 @@ def _owners():
         import pool_provision
     except ImportError as e:
         raise Refused(f"Actions need this checkout's connections record and worker-pool skill ({e.name} "
-                      "is not importable); use the s.space MCP tools instead") from None
+                      "is not importable); use the hosted MCP room tools instead") from None
     return connections, pool_provision
 
 
@@ -76,7 +76,7 @@ def requester(task_file, workspace=None) -> Optional[str]:
     if not who:
         return None
     if len(who) > ASKED_BY_MAX or not ASKED_BY_RE.fullmatch(who):
-        raise Refused("the task's sender is not an s.space user id, so the write cannot be held to "
+        raise Refused("the task's sender is not a room user id (@name:server), so the write cannot be held to "
                       "that person's rights; nothing was sent")
     return who
 
@@ -130,7 +130,7 @@ def _outcome(verb: str, env: Mapping[str, object], pp) -> dict:
         out["code"] = code
     said = env.get("message") if isinstance(env.get("message"), str) else ""
     if state == "held":
-        out["reason"] = ("waiting for approval in s.space; do NOT run it again (it runs once approved): "
+        out["reason"] = ("waiting for its approval; do NOT run it again (it runs once approved): "
                          "check it with operation.inspect")
     else:
         out["reason"] = said or f"the server did not complete it (status {env.get('status')!r})"
