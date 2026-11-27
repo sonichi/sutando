@@ -12,7 +12,7 @@ from pathlib import Path
 
 PKG_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG_ROOT))
-from ag2_sparrow import account_switch, card_ask, card_desk, model_switch  # noqa: E402
+from ag2_sparrow import account_switch, card_ask, card_desk, card_words, model_switch  # noqa: E402
 from ag2_sparrow.adapters.antigravity import agy_account  # noqa: E402
 
 from ag2_sparrow.adapters.claude_code import account_card, model_card  # noqa: E402
@@ -269,15 +269,50 @@ class Desk(unittest.TestCase):
             for said in ("which account are you on?", "你在用哪个账号和模型", "/account", "switch account",
                          "who are you signed in as?", "what's your email?"):
                 self.written.clear()
-                self.task(said, tier=tier, kind="room")
-                for line in self.written:
-                    self.assertNotIn("@", line, (tier, said))
-                    self.assertNotIn("Max", line, (tier, said))
+                self.assertEqual(self.task(said, tier=tier, kind="room"), "card-not-owner", (tier, said))
+                line, = self.written
+                self.assertIn(line.rstrip("\n"), (card_desk.ACCOUNT_OWNER_ONLY, card_desk.SWITCH_OWNER_ONLY,
+                                                  card_desk.ASK_OWNER, card_desk.MODEL_NAME % "Opus", card_desk.ASK_OWNER_ZH,
+                                                  card_desk.MODEL_NAME_ZH % "Opus"), (tier, said))
+                self.assertNotIn("@", line, (tier, said))
+                self.assertNotIn("Max", line, (tier, said))
+
+    def test_any_length_ask_about_the_account_or_model_is_answered_in_code(self):
+        # Chi's review: email, plan and usage too, and past the short-ask cap; never the model's to tell.
+        self.model.current_name = lambda: "Opus"
+        long_tail = " I need it for the onboarding doc we are writing together this afternoon, thanks!"
+        for said, team in (("what's your email?", card_desk.ACCOUNT_OWNER_ONLY),
+                           ("which plan are you on?", card_desk.ACCOUNT_OWNER_ONLY),
+                           ("how much usage is left?", card_desk.ACCOUNT_OWNER_ONLY),
+                           ("are you on the Max plan?" + long_tail, card_desk.ACCOUNT_OWNER_ONLY),
+                           ("what model are you?", card_desk.MODEL_NAME % "Opus"),
+                           ("which model are you using?" + long_tail, card_desk.MODEL_NAME % "Opus"),
+                           ("你的邮箱是什么", card_desk.ACCOUNT_OWNER_ONLY_ZH),
+                           ("额度还剩多少", card_desk.ACCOUNT_OWNER_ONLY_ZH)):
+            for kind in ("room", "dm"):
+                with self.subTest(said=said, kind=kind):
+                    self.assertEqual(self.answered(said, "team", kind=kind), team)
+                    self.assertEqual(self.answered(said, "guest", kind=kind),
+                                     card_desk.ASK_OWNER_ZH if card_words.is_zh(said) else card_desk.ASK_OWNER)
+        self.assertEqual((self.offers(), self.by_card), ((0, [0, 0]), []))
+
+    def test_an_owner_tier_collaborator_is_not_the_owner(self):
+        self.model.current_name = lambda: "Opus"
+        self.assertEqual(self.answered("which account are you on?", "owner", kind="dm", extra="collaborator: true\n"),
+                         card_desk.ACCOUNT_OWNER_ONLY)
+        self.assertEqual(self.offers(), (0, [0, 0]))
+
+    def test_the_lines_and_the_pick_are_the_core_s_own(self):
+        # One policy with src/switch_card_intercept.py: the package's copy of card_words, not words of its own.
+        self.assertIs(card_ask.names_a_pick, card_words.names_a_pick)
+        self.assertEqual((card_desk.IN_ROOM, card_desk.ASK_OWNER), (card_words.IN_ROOM, card_words.ASK_OWNER))
 
     def test_anyone_else_s_other_words_still_reach_the_model(self):
         for tier in ("team", "guest"):
             for said in ("hi there", "Can you model this?", "which model is best for coding?", "use claude to write this",
-                         "switch to dark mode", "我的 GitHub 账号", "create an account on GitHub"):
+                         "switch to dark mode", "我的 GitHub 账号", "create an account on GitHub",
+                         "what's the usage of this API?", "show CLI usage", "email me the report",
+                         "how much of my quota is left?", "what's your plan for today?"):
                 for kind in ("room", "dm"):
                     with self.subTest(tier=tier, said=said, kind=kind):
                         self.assertEqual(self.task(said, tier=tier, kind=kind), "")

@@ -8,31 +8,18 @@ names; a tap no card claims gets the fixed line, and never reaches the model.
 from __future__ import annotations
 
 import os
-import re
 from pathlib import Path
 
-from . import card_ask, connector_cards
+from . import card_ask, card_words, connector_cards
 
 ANSWERED = "[no-send] the card answers\n"
-# A switch can never be made in a room with other people in it, and no card that switches is shown
-# there: anyone asking for one in a room is told so, in their language, and the model never sees it.
-IN_ROOM = "Switching the account or model isn't available in a room. Please ask me in our DM."
-IN_ROOM_ZH = "房间里不能切换账号或模型，请到私聊里找我。"
-_CJK = re.compile(r"[\u3400-\u9fff]")
-# Anyone but the owner asking which account or model this agent is on, or asking it to switch, is answered
-# here and never by the model (owner 2026-11-26): a team member (a collaborator too) is told the model's
-# name and nothing else, a guest nothing at all. The account (who is signed in, its email, plan or usage)
-# is told to no one but the owner, in a room or a DM.
-MODEL_NAME = "I'm running on %s."
-MODEL_NAME_ZH = "我现在用的模型是 %s。"
-MODEL_UNKNOWN = "I can't tell which model I'm on right now."
-MODEL_UNKNOWN_ZH = "我现在读不到自己在用的模型。"
-ACCOUNT_OWNER_ONLY = "I only share account details with my owner."
-ACCOUNT_OWNER_ONLY_ZH = "账号信息只告诉我的主人。"
-SWITCH_OWNER_ONLY = "Only my owner can switch my account or model."
-SWITCH_OWNER_ONLY_ZH = "只有我的主人能切换我的账号或模型。"
-ASK_OWNER = "Please ask my owner."
-ASK_OWNER_ZH = "请问我的主人。"
+# A room is no place for a switch; anyone but the owner hears one line (card_words, shared with the core).
+IN_ROOM, IN_ROOM_ZH = card_words.IN_ROOM, card_words.IN_ROOM_ZH
+MODEL_NAME, MODEL_NAME_ZH = card_words.MODEL_NAME, card_words.MODEL_NAME_ZH
+MODEL_UNKNOWN, MODEL_UNKNOWN_ZH = card_words.MODEL_UNKNOWN, card_words.MODEL_UNKNOWN_ZH
+ACCOUNT_OWNER_ONLY, ACCOUNT_OWNER_ONLY_ZH = card_words.ACCOUNT_OWNER_ONLY, card_words.ACCOUNT_OWNER_ONLY_ZH
+SWITCH_OWNER_ONLY, SWITCH_OWNER_ONLY_ZH = card_words.SWITCH_OWNER_ONLY, card_words.SWITCH_OWNER_ONLY_ZH
+ASK_OWNER, ASK_OWNER_ZH = card_words.ASK_OWNER, card_words.ASK_OWNER_ZH
 
 
 class Desk:
@@ -128,7 +115,7 @@ class Desk:
                 if out:     # out of usage: the limit is the answer, here too
                     self.publish(result_file, self.quoted(out) + "\n")
                     return "quota-in-room"
-                self.publish(result_file, self.quoted(IN_ROOM_ZH if _CJK.search(said) else IN_ROOM) + "\n")
+                self.publish(result_file, self.quoted(IN_ROOM_ZH if card_words.is_zh(said) else IN_ROOM) + "\n")
                 return "card-in-room"
         return ""
 
@@ -150,19 +137,12 @@ class Desk:
                 switch = True
             elif asks and asks(said):
                 kinds.add(card.KIND)
+        kinds |= card_words.owner_only_kinds(said)     # any length: the account and model are not the model's to tell
         if not kinds and not switch:
             return ""
         switch = switch or card_ask.switches(said)
-        zh = bool(_CJK.search(said))
-        if tier != "team":
-            line = ASK_OWNER_ZH if zh else ASK_OWNER
-        elif switch:
-            line = SWITCH_OWNER_ONLY_ZH if zh else SWITCH_OWNER_ONLY
-        elif "model" in kinds:
-            name = self.model_name()
-            line = ((MODEL_NAME_ZH if zh else MODEL_NAME) % name) if name else (MODEL_UNKNOWN_ZH if zh else MODEL_UNKNOWN)
-        else:
-            line = ACCOUNT_OWNER_ONLY_ZH if zh else ACCOUNT_OWNER_ONLY
+        told = tier == "team" and not switch and "model" in kinds
+        line = card_words.not_owner_line(tier, kinds, switch, card_words.is_zh(said), self.model_name() if told else "")
         self.publish(result_file, self.quoted(line) + "\n")
         return "card-not-owner"
 
@@ -226,17 +206,9 @@ class Desk:
 
 
 def sender_tier(sent) -> str:
-    """'team' (a collaborator too) or 'guest' for a sender who is not the owner, by the trusted headers; ''
-    for the owner, and for any other tier (an ambient observation), whose words are left as they were."""
+    """'team' or 'guest' for a sender who is not the owner, by the trusted headers (card_words.sender_tier)."""
     connector_cards._core()      # the bundled modules, on the path
-    import local_task_protocol as ltp
-    tier = ltp.canonical_access_tier((sent or {}).get("access_tier"))
-    collaborator = str((sent or {}).get("collaborator") or "").strip().lower() == "true"
-    if tier == "team" or (collaborator and tier == "owner"):
-        return "team"
-    if tier == "guest":
-        return "guest"
-    return ""
+    return card_words.sender_tier(sent)
 
 
 def in_room(sent) -> bool:

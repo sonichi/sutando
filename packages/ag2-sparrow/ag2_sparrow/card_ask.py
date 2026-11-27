@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import re
 
+from . import card_words
+
 ASK_MAX = 80
 ACCOUNT, MODEL = "account", "model"
 
@@ -73,22 +75,7 @@ def switches(text) -> bool:
     return bool(kinds) and switch
 
 
-# A pick named in a sender's own words, for any runtime: "switch to opus", "change the model to gpt-5",
-# "换成 sonnet". Only the names of models, so "switch to dark mode" is not one.
-_FAMILY = r"(?:opus|sonnet|haiku|fable|claude|gpt|codex|gemini|o\d|default)"
-_PART = r"(?:opus|sonnet|haiku|fable|claude|gpt|codex|gemini|pro|flash|mini|max|high|low|medium|[-.\w]*\d[-.\w]*)"
-_NAMED = _FAMILY + r"[-.\w\[\]]*(?:\s+" + _PART + r"[-.\w\[\]]*){0,2}(?:\s*\(1m context\))?"
-_PICK = re.compile(r"^\s*(?:(?:hey|hi|ok|okay|please|pls|can you|could you)[\s,]+)*"
-                   r"(?:(?:switch|change|move|go)(?:\s+(?:the|your))?(?:\s+models?)?\s+to|use)\s+(?:the\s+)?"
-                   r"|^\s*(?:请|帮我)?(?:切换|更换|换|改|切)(?:模型)?(?:到|成)\s*", re.I)
-_PICKED = re.compile(_NAMED + r"(?:\s*(?:models?|模型))?(?:[\s,]*(?:please|pls|now|吧|一下))?\s*[.!?。！？]*\s*$", re.I)
-
-
-def names_a_pick(text) -> bool:
-    """Whether a short message picks a model by name ("switch to opus", "换成 sonnet")."""
-    said = (text or "").replace("’", "'").strip()
-    lead = _PICK.match(said) if said and len(said) <= ASK_MAX else None
-    return bool(lead) and bool(_PICKED.fullmatch(said, lead.end()))
+names_a_pick = card_words.names_a_pick     # a pick named in words, the one policy with the core
 
 
 def _read(text) -> tuple:
