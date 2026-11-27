@@ -10,6 +10,9 @@ same with no rate-limit window; `[[limit-words]]` fails it on another error whos
 `[[noaccess]]` fails a turn that names no model as one the account cannot run; `[[fail]]` fails it on another error. A refused turn ends with no item, unless `[[worked]]` is there too: then a
 reasoning item and part of a reply come first.
 
+`account/rateLimits/read` answers as `stub-limits` under CODEX_HOME says ("out": a window used up; "ok": usage
+left); with no such file the method is unknown.
+
 Tokens, as the real server holds them: `stub-token` under CODEX_HOME is read once, at start, and kept in
 memory. A sign-in that succeeds writes a new one there and lists the old one in `stub-revoked`; a turn on a
 token listed there fails as `unauthorized`, as a server that kept the old login after a switch does.
@@ -118,6 +121,13 @@ for line in sys.stdin:
         who = home_file("stub-account").split("\n")[-1]
         send({"jsonrpc": "2.0", "id": rid, "result": {
             "account": {"type": "chatgpt", "email": who, "planType": "pro"} if who else None, "requiresOpenaiAuth": True}})
+    elif meth == "account/rateLimits/read" and home_file("stub-limits"):
+        # `stub-limits` says what the account's usage is now: "out" (a window used up) or "ok" (usage left);
+        # absent, the method is unknown, as on a server that cannot say.
+        used = 100 if home_file("stub-limits") == "out" else 10
+        send({"jsonrpc": "2.0", "id": rid, "result": {"rateLimits": {
+            "limitId": "codex", "primary": {"usedPercent": used, "windowDurationMins": 300,
+                                            "resetsAt": int(time.time()) + 3600}}}})
     elif meth == "account/login/start":
         plan = home_file("stub-login").split()
         if plan[:1] == ["refuse"]:

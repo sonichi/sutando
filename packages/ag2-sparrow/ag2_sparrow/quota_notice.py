@@ -20,6 +20,11 @@ Queued is not told. The bridge drops a card it could not post within connector_c
 incident counts as told only once the card left the outbox in time or its posted receipt is there; one
 that was dropped is queued again (the same card id, which replaces the earlier in the room). Nothing here
 changes an account. English only.
+
+A limit belongs to the account it was recorded on (`account()`, a stable key that is no secret): once the account in
+use is another one (the owner switched), the record no longer applies and is dropped, so a stale limit never
+answers for an account that has usage. A runtime that can read its usage before any turn (Codex) records the limit
+it finds with `asked_limit`, so the first ask after a restart is answered by the limit's card too.
 """
 from __future__ import annotations
 
@@ -86,11 +91,13 @@ class QuotaNotice:
     """`build(text) -> (body, card)` is the connector's account card (its account_controls marker on), led by
     `text`; `using()` names the account in use in words ('' when it cannot say)."""
 
-    def __init__(self, state_dir, bridge_state, name, build, using, log, now=time.time, note=None):
+    def __init__(self, state_dir, bridge_state, name, build, using, log, now=time.time, note=None, account=None):
         self.state_dir, self.bridge_state, self.name = str(state_dir), bridge_state, name
         self.build, self.using, self.log, self.now = build, using, log, now
         # `note(text) -> (body, card)`: a card with no account controls, for a room that is not the owner's DM.
         self.note = note or build
+        # `account() -> str`: the account in use as a stable key (no secret), '' when it cannot be told.
+        self.account = account
 
     # ── records ──
     def _read(self, name) -> dict:
@@ -114,6 +121,27 @@ class QuotaNotice:
 
     def load(self) -> dict:
         return self._read(FILE)
+
+    def in_use(self) -> str:
+        """The account in use as `account()` keys it, '' when there is none or it cannot be read."""
+        try:
+            return str(self.account() or "") if self.account else ""
+        except Exception as e:  # noqa: BLE001 - unknown: the record is taken as it is
+            self.log("account not read:", "%s: %s" % (type(e).__name__, str(e)[:200]))
+            return ""
+
+    def current(self) -> dict:
+        """The incident's record, {} when it was kept for another account than the one in use now: the owner
+        switched, and that account's limit is not this one's. Such a record is dropped then."""
+        rec = self.load()
+        kept = str(rec.get("account") or "")
+        if kept:
+            now = self.in_use()
+            if now and now != kept:
+                self.save({})
+                self.log("quota: the limit kept for another account no longer applies")
+                return {}
+        return rec
 
     def save(self, rec: dict) -> bool:
         return self._write(FILE, rec)
@@ -142,12 +170,12 @@ class QuotaNotice:
     def limited(self) -> bool:
         """Whether a limit is being told or was told and has not cleared: the card is the notice, so the
         room needs no error line of its own."""
-        rec = self.load()
+        rec = self.current()
         return bool(rec.get("since")) and bool(rec.get("told") or rec.get("qid"))
 
     def says(self) -> str:
         """The limit in force, in words, for a card the owner asks for meanwhile; '' when none is, or its reset passed."""
-        rec = self.load()
+        rec = self.current()
         until = rec.get("reset_at")
         # The refusal itself is the limit, whether or not any card of it could be queued.
         if not rec.get("since") or (until is not None and self.now() >= float(until)):
@@ -159,7 +187,20 @@ class QuotaNotice:
 
     def says_in_room(self) -> str:
         """`says`, in the words for a shared room."""
-        return room_words(self.name, str(self.load().get("reset") or "")) if self.says() else ""
+        return room_words(self.name, str(self.current().get("reset") or "")) if self.says() else ""
+
+    def asked_limit(self, reset: str = "", reset_at=None) -> None:
+        """The runtime, read before an owner's ask was answered, says the account is out of usage now: the limit
+        is kept as told, since the ask is answered by the limit's card (no unasked card besides it)."""
+        rec = self._start(self.now(), reset, reset_at)
+        self.save(dict(rec, told=True))
+
+    def shown(self) -> None:
+        """The owner's ask in their DM was answered by the limit's card: that card told them, so no unasked one
+        follows it (one owed for want of a DM room would otherwise be queued on the next tick)."""
+        rec = self.current()
+        if rec.get("since") and not rec.get("told"):
+            self.save(dict({k: v for k, v in rec.items() if k != "noroom"}, told=True))
 
     def cleared(self) -> str:
         """The runtime answered: the limit is over, and a later one is a new card."""
@@ -259,7 +300,12 @@ class QuotaNotice:
         return account_switch.limited(self.build(words(self.name, str(rec.get("reset") or ""), using)))
 
     def _hit(self, reset: str = "", reset_at=None) -> str:
-        rec, at = self.load(), self.now()
+        at = self.now()
+        return self._deliver(self._start(at, reset, reset_at), at)
+
+    def _start(self, at: float, reset: str = "", reset_at=None) -> dict:
+        """The incident's record with this refusal in it (not saved), on the account in use."""
+        rec = self.current()
         until = rec.get("reset_at")
         if rec.get("since") and until is not None and at >= float(until) and (rec.get("told") or rec.get("qid")):
             rec = {}                     # the earlier limit reset and this is a new one: a new card
@@ -270,10 +316,14 @@ class QuotaNotice:
             rec["reset_at"] = float(reset_at)
         if reset and not rec.get("reset"):
             rec["reset"] = reset[:60]
-        return self._deliver(rec, at)
+        account = self.in_use()
+        if account:
+            rec["account"] = account
+        return rec
 
     def tick(self) -> str:
-        """Between turns: settle a queued card's fate, and queue again one the bridge dropped. '' when idle."""
+        """Between turns: settle a queued card's fate, and queue again one the bridge dropped. '' when idle.
+        The account is not read here (each tick): a switch is seen by the next message's `current`."""
         rec = self.load()
         if not rec.get("since"):
             return ""

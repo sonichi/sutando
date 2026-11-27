@@ -314,6 +314,34 @@ class AccountCardTest(unittest.TestCase):
             (shown,) = self.posted("$a%d" % n)
             self.assertEqual((shown["text"], shown["account_controls"]), (card["text"], card["account_controls"]), asked)
 
+    def test_after_a_restart_at_the_limit_the_first_ask_gets_only_the_limits_card_and_a_switch_ends_it(self):
+        # RC6 acceptance (Dots): the first "account", "model" or "/model" after the agent restarted, at the limit.
+        self.dm("task-q1", "STUB:QUOTA hi")
+        self.serve()
+        (limit,) = self.posted("$q1")
+        for n, ask in enumerate(("account", "model", "/model")):
+            self.connector = None            # a restart: a new connector, reading what the last one kept
+            self.dm("task-r%d" % n, ask)
+            self.serve()
+            (shown,) = self.posted("$r%d" % n)
+            self.assertEqual((shown["text"], shown["account_controls"]), (limit["text"], limit["account_controls"]), ask)
+        # The owner switched to this agent's own API key: the limit was the Google sign-in's, not this one's.
+        self.keychain["saved"] = True
+        self.connector = None
+        self.dm("task-m", "/model")
+        self.serve()
+        self.assertNotIn("quota-card-asked", json.dumps(self.w.metrics()[-1]))
+        self.assertEqual([c for c in self.posted("$m") if "usage limit" in c["text"]], [], "no limit card for it")
+        self.dm("task-a", "account")
+        self.serve()
+        (card,) = self.posted("$a")
+        self.assertNotIn("usage limit", card["text"])
+        self.assertEqual(card["account_controls"], {"runtime": "antigravity", "agent": AGENT})
+        self.dm("task-t", "STUB:TEXT hi")
+        self.serve()
+        self.assertNotEqual(self.w.result("task-t"), gc.LIMITED_NO_SEND)
+        self.assertEqual(self.posted("$t"), [], "a turn, and no card")
+
     def test_a_collaborator_who_asks_while_agy_is_at_its_limit_is_told_why_there_is_no_answer(self):
         # Review of #6713: once the owner's card was queued, anyone else who asked got no reply at all.
         self.dm("task-q1", "STUB:QUOTA hi")

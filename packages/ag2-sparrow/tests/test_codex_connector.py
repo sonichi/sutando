@@ -2741,6 +2741,89 @@ class QuotaCardTest(CardWorld, unittest.TestCase):
         self.serve("task-3", "[[limit-bare]] hello")
         self.assertEqual(len(self.posted("$card2")), 1, "the limit came back: a second card")
 
+    def sign_in(self, account_id):
+        """The login on disk, as the account switch leaves it: the account's id only (no token is needed here)."""
+        (self.home / "auth.json").write_text(json.dumps({"tokens": {"account_id": account_id}}))
+
+    def test_after_a_restart_on_an_account_out_of_usage_the_first_ask_gets_only_the_limits_card(self):
+        # RC6 acceptance (Dots): out of usage, the first owner message after the agent restarted was "account",
+        # "model" or "/model", and it got the plain card. Each serve is a new connector, as after a restart; the
+        # server, asked before any turn was refused here, says the account is out of usage.
+        self.sign_in("acct-a")
+        (self.home / "stub-limits").write_text("out")
+        for n, ask in enumerate(("account", "model", "/model")):
+            self.assertEqual(self.serve("task-first%d" % n, ask), account_switch.ANSWERED, ask)
+            self.assertEqual(metrics(self.work)[-1]["card"], "quota-card-asked", ask)
+            shown = self.outbox()
+            self.assertEqual([(q["card"]["id"], q["card"]["account_controls"]) for q in shown],
+                             [(account_switch.CARD, {"runtime": "codex", "limit": True})], ask)
+            self.assertRegex(shown[0]["card"]["text"], r"^Codex has reached its usage limit \(resets [^)]+\)")
+            self.posted()
+        rec = json.loads((self.work / "state" / quota_notice.FILE).read_text())
+        self.assertTrue(rec["told"], "the card the ask got told the owner: no unasked one besides")
+        # A limit recorded by a refused turn, then a restart with a server that cannot say: the record answers.
+        (self.home / "stub-limits").unlink()
+        self.serve("task-l", "[[limit]] hello")
+        self.posted()
+        self.serve("task-after", "/model")
+        self.assertEqual([q["card"]["id"] for q in self.outbox()], [account_switch.CARD])
+        self.assertEqual(metrics(self.work)[-1]["card"], "quota-card-asked")
+
+    def test_after_switching_to_an_account_with_usage_the_old_limit_no_longer_answers(self):
+        self.sign_in("acct-a")
+        self.serve("task-1", "[[limit]] hello")
+        self.posted()
+        self.assertEqual(self.serve("task-2", "/model"), account_switch.ANSWERED)
+        self.assertEqual(metrics(self.work)[-1]["card"], "quota-card-asked")
+        self.posted()
+        # The owner switched (another account in auth.json) and the agent restarted: its own cards, its turns.
+        self.sign_in("acct-b")
+        self.assertEqual(self.serve("task-3", "/model"), model_switch.ANSWERED)
+        self.assertEqual(metrics(self.work)[-1]["card"], "model-card")
+        self.assertEqual([q["card"]["id"] for q in self.outbox()], [self.CARD])
+        self.assertFalse(json.loads((self.work / "state" / quota_notice.FILE).read_text()), "the old limit is dropped")
+        self.posted()
+        self.serve("task-4", "account")
+        self.assertEqual(self.outbox()[-1]["card"]["account_controls"], {"runtime": "codex"}, "the plain account card")
+        self.assertTrue(self.serve("task-5", "hello").startswith("STUB echo"))
+
+    def test_a_limit_kept_for_another_account_is_not_this_ones(self):
+        self.sign_in("acct-b")
+        state = self.work / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / quota_notice.FILE).write_text(json.dumps({"since": time.time(), "last": time.time(), "told": True,
+                                                           "reset_at": time.time() + 3600, "account": "another"}))
+        self.serve("task-1", "/model")
+        self.assertEqual(metrics(self.work)[-1]["card"], "model-card")
+        # Kept for this very account, the same record answers.
+        notice = quota_notice.QuotaNotice(state, self.bridge, "Codex", None, None, lambda *a: None,
+                                          account=lambda: "mine")
+        notice.save({"since": time.time(), "told": True, "reset_at": time.time() + 3600, "account": "mine"})
+        self.assertTrue(notice.says())
+        # An account that cannot be read leaves the record as it is.
+        self.assertTrue(quota_notice.QuotaNotice(state, self.bridge, "Codex", None, None, lambda *a: None,
+                                                 account=lambda: 1 / 0).says())
+
+    def test_a_server_that_says_the_account_has_usage_clears_a_limit_kept_from_before_the_restart(self):
+        self.sign_in("acct-a")
+        self.serve("task-1", "[[limit-bare]] hello")
+        self.posted()
+        (self.home / "stub-limits").write_text("ok")
+        self.serve("task-2", "/model")
+        self.assertEqual(metrics(self.work)[-1]["card"], "model-card")
+
+    def test_what_a_usage_read_says(self):
+        later = time.time() + 3600
+        out = {"rateLimits": {"primary": {"usedPercent": 100, "resetsAt": later}}}
+        self.assertEqual(cc.usage_state(out), out["rateLimits"])
+        self.assertTrue(cc.usage_state({"rateLimits": {"rateLimitReachedType": "plan"}}) is not None)
+        self.assertTrue(cc.usage_state({"rateLimits": {}, "ordinaryUsageAllowed": False}) is not None)
+        self.assertEqual(cc.usage_state({"rateLimits": {"primary": {"usedPercent": 40, "resetsAt": later},
+                                                        "secondary": {"usedPercent": 99}}}), {})
+        for unknown in (None, {}, {"turn": {}}, {"rateLimits": {}}, {"rateLimits": {"primary": {"usedPercent": "x"}}},
+                        {"rateLimits": {"primary": {"usedPercent": 100}}}):
+            self.assertIsNone(cc.usage_state(unknown), unknown)
+
     def test_another_error_queues_no_card(self):
         self.assertEqual(self.serve("task-1", "[[fail]] hello"), "Codex ended this task with status failed.\n")
         self.assertEqual(self.outbox(), [])

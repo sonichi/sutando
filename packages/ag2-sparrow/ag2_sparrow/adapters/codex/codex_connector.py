@@ -244,6 +244,24 @@ def limit_reset(snapshot, now=None) -> "float | None":
         if isinstance(used, (int, float)) and used >= 100 and isinstance(at, (int, float)) and at > now:
             found.append(float(at))
     return max(found) if found else None
+
+
+USAGE_READ_S = 10.0     # `account/rateLimits/read`: a usage read before a card ask waits no longer than this
+
+
+def usage_state(answer, now=None) -> "dict | None":
+    """From an `account/rateLimits/read` answer: the snapshot when it says the account is out of usage now (a
+    window used up, a limit it names as reached, or ordinary usage not allowed); {} when every window it gives
+    has usage left; None when it does not say (no window with a number, or an answer of another shape)."""
+    if not isinstance(answer, dict) or not isinstance(answer.get("rateLimits"), dict):
+        return None
+    snapshot = answer["rateLimits"]
+    if (limit_reset(snapshot, now) is not None or snapshot.get("rateLimitReachedType")
+            or answer.get("ordinaryUsageAllowed") is False):
+        return snapshot
+    used = [w.get("usedPercent") for w in (snapshot.get(n) for n in ("primary", "secondary")) if isinstance(w, dict)]
+    used = [u for u in used if isinstance(u, (int, float)) and not isinstance(u, bool)]
+    return {} if used and all(u < 100 for u in used) else None
 OWNER_ONLY, SHARED = "owner-only", "shared"   # third line of a thread file; absent: an older file, unknown
 SHARED_SUFFIX = ".shared"               # a collaborator's thread where the kept thread is not known to be shared
 RESUME_MARKER = "resume-thread-taken"   # under state/: the --resume-thread id already carried over
@@ -507,7 +525,7 @@ class Connector:
             self._quota = quota_notice.QuotaNotice(
                 self.args.state, getattr(self.args, "bridge_state", None), "Codex",
                 lambda text: self.accounts.card("pending", text, ask=True), self.accounts.using, log,
-                note=lambda text: self.accounts.card("pending", text))
+                note=lambda text: self.accounts.card("pending", text), account=lambda: self.signin_account or "")
         return self._quota
 
     def saw_rate_limits(self, params, tell=True) -> str:
@@ -539,11 +557,42 @@ class Connector:
                               lambda: self.quota.says_in_room())
 
     def limit_first(self, sent, result_file) -> str:
-        """Out of usage, the owner's ask for a card is answered by the limit's card (the account card, which says it)."""
+        """Out of usage, the owner's ask for a card is answered by the limit's card (the account card, which says it).
+        With no limit on record (none was refused yet since a restart), the server is asked first."""
         if not self.quota.says():
-            return ""
+            snapshot = self.usage_now()
+            if not snapshot:
+                return ""
+            self.rate_limits = snapshot
+            at = limit_reset(snapshot)
+            self.quota.asked_limit(quota_notice.reset_from_epoch(at) if at else "", at)
+            if not self.quota.says():
+                return ""
         self.accounts.offer(sent, result_file)
+        self.quota.shown()
         return "quota-card-asked"
+
+    def usage_now(self) -> "dict | None":
+        """The account's usage as the server reads it now (usage_state); None when it cannot be read."""
+        try:
+            return usage_state(self.rpc.request("account/rateLimits/read", {}, timeout=USAGE_READ_S))
+        except Exception as e:  # noqa: BLE001 - advisory: the card asked for is shown as before
+            log("usage not read:", "%s: %s" % (type(e).__name__, str(e)[:120]))
+            return None
+
+    def usage_at_start(self) -> str:
+        """Before the first task: a limit the account is at already is known (and told, once per limit) without
+        waiting for a turn to be refused, and one kept from before that the server says is over is cleared."""
+        snapshot = self.usage_now()
+        if snapshot:
+            self.rate_limits = snapshot
+            return self.quota_hit()
+        if snapshot == {}:
+            done = self.quota.cleared()
+            if done:
+                log("quota:", done, "(the server says the account has usage)")
+            return done
+        return ""
 
     def card_answer(self, result_file, body):
         """A card matter's answer, led by a model outcome this turn could only say in words."""
@@ -1287,6 +1336,8 @@ class Connector:
         idle_since = time.time()
         metrics_path = os.path.join(self.args.state, "metrics.jsonl")
         held = {}       # task id -> (since when, its file's name, its tier): waiting for the selected account
+        if getattr(self.args, "state", None):
+            self.usage_at_start()       # a restart on an account out of usage: its first ask gets the limit's card
         while not stop_requested():
             try:    # a card's ledger entry, or a sign-in given up, never stops task service
                 connector_cards.absorb(self.args.bridge_state, self.root)

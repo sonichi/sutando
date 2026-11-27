@@ -404,6 +404,12 @@ def notice(root, cfg: dict, names, text: str, log, now=time.time, session: str =
         save(root, rec)
     bridge = str(cb.bridge_state(cfg))
     rec = dict(rec, since=rec.get("since") or at)
+    if not rec.get("said"):
+        # Kept as soon as the limit is seen, whether or not a card can be sent yet: an ask that comes first (the
+        # first message after a restart, before the owner's DM is known) is answered by the limit's card too.
+        card = account_card.AccountCard(root, cfg, lambda result_file, body: None, log)
+        rec = dict(rec, said=_card_words(card, limited, text, log), said_room=room_words(text))
+        save(root, rec)
     rec, done = _tell_tasks(root, cfg, bridge, limited, text, log, rec, at)
     told_tasks = "quota-task-card x%d" % done.count("quota-task-card") if "quota-task-card" in done else ""
     return "; ".join(w for w in (_tell_incident(root, cfg, bridge, limited, text, log, rec, at), told_tasks) if w)
@@ -418,6 +424,9 @@ def asked(root, cfg: dict, sent, result_file, publish, log) -> str:
     card = account_card.AccountCard(root, cfg, publish, log)
     card.say(sent.get("channel_id"), account_switch.limited(card.card("pending", str(rec["said"]), ask=True)),
              result_file)
+    if not rec.get("told") and not rec.get("qid"):
+        # That card told the owner: none unasked follows it once their DM is known (one owed for want of a room).
+        save(root, dict(rec, told=True))
     return "quota-card-asked"
 
 

@@ -537,6 +537,29 @@ class LimitMenu(NoticeBase):
         self.assertEqual(quota_card.asked(self.root, self.cfg, {"channel_id": DM}, "r.txt", None, None), "")
         self.assertEqual(quota_card.asked_in_room(self.root), "")
 
+    def test_the_first_ask_after_a_restart_gets_the_limits_card_before_any_card_could_be_sent(self):
+        # RC6 acceptance (Dots): at the limit, the owner's first message after a restart was "account", "model" or
+        # "/model" and it got the plain card. The limit was on the pane, but its words were kept only once a card was
+        # queued, which needs the owner's DM room: a room not known yet left the desk with no limit to answer with.
+        from ag2_sparrow.adapters.claude_code import model_card
+        self.assertEqual(self.tick(STARTUP_MENU), "quota-no-room")
+        for n, ask in enumerate(("account", "model", "/model")):
+            rc, _ = self.claim(self.task("task-first%d" % n, ask))
+            self.assertEqual(rc, 1, "answered here, never by the session")
+            card = self.queued()[-1]["card"]
+            self.assertEqual((card["id"], card["account_controls"]["limit"]), (account_switch.CARD, True), ask)
+            self.assertTrue(card["text"].startswith("sarah@example.com (Claude Code) has hit its usage limit; "
+                                                    "resets Nov 28, 1pm."), card["text"])
+        self.assertEqual(len(self.queued()), 3, "one card per ask")
+        # That card told the owner: no unasked card follows once their DM is known.
+        self.assertEqual(self.tick(STARTUP_MENU, quota_card.RETRY_S), "")
+        self.assertEqual(len(self.queued()), 3)
+        # A new session (an account switch restarts it) is not at that limit: the ask gets its own card.
+        quota_card.new_session(self.root)
+        self.task("task-after", "/model")
+        self.assertEqual(model_card.card_matter(self.root, "task-after", self.cfg)[0], "model-card")
+        self.assertEqual(self.queued()[-1]["card"]["id"], model_card.model_switch.CARD)
+
     def test_a_task_card_whose_send_was_unsure_is_queued_again_under_its_own_id(self):
         quota_card.remember_room(self.root, DM)
         self.task("task-n", "hello")
