@@ -4,9 +4,8 @@
 The broker serves an edit of a message whose task the agent already took as a second
 task with the same `source_message_id` and `replaces_event_id` naming the original.
 The gateway writes that as `edit_of:` (and the edit's `edit_ts:`) above `task:` plus one
-prose line, so the agent answers the message once; a body line cannot forge either. The
-line names a task to fold into the edit only when that task is certainly older, the
-owner's, unanswered and not started.
+prose line, the same for every tier and runtime; a body line cannot forge either. The
+line never names or closes another task, whatever else is queued.
 
 Run: python3 tests/gateway-edit-of.test.py
 """
@@ -38,7 +37,6 @@ from ag2_sparrow._dirs import set_dirs
 set_dirs(task_dir=TMP / "tasks", result_dir=TMP / "results", state_dir=TMP / "state")
 import ag2_sparrow.remote_gateway_bridge as rgb
 import local_task_protocol as ltp
-from result_markers import parse_markers
 from task_body_guard import confine_user_content
 from task_envelope import attested_task_headers
 
@@ -46,9 +44,6 @@ OWNER_DM = "!ownerdm:ag2.space"
 OTHER_ROOM = "!shared:ag2.space"
 ORIGINAL = "$orig1"
 MARK = "edit of a message you were already given"
-FOLD = "still queued, not started, as "
-QUEUED = {"phase": "Waiting", "summary": "Queued · next", "since": 1.0, "waiting": {"reason": "queued", "position": 1}}
-STARTED = {"phase": "Understanding the request", "summary": "Understanding the request", "since": 1.0}
 
 
 def _task(tid, **kw):
@@ -70,12 +65,10 @@ class _Base(unittest.TestCase):
             shutil.rmtree(d, ignore_errors=True)
             d.mkdir(parents=True, exist_ok=True)
         self.network = []
-        self.status = {}
         self._p = [patch.object(rgb, "LOCAL_TIER", "owner"),
                    patch.object(rgb, "_load_tier_map", lambda: {}),
                    patch.object(rgb, "_fleet_agent_ids", lambda: set()),
                    patch.object(rgb, "URL", "https://gw.invalid/relay"),
-                   patch.object(rgb, "TASK_STATUS", lambda tid: self.status.get(tid, QUEUED)),
                    patch.object(rgb, "_req", side_effect=self._no_network)]
         for p in self._p:
             p.start()
@@ -100,8 +93,11 @@ class EditIsMarked(_Base):
         headers = attested_task_headers(text, TMP)
         self.assertEqual((headers.get("edit_of"), headers.get("edit_ts")), (ORIGINAL, "1700000000000"))
         self.assertIn(f"\nsource_message_id: {ORIGINAL}\n", text)
-        self.assertEqual(text.count(MARK), 1)
-        self.assertIn("reply only to what the edit changes", text)
+        self.assertEqual(text.count(rgb.EDIT_NOTE + "\n"), 1)
+        self.assertLess(text.index("access_tier:"), text.index(rgb.EDIT_NOTE))
+        for part in (MARK, "already answered the earlier version, reply only to what the edit changes",
+                     "`[no-send]` when nothing material changed", "if you have not, answer this version"):
+            self.assertIn(part, rgb.EDIT_NOTE)
 
     def test_ordinary_task_is_unchanged(self):
         text = self.write(_task("task-o1"))
@@ -137,115 +133,48 @@ class EditIsMarked(_Base):
             self.assertFalse(any(ln.startswith(key + ":") for ln in out.split("\n")))
             self.assertLess(rgb._TASK_FIELDS.index(key), rgb._TASK_FIELDS.index("task"))
 
-    def test_note_is_one_prose_line_not_a_header(self):
-        note = rgb.edit_note("task-e1", ["task-o1"])
-        self.assertNotIn("\n", note)
-        self.assertNotRegex(note, r"^[A-Za-z_]+:")
+    def test_note_is_one_prose_line_that_asks_for_no_cross_task_action(self):
+        self.assertNotIn("\n", rgb.EDIT_NOTE)
+        self.assertNotRegex(rgb.EDIT_NOTE, r"^[A-Za-z_]+:")
+        for word in ("deduped", "results/", "tasks/", "queued", "unanswered", "task-"):
+            self.assertNotIn(word, rgb.EDIT_NOTE)
 
-    def test_non_owner_edit_gets_the_note_but_names_no_task(self):
-        self.write(_task("task-o1"))
-        with patch.object(rgb, "_tier_for", lambda *_a: "team"):
-            text = self.write(_edit("task-e1"))
-        self.assertIn("access_tier: team", text)
-        self.assertIn(f"edit_of: {ORIGINAL}\n", text)
-        self.assertEqual(text.count(MARK), 1)
+    def test_every_tier_gets_the_same_line(self):
+        for tier in ("owner", "team", "guest"):
+            with patch.object(rgb, "_tier_for", lambda *_a, _t=tier: _t):
+                text = self.write(_edit(f"task-{tier}"))
+            self.assertIn(f"access_tier: {tier}", text)
+            self.assertIn(f"edit_of: {ORIGINAL}\n", text)
+            self.assertEqual(text.count(rgb.EDIT_NOTE + "\n"), 1, tier)
+
+    def test_nothing_else_queued_changes_the_edit_or_is_named_by_it(self):
+        plain = self.write(_edit("task-e0"))
+        (rgb.TASKS_DIR / "task-e0.txt").unlink()
+        original = self.write(_task("task-o1"))
+        self.write(_edit("task-e1", edit_ts=1700000000000))
+        text = self.write(_edit("task-e2", edit_event_id="$edit2", edit_ts=1700000005000))
+        self.assertEqual(text.replace("task-e2", "task-e0").replace("edit_ts: 1700000005000", "edit_ts: 1700000000000")
+                         .split("\nlocal_time:")[0], plain.split("\nlocal_time:")[0])
+        for other in ("task-o1", "task-e1"):
+            self.assertNotIn(other, text)
         self.assertNotIn("[deduped:", text)
+        self.assertEqual((rgb.TASKS_DIR / "task-o1.txt").read_text(), original, "the earlier task is untouched")
+        self.assertEqual(list(rgb.RESULTS_DIR.iterdir()), [], "the bridge settles nothing for an edit")
 
 
-class FoldNamesOnlyOlderQueuedOwnerTasks(_Base):
-    T1, T2 = 1700000000000, 1700000005000
-
-    def test_queued_original_is_named_for_folding(self):
-        self.write(_task("task-o1"))
-        text = self.write(_edit("task-e1"))
-        self.assertIn(FOLD + "task-o1:", text)
-        self.assertIn("`[deduped: task-e1]`", text)
-        # What the note tells the agent to write is the marker the bridges already honour.
-        skip = [a for a in parse_markers("[deduped: task-e1]").actions if a.kind == "skip"]
-        self.assertEqual([(a.value, a.extra) for a in skip], [("deduped", "task-e1")])
-
-    def test_two_edits_in_order_the_newer_names_the_older_and_the_original(self):
-        self.write(_task("task-o1"))
-        self.assertIn(FOLD + "task-o1:", self.write(_edit("task-e1", edit_ts=self.T1)))
-        text = self.write(_edit("task-e2", edit_event_id="$edit2", edit_ts=self.T2))
-        self.assertIn(FOLD + "task-e1, task-o1:", text)
-        self.assertIn("`[deduped: task-e2]`", text)
-
-    def test_older_edit_arriving_after_a_newer_one_names_nothing(self):
-        self.write(_task("task-o1"))
-        self.write(_edit("task-e2", edit_event_id="$edit2", edit_ts=self.T2))
-        text = self.write(_edit("task-e1", edit_ts=self.T1))
-        self.assertEqual(text.count(MARK), 1)
-        self.assertNotIn(FOLD, text)
-        self.assertNotIn("[deduped:", text)
-
-    def test_equal_edit_times_name_nothing(self):
-        self.write(_task("task-o1"))
-        self.write(_edit("task-e1", edit_ts=self.T1))
-        self.assertNotIn(FOLD, self.write(_edit("task-e2", edit_event_id="$edit2", edit_ts=self.T1)))
-
-    def test_missing_or_unusable_edit_time_names_nothing(self):
-        self.write(_task("task-o1"))
-        for i, v in enumerate((None, "", "1700000000000", True, -1, 1.5)):
-            self.assertNotIn(FOLD, self.write(_edit(f"task-n{i}", edit_ts=v)), repr(v))
-        # A queued edit with no time makes the order unknown for a later, timed one too.
-        self.assertNotIn(FOLD, self.write(_edit("task-e9", edit_event_id="$edit9", edit_ts=self.T2)))
-
-    def test_edit_before_its_original_names_nothing_and_the_original_is_plain(self):
-        self.assertNotIn(FOLD, self.write(_edit("task-e1")))
-        text = self.write(_task("task-o1"))
-        self.assertNotIn("edit_of", text)
-        self.assertNotIn(MARK, text)
-        self.assertNotIn("[deduped:", text)
-
-    def test_answered_or_gone_original_is_not_named(self):
-        self.write(_task("task-o1"))
-        (rgb.RESULTS_DIR / "task-o1.txt").write_text("done\n")
-        self.assertNotIn(FOLD, self.write(_edit("task-e1", edit_ts=self.T1)))
-        (rgb.TASKS_DIR / "task-o1.txt").unlink()
-        (rgb.RESULTS_DIR / "task-o1.txt").unlink()
-        text = self.write(_edit("task-e2", edit_event_id="$edit2", edit_ts=self.T2))
-        self.assertIn(FOLD + "task-e1:", text)
-        self.assertNotIn("task-o1", text)
-
-    def test_started_original_is_not_named(self):
-        self.write(_task("task-o1"))
-        for i, status in enumerate((STARTED, {"phase": "Waiting", "waiting": {"reason": "permission"}},
-                                    {"phase": "Delegated", "waiting": {"reason": "delegated"}}, None, "queued")):
-            self.status["task-o1"] = status
-            self.assertNotIn(FOLD, self.write(_edit(f"task-s{i}", edit_ts=self.T1)), repr(status))
-            (rgb.TASKS_DIR / f"task-s{i}.txt").unlink()
-
-    def test_claimed_or_assigned_original_is_not_named(self):
-        self.write(_task("task-o1"))
-        for name in ("task-o1.claimed-core", "task-o1.assigned-core"):
-            (rgb.TASKS_DIR / "task-o1.txt").rename(rgb.TASKS_DIR / name)
-            self.assertNotIn(FOLD, self.write(_edit("task-e1", edit_ts=self.T1)), name)
-            (rgb.TASKS_DIR / "task-e1.txt").unlink()
-            (rgb.TASKS_DIR / name).rename(rgb.TASKS_DIR / "task-o1.txt")
-
-    def test_no_status_hook_or_a_failing_one_names_nothing(self):
-        self.write(_task("task-o1"))
-        with patch.object(rgb, "TASK_STATUS", None):
-            self.assertNotIn(FOLD, self.write(_edit("task-e1", edit_ts=self.T1)))
-        with patch.object(rgb, "TASK_STATUS", side_effect=OSError("unreadable")):
-            self.assertNotIn(FOLD, self.write(_edit("task-e2", edit_event_id="$edit2", edit_ts=self.T2)))
-
-    def test_original_at_another_tier_is_not_named(self):
-        with patch.object(rgb, "_tier_for", lambda *_a: "team"):
-            self.assertIn("access_tier: team", self.write(_task("task-o1")))
-        self.assertNotIn(FOLD, self.write(_edit("task-e1")))
-
-    def test_another_message_room_or_sender_is_not_named(self):
-        self.write(_task("task-m", source_message_id="$other"))
-        self.write(_task("task-r", channel_id=OTHER_ROOM, source_room_id=OTHER_ROOM))
-        self.write(_task("task-s", user_id="@someone:ag2.space"))
-        self.assertNotIn(FOLD, self.write(_edit("task-e1")))
-
-    def test_edit_in_another_room_does_not_name_this_rooms_original(self):
-        self.write(_task("task-o1"))
-        text = self.write(_edit("task-e1", channel_id=OTHER_ROOM, source_room_id=OTHER_ROOM))
-        self.assertNotIn(FOLD, text)
+class CodexConnectorReadsTheEdit(_Base):
+    def test_header_and_line_reach_the_codex_prompt(self):
+        from ag2_sparrow.adapters.codex import codex_connector as cc
+        for tier in ("owner", "team"):
+            with patch.object(rgb, "_tier_for", lambda *_a, _t=tier: _t):
+                self.write(_edit(f"task-cx-{tier}"))
+            headers, message, operator = cc.parse_task(str(rgb.TASKS_DIR / f"task-cx-{tier}.txt"))
+            self.assertEqual((headers.get("edit_of"), headers.get("edit_ts")), (ORIGINAL, "1700000000000"))
+            self.assertEqual(headers["access_tier"], tier)
+            self.assertIn(rgb.EDIT_NOTE, operator)
+            prompt = cc.wrap_untrusted(f"task-cx-{tier}", headers, message, operator)
+            self.assertEqual(prompt.count(rgb.EDIT_NOTE), 1, tier)
+            self.assertNotIn(MARK, message)
 
 
 if __name__ == "__main__":

@@ -149,19 +149,16 @@ own id, the edited text, `source_message_id` still the original message, and
 `replaces_event_id` naming that original. The gateway writes it as the trusted
 pre-body header `edit_of: <original event id>` (dropped unless it is one event
 id) and adds one prose line under the headers: this is an edit of a message the
-agent was already given, so it answers once, replying only to what the edit
-changes or with `[no-send]` when nothing does. The broker's `edit_ts` (the
-edit's time in ms) is written beside it as `edit_ts:`, a trusted pre-body header
-too. For an owner task the line also names (at most three) the tasks the core
-can close with `[deduped: <the edit's task id>]` after answering the edit. A
-task is named only when all of these hold: this lane wrote it for the same
-room, message and sender at owner tier; it is older than this edit (the
-original, or an edit with a smaller `edit_ts`); it has no result; and the
-status hook says it still waits in the queue, not picked up. Nothing is named
-when the order is not certain: this edit or a queued edit of the message has no
-usable `edit_ts`, two are equal, or a newer edit is already queued. Nothing is
-named either when no status hook is installed. The bridge never closes a task
-itself. A task without `replaces_event_id` is written as before.
+agent was already given; if it has answered the earlier version it replies only
+to what the edit changes, or with `[no-send]` when nothing material changed,
+and otherwise it answers this version. The line is the same for every runtime
+and tier and says nothing about the earlier task's state. The broker's `edit_ts`
+(the edit's time in ms, which orders two edits of one message) is written beside
+it as `edit_ts:`, a trusted pre-body header too. The bridge never closes or
+folds the earlier task: a real supersede needs an atomic claim and result check
+in the runtime, at dispatch or settlement, so an original and its edit that are
+both still queued can each be answered. A task without `replaces_event_id` is
+written as before.
 
 **`capabilities` (the poll's proof).** Every poll carries
 `&capabilities=voice-outcome-v1`, the voice-outcome contract the heartbeat also
