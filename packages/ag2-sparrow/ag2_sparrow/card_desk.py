@@ -68,7 +68,9 @@ class Desk:
             return "card-refused"
         ask, _, words = said.strip().partition(" ")
         if in_room(sent):
-            return self.in_room(ask, said, result_file)
+            # Only the owner hears the room line; anyone else's words go on to the model.
+            owner = agent_card.owner_may_act(sent, dm_only=False) is None
+            return self.in_room(ask, said, result_file) if owner else ""
         if agent_card.owner_may_act(sent) is not None:
             return ""
         slash = [card for card in self.cards if ask.lower() == card.ASK and card.usable()]
@@ -97,8 +99,8 @@ class Desk:
         return self.offered_all(list(asking.values()), sent, result_file) if asking else ""
 
     def in_room(self, ask, said, result_file) -> str:
-        """A room is no place for a switch: a slash command, a named pick or a card's own question there,
-        from anyone, gets the one line saying to ask in the DM, and no card. '' for anything else."""
+        """A room is no place for a switch: the owner's slash command, named pick or card question there
+        gets the one line saying to ask in the DM, and no card. '' for anything else."""
         said = said.strip()
         for card in self.cards:
             named = getattr(card, "named_in", None)
