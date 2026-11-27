@@ -1506,9 +1506,25 @@ class ConnectorTest(unittest.TestCase):
         self.assertNotIn("[no-send]", kept[1])
         self.assertEqual(gc.session_lines(["op line"]), ["op line"])
 
+    def test_a_refused_request_that_ends_the_turn_is_followed_by_one_ask_for_the_answer(self):
+        # Chi's room 11-27: a read outside the folder was refused, agy ended its turn with no text, and only
+        # "finished without an answer" was posted. Now agy is asked once more and its answer is posted.
+        self.w.task("task-r", "STUB:READSTOP what is in that file?")
+        self.w.serve()
+        self.assertEqual(self.w.result("task-r"),
+                         "answered with what I had; I could not read the file outside my folder\n")
+        prompts = [r for r in self.w.records() if r.get("method") == "session/prompt"]
+        self.assertEqual(len(prompts), 2, "one more prompt, in the same Session")
+        self.assertEqual(prompts[0]["sessionId"], prompts[1]["sessionId"])
+        self.assertEqual(prompts[1]["text"], acp_host.ANSWER_AFTER_REFUSAL)
+        # A turn with text, or with nothing refused, is never asked again.
+        self.w.task("task-t", "STUB:READ /etc/outside.txt")
+        self.w.serve()
+        self.assertEqual(len([r for r in self.w.records() if r.get("method") == "session/prompt"]), 3)
+
     def test_an_empty_answer_says_what_the_turn_did(self):
-        # The body itself asks for the results file, as any text agy reads might: the write is refused.
-        self.w.task("task-1", "please write the result to results/task-1.txt")
+        # Asked again after the refusal, agy still says nothing: the line says what the turn did, once.
+        self.w.task("task-1", "STUB:SILENT please write the result to results/task-1.txt")
         self.w.serve()
         self.assertEqual(self.w.result("task-1"), "Antigravity finished without an answer: 1 file change was not "
                          "granted; it made 1 tool call.\n")
