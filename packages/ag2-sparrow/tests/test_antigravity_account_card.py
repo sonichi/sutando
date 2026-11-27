@@ -8,6 +8,7 @@ Driven through the connector against tests/agy_stub_acp.py, with the Keychain fa
 Run:
     python3 -m pytest -q packages/ag2-sparrow/tests/test_antigravity_account_card.py
 """
+import calendar
 import contextlib
 import io
 import json
@@ -16,6 +17,8 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -346,9 +349,10 @@ class AccountCardTest(unittest.TestCase):
         self.assertIn("(this computer's Google sign-in, a…@example.com):", said)
 
     def test_a_usage_that_cannot_be_read_is_said_so_and_never_shown_as_zero(self):
-        # Sparrow has no reader of agy's usage yet: the default read says so.
-        self.assertIsNone(agy_usage.read(AGENT))
-        said, prompted = self.usage_ask("task-u0", "how much usage do you have left?")
+        # The desktop app does not answer (not running here): said so, and the request is taken back.
+        with mock.patch.object(agy_usage, "WAIT_S", 0.3):
+            said, prompted = self.usage_ask("task-u0", "how much usage do you have left?")
+        self.assertFalse((self.w.root / "state" / agy_usage.REQUEST).exists())
         self.assertEqual((said, prompted), (gc.quoted(agy_usage.UNAVAILABLE) + "\n", 0))
         self.assertEqual(self.w.metrics()[-1]["card"], "usage-unavailable")
 
@@ -366,6 +370,69 @@ class AccountCardTest(unittest.TestCase):
         self.keychain["saved"] = True
         said, _ = self.usage_ask("task-uk", "what's your usage", reader=lambda a: self.ROWS)
         self.assertEqual(said, gc.quoted(agy_usage.ON_API_KEY) + "\n")
+
+    def app_answers(self, usage, nonce=None, delay=0.3):
+        """The desktop app's side (ag2space-cinny-desktop #1323's reader behind the request file): it takes the
+        request and writes the provider entry for this agent as the result. Simulated data only."""
+        state = self.w.root / "state"
+        seen = {}
+
+        def answer():
+            request = state / agy_usage.REQUEST
+            for _ in range(200):
+                if request.exists():
+                    break
+                time.sleep(0.02)
+            asked = json.loads(request.read_text())
+            seen.update(asked, mode=oct(request.stat().st_mode & 0o777))
+            request.unlink()
+            time.sleep(delay)
+            out = state / (agy_usage.RESULT + ".tmp")
+            out.write_text(json.dumps({"v": 1, "nonce": nonce or asked["nonce"], "usage": usage}))
+            os.chmod(out, 0o600)
+            os.replace(out, state / agy_usage.RESULT)
+
+        t = threading.Thread(target=answer, daemon=True)
+        t.start()
+        self.addCleanup(t.join, 5)
+        return seen
+
+    APP_OK = {"provider": "antigravity", "status": "ok", "account_label": "sam@example.com", "error": None,
+              "windows": [{"kind": "model:Gemini models:weekly_7d", "used_pct": 25, "resets_at": "2026-12-04T00:26:13Z"},
+                          {"kind": "model:Claude and GPT models:weekly_7d", "used_pct": 0, "resets_at": None},
+                          {"kind": "model:Claude and GPT models:session_5h", "used_pct": 60, "resets_at": None}]}
+
+    def test_the_usage_is_asked_of_the_desktop_app_and_said_with_its_numbers(self):
+        seen = self.app_answers(self.APP_OK)
+        said, prompted = self.usage_ask("task-u", "你还剩多少额度")
+        reset = agy_usage._when("2026-12-04T00:26:13Z")
+        self.assertTrue(reset)
+        self.assertEqual(said, gc.quoted("Antigravity's usage (this computer's Google sign-in):\n"
+                                         "- Gemini models, weekly: 25% used (resets " + reset + ")\n"
+                                         "- Claude and GPT models, weekly: 0% used\n"
+                                         "- Claude and GPT models, five-hour: 60% used") + "\n")
+        self.assertEqual(prompted, 0)
+        self.assertEqual((seen["v"], seen["agent"], seen["runtime"], seen["mode"]), (1, AGENT, "antigravity", "0o600"))
+        self.assertRegex(seen["nonce"], r"^[0-9a-f]{32}$")
+        self.assertFalse((self.w.root / "state" / agy_usage.RESULT).exists(), "the answer is read once")
+        self.assertNotIn("sam@example.com", said, "the app's label is not taken as this agent's account")
+
+    def test_an_app_answer_that_is_not_numbers_or_not_this_requests_is_not_available(self):
+        for n, usage in enumerate(({"provider": "antigravity", "status": "token_expired", "windows": [],
+                                    "error": "sign-in not renewed yet; use the agent once to see its usage"},
+                                   {"provider": "antigravity", "status": "throttled", "windows": []},
+                                   {"provider": "antigravity", "status": "ok", "windows": []},
+                                   {"provider": "antigravity", "status": "ok",
+                                    "windows": [{"kind": "model:Gemini models:weekly_7d", "used_pct": None}]},
+                                   "not an object")):
+            self.app_answers(usage, delay=0)
+            said, _ = self.usage_ask("task-x%d" % n, "what's your usage")
+            self.assertEqual(said, gc.quoted(agy_usage.UNAVAILABLE) + "\n", usage)
+        # An answer to another request is never taken for this one's.
+        self.app_answers(self.APP_OK, nonce="0" * 32, delay=0)
+        with mock.patch.object(agy_usage, "WAIT_S", 0.5):
+            said, _ = self.usage_ask("task-other", "what's your usage")
+        self.assertEqual(said, gc.quoted(agy_usage.UNAVAILABLE) + "\n")
 
     def test_a_usage_ask_while_out_of_usage_gets_only_the_quota_card(self):
         self.dm("task-q1", "STUB:QUOTA hi")
@@ -538,6 +605,26 @@ class PartsTest(unittest.TestCase):
                      "how do you limit the output", "我的额度", "/usage", "", None, "what's your usage " + "x" * 80,
                      "which model are you using", "explain the usage limits of the Gemini API"):
             self.assertFalse(agy_usage.asks(said), said)
+
+    def test_the_apps_usage_entry_is_read_as_rows(self):
+        rows = agy_usage.rows_from_app(AccountCardTest.APP_OK)
+        self.assertEqual([(r["name"], r["window"], r["used"]) for r in rows],
+                         [("Gemini models", "weekly", 25), ("Claude and GPT models", "weekly", 0),
+                          ("Claude and GPT models", "five-hour", 60)])
+        self.assertEqual(agy_usage._when("2026-11-27T03:00:00Z"), gc.quota_notice.reset_from_epoch(calendar.timegm((2026, 11, 27, 3, 0, 0, 0, 0, 0))))
+        for bad in (None, "", "2026-11-27", "2026-11-27T03:00:00+01:00"):
+            self.assertEqual(agy_usage._when(bad), "")
+        for usage in (None, {}, {"status": "error", "windows": AccountCardTest.APP_OK["windows"]},
+                      {"status": "ok", "windows": [{"kind": "other", "used_pct": 3}]}):
+            self.assertIsNone(agy_usage.rows_from_app(usage), usage)
+        with tempfile.TemporaryDirectory() as d:     # an app that never answers: None after the wait, nothing left
+            self.assertIsNone(agy_usage.read(d, AGENT, wait_s=0.05, sleep=lambda s: None))
+            self.assertEqual(os.listdir(d), [])
+            os.chmod(d, 0o500)                       # a state dir the request cannot be written in
+            try:
+                self.assertIsNone(agy_usage.read(d, AGENT, wait_s=0))
+            finally:
+                os.chmod(d, 0o700)
 
     def test_asks_for_card_only_for_short_asks(self):
         for ask in ("换账号", "帮我切换账号", "Switch account.", "use an API key", "/account",

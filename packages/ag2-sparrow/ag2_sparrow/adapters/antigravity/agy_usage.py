@@ -12,14 +12,34 @@ The answer comes in one of three states, and the connector picks it (antigravity
 - the usage can be read: what is used of each window, as agy's own /usage panel lists them (`words`);
 - it cannot be read: UNAVAILABLE, never a 0.
 
-Sparrow has no reader yet. The only one is the desktop app's (ag2space-cinny-desktop #1323, usage_meter.rs). It
-reads agy's Google sign-in from the Keychain, with the owner's approval for the app only, and asks Cloud Code's
-internal quota endpoints. `read` is where a reader goes: it returns the rows, or None when it cannot say. Until
-one exists here, every read says None, and the owner is told the usage isn't available right now.
+The numbers come from the desktop app, which already reads them for its usage card (ag2space-cinny-desktop #1323,
+usage_meter.rs `agent_usage_at`: agy's Google sign-in from the Keychain, Cloud Code's quota endpoints). Sparrow reads
+no Keychain item and holds no token: it asks the app through a request file in this agent's state dir, the way the
+account switch does (#6878 / desktop #1330), and the app answers in a result file beside it:
+
+  request  <ROOT>/state/.ag2-usage-request.json (0600, written whole then renamed in)
+           {"v": 1, "nonce": "<uuid4 hex>", "at": <unix s>, "agent": "<agent mxid>", "runtime": "antigravity"}
+  result   <ROOT>/state/.ag2-usage-result.json (0600, written whole then renamed in)
+           {"v": 1, "nonce": "<the request's>", "usage": <agent_usage's provider entry for this agent:
+            {"provider": "antigravity", "status": "ok" | "error" | "not_logged_in" | "token_expired" | "throttled",
+             "account_label": str | null, "error": str | null,
+             "windows": [{"kind": "model:<group>:weekly_7d" | "model:<group>:session_5h", "used_pct": int,
+                          "resets_at": "<RFC 3339>" | null}]}>}
+
+ROOT is the agent's work root, as its antigravity-local.conf names it. `read` waits up to WAIT_S for the answer
+with the request's nonce. No answer (the app is not running, or not one that knows this request), a status that is
+not "ok", or no window with a number: None, and the owner is told the usage isn't available right now.
 """
 from __future__ import annotations
 
+import calendar
+import json
+import os
 import re
+import time
+import uuid
+
+from ... import bounded_file_read, quota_notice
 
 ASK_MAX = 80
 UNAVAILABLE = "Antigravity's usage isn't available right now, so I can't say how much is left."
@@ -71,10 +91,106 @@ def asks(text) -> bool:
     return "topic" in kinds and bool(kinds & {"self", "left"})
 
 
-def read(agent_id: str):
-    """This agent's usage windows, as agy's /usage panel lists them: [{"name", "window", "used" (percent),
-    "resets"}], or None when they cannot be read. Sparrow has no reader yet (see the module's note)."""
-    return None
+REQUEST, RESULT = ".ag2-usage-request.json", ".ag2-usage-result.json"
+WAIT_S, POLL_S = 10.0, 0.25     # the app looks every 2 s, then reads three quota calls
+RESULT_MAX = 64 * 1024
+_WINDOWS = {"weekly_7d": "weekly", "session_5h": "five-hour"}
+
+
+def read(state_dir, agent_id: str, wait_s: "float | None" = None, clock=time.monotonic, sleep=time.sleep):
+    """This agent's usage windows as the desktop app read them (`rows_from_app`), or None when it did not answer
+    in `wait_s` or could not read them. One request at a time; a request left unanswered is taken back."""
+    state = str(state_dir)
+    request, result = os.path.join(state, REQUEST), os.path.join(state, RESULT)
+    nonce = uuid.uuid4().hex
+    try:
+        with _quiet():
+            os.unlink(result)        # an answer to an earlier request is not this one's
+        _write_private(request, {"v": 1, "nonce": nonce, "at": int(time.time()), "agent": str(agent_id or ""),
+                                 "runtime": "antigravity"})
+    except OSError:
+        return None
+    deadline = clock() + (WAIT_S if wait_s is None else wait_s)
+    try:
+        while True:
+            answer = _answer(result, nonce)
+            if answer is not None:
+                with _quiet():
+                    os.unlink(result)
+                return rows_from_app(answer.get("usage"))
+            if clock() >= deadline:
+                return None
+            sleep(POLL_S)
+    finally:
+        with _quiet():
+            if _nonce_of(request) == nonce:
+                os.unlink(request)   # unanswered: a late app finds nothing to do
+
+
+def rows_from_app(usage):
+    """agent_usage's provider entry -> the rows `words` says; None unless its status is "ok" with a window."""
+    if not isinstance(usage, dict) or usage.get("status") != "ok" or not isinstance(usage.get("windows"), list):
+        return None
+    rows = []
+    for w in usage["windows"]:
+        if not isinstance(w, dict) or not isinstance(w.get("kind"), str) or not w["kind"].startswith("model:"):
+            continue
+        name, _, base = w["kind"][len("model:"):].rpartition(":")
+        if not name.strip():
+            continue
+        rows.append({"name": name.strip(), "window": _WINDOWS.get(base, ""), "used": w.get("used_pct"),
+                     "resets": _when(w.get("resets_at"))})
+    return rows_of(rows) or None
+
+
+def _when(stamp) -> str:
+    """An RFC 3339 UTC moment ("2026-12-04T00:26:13Z") in local words, '' when there is none or it is not one."""
+    found = re.match(r"^(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.\d+)?Z$", str(stamp or ""))
+    if not found:
+        return ""
+    return quota_notice.reset_from_epoch(calendar.timegm(tuple(int(g) for g in found.groups()) + (0, 0, 0)))
+
+
+class _quiet:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, kind, value, tb):
+        return kind is not None and issubclass(kind, OSError)
+
+
+def _write_private(path, record: dict) -> None:
+    tmp = "%s.%s.tmp" % (path, uuid.uuid4().hex[:8])
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(record, f)
+        os.replace(tmp, path)
+    except BaseException:
+        with _quiet():
+            os.unlink(tmp)
+        raise
+
+
+def _load(path):
+    """A private regular file of this user's, as JSON; None when it is absent, not that, or not an object."""
+    data, _why = bounded_file_read.read_regular_bytes(path, RESULT_MAX, follow=False, private=True)
+    if data is None:
+        return None
+    try:
+        got = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    return got if isinstance(got, dict) else None
+
+
+def _nonce_of(path) -> str:
+    return str((_load(path) or {}).get("nonce") or "")
+
+
+def _answer(path, nonce):
+    got = _load(path)
+    return got if got and got.get("v") == 1 and got.get("nonce") == nonce else None
 
 
 def rows_of(got) -> list:

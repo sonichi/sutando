@@ -615,7 +615,8 @@ class Connector:
             args.state, getattr(args, "bridge_state", None), NAME, getattr(args, "agent_id", None) or "", publish,
             quoted, log)
         self.agy_pid = None   # the owner turn's agy process, whose own log names the account it used
-        self.usage_reader = agy_usage.read   # agy's own usage windows, None when they cannot be read
+        # agy's own usage windows, as the desktop app reads them for this agent (agy_usage.read); None: not now.
+        self.usage_reader = lambda agent_id: agy_usage.read(self.args.state, agent_id)
         # Out of quota: the account card, unasked, in the owner's DM, on each of their messages (quota_notice).
         self.quota = quota_notice.QuotaNotice(args.state, getattr(args, "bridge_state", None), NAME,
                                               self.accounts.quota_card, self.accounts.using, log,
