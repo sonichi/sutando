@@ -150,12 +150,18 @@ own id, the edited text, `source_message_id` still the original message, and
 pre-body header `edit_of: <original event id>` (dropped unless it is one event
 id) and adds one prose line under the headers: this is an edit of a message the
 agent was already given, so it answers once, replying only to what the edit
-changes or with `[no-send]` when nothing does. For an owner task, when earlier
-tasks of this lane for the same room, message and sender are still in `tasks/`
-with no result, the line names them (at most three) so the core answers the
-edit and closes each with `[deduped: <the edit's task id>]`. The bridge never
-closes a queued task itself: it cannot tell a task the core has not read from
-one it is working on. A task without the field is written as before.
+changes or with `[no-send]` when nothing does. The broker's `edit_ts` (the
+edit's time in ms) is written beside it as `edit_ts:`, a trusted pre-body header
+too. For an owner task the line also names (at most three) the tasks the core
+can close with `[deduped: <the edit's task id>]` after answering the edit. A
+task is named only when all of these hold: this lane wrote it for the same
+room, message and sender at owner tier; it is older than this edit (the
+original, or an edit with a smaller `edit_ts`); it has no result; and the
+status hook says it still waits in the queue, not picked up. Nothing is named
+when the order is not certain: this edit or a queued edit of the message has no
+usable `edit_ts`, two are equal, or a newer edit is already queued. Nothing is
+named either when no status hook is installed. The bridge never closes a task
+itself. A task without `replaces_event_id` is written as before.
 
 **`capabilities` (the poll's proof).** Every poll carries
 `&capabilities=voice-outcome-v1`, the voice-outcome contract the heartbeat also
