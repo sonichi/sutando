@@ -643,8 +643,11 @@ class RemoteCardTest(Home, CardWorld, unittest.TestCase):
         labels = [b["label"] for b in refused["buttons"]]
         self.assertIn(account_switch.HERE_LABEL, labels, "the way that does not need device code")
         opened = []
+        # The error card itself, as the owner sees it: its own "Sign in on this computer" recovers.
+        _, issued = connector_cards._core()
+        issued.record(Path(self.work), "$card1", refused, room=self.DM, lane="")
         with mock.patch.object(cc, "open_page", side_effect=lambda url: opened.append(url) or True):
-            self.tap("task-here", self.ask("$card2"), account_switch.HERE_LABEL, "$card2")
+            self.tap("task-here", refused, account_switch.HERE_LABEL, "$card1")
         self.assertEqual(metrics(self.work)[-1]["card"], "account-started")
         self.assertEqual(len(opened), 1, "the browser sign-in on this computer, asked for by name")
 
