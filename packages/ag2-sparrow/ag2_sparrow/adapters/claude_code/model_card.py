@@ -210,9 +210,11 @@ def remember_owner_dm(root, path) -> None:
 def desk(root, cfg: dict, publish) -> card_desk.Desk:
     """This agent's cards behind the shared desk: the model card here, the account card (account_card). The
     desk routes a tap, a stale tap, the owner's /model or /account (/login), or the session's mark."""
-    from . import account_card
+    from . import account_card, quota_card
     return card_desk.Desk(root, publish, quoted, [switcher(root, cfg, publish=publish)]
-                          + account_card.cards(root, cfg, publish, log))
+                          + account_card.cards(root, cfg, publish, log),
+                          lambda sent, result_file: quota_card.asked(root, cfg, sent, result_file, publish, log),
+                          lambda: quota_card.asked_in_room(root))
 
 
 MARKED_DIR = "card-marks"

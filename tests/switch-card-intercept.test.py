@@ -110,6 +110,34 @@ class Intercept(unittest.TestCase):
         self.assertEqual(argv[argv.index("post") + 1:], ["--room", "!dm:s.space", "--reply-to", "$evt"])
         self.assertTrue((self.results / "task-abc.txt").read_text().startswith("[no-send]"))
 
+    def test_out_of_usage_every_card_asked_for_is_answered_by_the_limits_card(self):
+        import core_quota_notice
+        state = self.ws.joinpath(*core_quota_notice.FILE)
+        state.parent.mkdir(parents=True, exist_ok=True)
+        import time
+        state.write_text(json.dumps({"since": time.time(), "name": "Codex", "reset": "3:05 PM", "told": True}))
+        lead = "Codex has reached its usage limit (resets 3:05 PM), so I can't answer until then. Switch to another account to go on now."
+        for words in ("/model", "switch core", "account"):
+            self.calls.clear()
+            self.assertTrue(self.run_with(words), words)
+            argv = self.calls[0]
+            self.assertTrue(argv[1].endswith("skills/account-switch/scripts/account_card.py"), words)
+            self.assertEqual(argv[argv.index("post") + 1:],
+                             ["--room", "!dm:s.space", "--retry", "--lead", lead, "--reply-to", "$evt"], words)
+        # No limit, one past its reset, a sign-out, or a record that cannot be read: the card asked for, as before.
+        # ... nor one that named no reset time and was last seen long ago: nothing else would ever end it.
+        stale = time.time() - core_quota_notice.NO_RESET_S - 1
+        for rec in ("{}", json.dumps({"since": 1.0, "reset_at": 2.0}), json.dumps({"since": time.time(), "why": "signed_out"}),
+                    json.dumps({"since": stale}), json.dumps({"since": 1.0, "seen": stale}), "[1]", "not json"):
+            state.write_text(rec)
+            self.assertEqual(sci.limit_lead(self.ws), "", rec)
+        state.write_text(json.dumps({"since": 1.0, "seen": time.time()}))
+        self.assertTrue(sci.limit_lead(self.ws), "seen just now: still in force")
+        state.write_text("{}")
+        self.calls.clear()
+        self.assertTrue(self.run_with("/model"))
+        self.assertTrue(self.calls[0][1].endswith("skills/model-switch/scripts/model_card.py"))
+
     def test_a_card_not_posted_leaves_it_to_the_core(self):
         self.assertFalse(self.run_with("switch account", status="failed", rc=1))
         self.assertFalse((self.results / "task-abc.txt").exists())
@@ -205,6 +233,16 @@ class InRoom(Intercept):
                 self.assertTrue(self.in_room(words))
                 self.assertEqual((self.results / "task-abc.txt").read_text(), line + "\n")
         self.assertEqual(self.calls, [], "no card script ran")
+
+    def test_out_of_usage_the_owner_asking_in_a_room_is_told_the_limit_there_and_no_card(self):
+        import time
+        import core_quota_notice
+        state = self.ws.joinpath(*core_quota_notice.FILE)
+        state.parent.mkdir(parents=True, exist_ok=True)
+        state.write_text(json.dumps({"since": time.time(), "name": "Codex", "reset": "3:05 PM"}))
+        self.assertTrue(self.in_room("/model"))
+        self.assertEqual((self.results / "task-abc.txt").read_text(), core_quota_notice.room_words("Codex", "3:05 PM") + "\n")
+        self.assertEqual(self.calls, [], "no card that switches in a room")
 
     def test_any_room_kind_but_the_dm_is_a_room(self):
         self.assertTrue(self.in_room("switch account", kind="place"))

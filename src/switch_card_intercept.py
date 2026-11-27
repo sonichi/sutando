@@ -22,6 +22,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -97,6 +98,32 @@ def request(task_text: str, workspace: Optional[Path] = None) -> Optional[dict]:
             "reply_to": (h.get("source_message_id") or "").strip()}
 
 
+def _limit(workspace: Path, now=time.time) -> dict:
+    """The core's usage limit in force, as recorded; {} when none is (or it cannot be read)."""
+    try:
+        import core_quota_notice
+        rec = json.loads(Path(workspace).joinpath(*core_quota_notice.FILE).read_text(encoding="utf-8"))
+        return rec if core_quota_notice.in_force(rec, now()) else {}
+    except (OSError, ValueError, TypeError, ImportError):
+        return {}
+
+
+def limit_lead(workspace: Path, now=time.time) -> str:
+    """The limit in force, in the quota card's own words; '' when none is. Out of usage, the owner's ask
+    for any card is answered by the limit's card first."""
+    import core_quota_notice
+    rec = _limit(workspace, now)
+    return core_quota_notice.words(str(rec.get("name") or "The core"), str(rec.get("reset") or ""),
+                                   credits=bool(rec.get("credits"))) if rec else ""
+
+
+def limit_in_room(workspace: Path, now=time.time) -> str:
+    """The limit in force, as said in a shared room (no account, nothing that switches one); '' when none is."""
+    import core_quota_notice
+    rec = _limit(workspace, now)
+    return core_quota_notice.room_words(str(rec.get("name") or "The core"), str(rec.get("reset") or "")) if rec else ""
+
+
 # No switch is made in a room with other people in it, and no card that switches is posted there: the
 # owner asking there is told so in one line, in their language, and the core never sees it.
 IN_ROOM = "Switching the account or model isn't available in a room. Please ask me in our DM."
@@ -129,9 +156,11 @@ def say_in_room(results_dir: Path, filename: str, line: str) -> bool:
 
 
 def post(req: dict, workspace: Path, repo: Path = _REPO, run=subprocess.run) -> bool:
-    skill, script = SCRIPTS[req["kind"]]
+    skill, script = SCRIPTS["account" if req.get("lead") else req["kind"]]
     argv = [sys.executable, str(repo / "skills" / skill / "scripts" / script), "--workspace", str(workspace),
             "post", "--room", req["room"]]
+    if req.get("lead"):
+        argv += ["--retry", "--lead", req["lead"]]      # the quota card: the limit first, then the account
     if req.get("reply_to"):
         argv += ["--reply-to", req["reply_to"]]
     try:
@@ -171,11 +200,15 @@ def intercept(task_file: Path, workspace: Path, results_dir: Path, repo: Path = 
         return False
     line = in_room(text, workspace)
     if line:
+        line = limit_in_room(workspace) or line     # out of usage: the limit is the answer in a room too
         if not say_in_room(results_dir, Path(task_file).name, line):
             log(f"{Path(task_file).name}: the in-room line was not written; the core takes it")
             return False
-        log(f"{Path(task_file).name}: a {req['kind']} request in a room; told to ask in the DM, no card")
+        log(f"{Path(task_file).name}: a {req['kind']} request in a room; answered in one line, no card")
         return True
+    lead = limit_lead(workspace)
+    if lead:
+        req = dict(req, lead=lead, kind="quota")
     if not post(req, workspace, repo, run):
         log(f"{Path(task_file).name}: the {req['kind']} card was not posted; the core takes it")
         return False

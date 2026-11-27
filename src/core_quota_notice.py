@@ -27,8 +27,9 @@ from typing import Callable, Optional, Sequence
 FILE = ("state", "core-quota-card.json")
 RETRY_S = 60.0
 CARDED_KEEP = 100   # the owner messages already answered with the card, this episode
+ROOMED_KEEP = 200   # the room messages already told the limit, this episode
 SEND_TIMEOUT_S = 90.0
-AGAIN_TRIES = 5     # a follow-up card that failed is tried this many times in all, RETRY_S doubling between
+AGAIN_TRIES = 5     # a follow-up card that failed is tried again, RETRY_S doubling this many times, then at that pace
 
 # The runtime's own words for when the limit ends ("try again at 3:05 PM", "resets in 2 hours"); only
 # time-like characters of them are kept, so nothing else of the error reaches the DM.
@@ -97,6 +98,66 @@ def words(name: str, reset: str, why: str = "quota", credits: bool = False) -> s
     said = "%s has reached its usage limit%s, so I can't answer until then. Switch to another account to go on now." % (
         name, " (resets %s)" % reset if reset else " (it does not say when that resets)")
     return said + (" " + CREDITS_LINE if credits else "")
+
+
+NO_RESET_S = 900.0  # a limit that named no reset time is over this long after it was last seen
+
+
+def room_words(name: str, reset: str) -> str:
+    """The limit as told under a message in a shared room: no account named, nothing that switches one.
+    The same words the local agents use (ag2_sparrow.quota_notice.room_words); a test holds them equal."""
+    return ("%s has reached its usage limit%s, so I can't answer until then. To switch account, message me in our "
+            "direct message." % (name, " (resets %s)" % reset if reset else " (it does not say when that resets)"))
+
+
+def in_force(rec: dict, now: float) -> bool:
+    """Whether the limit `rec` records still stands: not past its reset time, or, when it named none,
+    seen within NO_RESET_S (nothing else would ever end it for a caller that runs no turn)."""
+    if not isinstance(rec, dict) or not rec.get("since") or (rec.get("why") or "quota") != "quota":
+        return False
+    until = rec.get("reset_at")
+    if until is not None:
+        return now < float(until)
+    return now - float(rec.get("seen") or rec.get("since") or 0) <= NO_RESET_S
+
+
+def _room_task(path, workspace) -> bool:
+    """Whether the task at `path` was sent in a shared room by someone the core answers there: the owner
+    or a collaborator. Read from its attested headers, never from its words."""
+    import task_envelope
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    h = task_envelope.attested_task_headers(text, Path(workspace)).headers
+    kind = (h.get("channel_kind") or "").strip()
+    answered = (h.get("access_tier") or "").strip() == "owner" or (h.get("collaborator") or "").strip().lower() == "true"
+    return bool(kind) and kind != "dm" and answered
+
+
+def room_tasks(workspace) -> dict:
+    """{task id: its file} for the tasks waiting in the core's queue that were sent in a shared room and
+    that the core itself would answer. A room message it would not have replied to, or one routed to a
+    worker, is told nothing."""
+    out = {}
+    try:
+        import task_queue
+        files = task_queue.pending_files(Path(workspace))
+    except Exception:  # noqa: BLE001 - no queue read: nobody to tell
+        return out
+    from delivery import task_dispatch
+    deliveries = Path(workspace) / "deliveries"
+    for p in files:
+        try:
+            # A task a worker holds is that worker's to answer, as the core's own dispatch reads it: the
+            # core's limit does not hold it, and one whose owner cannot be told is told nothing.
+            if task_dispatch.worker_holds(deliveries, p.name):
+                continue
+        except task_dispatch.WorkerHoldUnreadable:
+            continue
+        if _room_task(p, workspace):
+            out[p.name[:-4] if p.name.endswith(".txt") else p.name] = p
+    return out
 
 
 def card_sender(argv: Sequence[str], workspace, log: Callable[..., None] = print,
@@ -206,6 +267,7 @@ class QuotaNotice:
             rec = {"since": at}
         rec["name"] = self.name
         rec["why"] = why
+        rec["seen"] = at                 # a limit with no reset time is dated from when it was last seen
         if reset_at is not None:
             rec["reset_at"] = float(reset_at)
         if reset and not rec.get("reset"):
@@ -213,6 +275,8 @@ class QuotaNotice:
         if credits:
             rec["credits"] = True        # the account can go on with usage credits: the card says how
         self.health(SIGNED_OUT if why == SIGNED_OUT else "quota", rec.get("reset_at"))
+        if why != SIGNED_OUT:
+            rec = self.tell_rooms(rec)
         if rec.get("told"):
             return self.again(rec, [str(t) for t in tasks if t])
         if at - float(rec.get("tried") or 0) < RETRY_S:
@@ -233,12 +297,34 @@ class QuotaNotice:
         self.save(dict(rec, told=True, via="card", carded=[str(t) for t in tasks if t][-CARDED_KEEP:]))
         return "quota-card"
 
+    def tell_rooms(self, rec: dict) -> dict:
+        """Each message waiting from a shared room is told the limit there, once, under itself: the card
+        goes to the owner's DM only, and a room used to hear nothing. Returns `rec` with those it told."""
+        try:
+            import activity_rows
+            told = [t for t in rec.get("roomed") or [] if isinstance(t, str)]
+            line = room_words(self.name, str(rec.get("reset") or ""))
+            for tid, path in room_tasks(self.workspace).items():
+                if tid in told:
+                    continue
+                task, room = activity_rows.task_from_file(path)
+                if not room:
+                    continue
+                activity_rows.append(line, kind="notice", room=room, task=task, audience="room",
+                                     projection="TASK_STATUS", pid="quota:%s:%s:on-hold" % (int(rec["since"]), tid),
+                                     workspace=self.workspace)
+                told.append(tid)
+            return dict(rec, roomed=told[-ROOMED_KEEP:]) if told else rec
+        except Exception as e:  # noqa: BLE001 - the card in the DM stands without it
+            self.log("room not told the limit:", type(e).__name__)
+            return rec
+
     def again(self, rec: dict, tasks: list) -> str:
         """The card once more for each owner message that arrived since: told, never left to wait."""
         carded = [t for t in rec.get("carded") or [] if isinstance(t, str)]
         fresh = [t for t in tasks if t not in carded]
         failed = rec.get("again_failed") if isinstance(rec.get("again_failed"), dict) else {}
-        if rec.get("via") == "notice" or not fresh or self.now() < float(failed.get("next") or 0):
+        if not fresh or self.now() < float(failed.get("next") or 0):
             self.save(rec)
             return ""
         # Recorded before the send: a stop mid-send never posts it twice for the same message.
@@ -252,9 +338,9 @@ class QuotaNotice:
             posted = False
         if posted:
             return "quota-card-again"
-        tries = int(failed.get("n") or 0) + 1
-        if tries < AGAIN_TRIES:   # a confirmed failure: the messages stay uncarded and are tried again later
-            self.save(dict(rec, again_failed={"n": tries, "next": self.now() + RETRY_S * 2 ** (tries - 1)}))
+        # A confirmed failure: the messages stay uncarded and are tried again, ever later up to a ceiling.
+        tries = min(int(failed.get("n") or 0) + 1, AGAIN_TRIES)
+        self.save(dict(rec, again_failed={"n": tries, "next": self.now() + RETRY_S * 2 ** (tries - 1)}))
         return "quota-not-posted"
 
 
