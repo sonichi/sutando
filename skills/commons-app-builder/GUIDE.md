@@ -49,7 +49,8 @@ the whole call.
 | `db.onChange(db, fn, {bodies?})` | Calls `fn(snapshot)` with the same shape as `read` (`null` once the database is gone), with changes coalesced. Returns an unsubscribe function. |
 | `members()` | Resolves to the room's joined members, `[{id, name, avatar, kind}]` (at most 200). |
 | `personId(cell)` | Resolves to the `me.id`-style id of a joined member named in a person or `created_by` cell, else `null`. |
-| `state.get/set/delete/keys/all/on(key \| "*", fn)` | Shared, persisted room state: JSON values up to 4 KB, at most 500 keys, keys matching `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`. |
+| `state.get/keys/all/on(key \| "*", fn)` | Shared, persisted state that belongs to this page, not the room: JSON values up to 4,096 bytes, at most 500 keys, keys matching `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`. `get` returns the cached value. |
+| `state.read(key)` / `state.set(key, value, options?)` / `state.delete(key, options?)` | Ask the host. `read` resolves to `{key, exists, revision, value}`; `set` and `delete` resolve once saved (see "Saving state"). |
 | `emit(name, data)` / `on(name, fn)` | One-shot events, at most 20 a second. Only viewers online at that moment see them. |
 | `pages.list()` / `pages.read(kind)` | Read-only access to the room's pages. |
 | `agent.list()` | Resolves to the viewer's own agents, `[{id, name, kind, userId?}]` (see "Asking an agent from an app"). |
@@ -62,6 +63,16 @@ bytes per write. A page's first write asks the viewer "may this page edit data i
 they answer, writes are refused with "waiting for the viewer's answer", and `members()` and
 `personId()` reject with "page permission required". A "no" gives "not allowed by the viewer".
 Editing the page asks again.
+
+**Saving state.** `options` may hold only `expected_revision` (a `revision` from `read`) and
+`operation_id` (`[A-Za-z0-9_-]{1,128}`); anything else is refused as `INVALID_ARGUMENT`. A failed
+`set` or `delete` rejects with an error carrying `code` and `refused` (and, once the host has
+answered, `current_revision` and `draft`). `refused: true` means nothing was saved:
+`REVISION_CONFLICT` (read again and merge), `STATE_NOT_SYNCED` (retry once the page syncs),
+`STATE_REQUEST_REFUSED`, `INVALID_ARGUMENT`, `STATE_REQUEST_PENDING` or `TOO_MANY_STATE_REQUESTS`.
+`refused: false` (`STATE_REQUEST_UNCONFIRMED`, `STATE_REQUEST_TIMEOUT`) means it may have been
+saved: retry the same value with the same `operation_id`, and use a new one for a changed value.
+Keep the viewer's input on any failure.
 
 **The sandbox.** The frame is `allow-scripts` on an opaque origin. It has no network (`fetch`,
 XHR and WebSocket fail), `localStorage` throws, `alert`, `confirm` and `prompt` are blocked,
@@ -287,8 +298,10 @@ me" buttons.
   minute per person and agent) and refuses an agent that is not the viewer's.
 - It resolves to `{ok: true, eventId}`, a dispatch receipt, or `{ok: false, reason}`. Reasons
   include `declined`, `page permission required`, `agent not owned or unavailable`,
-  `too many agent requests`, `another request is in progress` and `request outcome unknown`
-  (retry with the same `key`).
+  `too many agent requests`, `another request is in progress`, `request outcome unknown` and
+  `send outcome unknown`. Treat both "outcome unknown" answers alike: it may have been sent, so
+  never make a new `key`. Retrying the same one does not send again in this browser profile;
+  after `send outcome unknown`, check the agent's DM instead of retrying.
 
 **2. `artifact.room.post` asks an agent in the room, as the viewer.** Use it when the ask should
 be seen by the room, or the agent is not the viewer's.
