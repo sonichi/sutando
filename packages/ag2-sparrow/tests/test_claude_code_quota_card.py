@@ -41,10 +41,10 @@ class NoticeBase(Base):
         self.addCleanup(p.stop)
 
     def task(self, task_id, *a, **kw):
-        """A task that arrives at the test's clock, as the notice reads it."""
-        made = super().task(task_id, *a, **kw)
-        os.utime(self.inbox / (task_id + ".txt"), (self.at[0], self.at[0]))
-        return made
+        """A task sent at the test's clock, as its `timestamp` header says (the notice reads that, not the file)."""
+        import datetime
+        sent = datetime.datetime.fromtimestamp(self.at[0], datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+        return super().task(task_id, *a, **dict(kw, extra=kw.get("extra", "") + "timestamp: %s\n" % sent))
 
     def tick(self, text, advance=0.0):
         self.at[0] += advance
@@ -379,6 +379,24 @@ class LimitMenu(NoticeBase):
         self.assertEqual(self.tick(TURN_MENU, 5.0), "quota-task-card x1")
         self.assertEqual(len(self.queued()), 2)
 
+    def test_a_waiting_message_whose_file_is_rewritten_gets_no_second_card_and_the_limits_words_are_kept(self):
+        quota_card.remember_room(self.root, DM)
+        self.task("task-w", "hello?")
+        self.at[0] += 5
+        self.assertEqual(self.tick(TURN_MENU), "quota-task-card x1")
+        said = quota_card.load(self.root)["said"]
+        self.assertIn("has hit its usage limit", said)
+        # The message's card covered the incident; a rewrite of its file (a later mtime) is not a new message.
+        os.utime(self.inbox / "task-w.txt", (self.at[0] + 500, self.at[0] + 500))
+        self.assertEqual(self.tick(TURN_MENU, 600.0), "")
+        self.assertEqual(len(self.queued()), 1)
+        self.assertEqual(quota_card.load(self.root)["said"], said, "kept for a card asked for meanwhile")
+        # The time a task was sent is its header's; only a task with none is dated by its file.
+        path = self.inbox / "task-w.txt"
+        self.assertEqual(quota_card._sent_at({"timestamp": "2026-11-26T12:00:00Z"}, path), 1795694400.0)
+        self.assertEqual(quota_card._sent_at({"timestamp": "not a time"}, path), path.stat().st_mtime)
+        self.assertEqual(quota_card._sent_at({}, path), path.stat().st_mtime)
+
     def test_a_tasks_own_words_on_the_pane_are_not_the_limit(self):
         # An account with quota left was said to have hit its limit: the owner's message quoted the card, and the
         # terminal wrapped it so a line began "hit its usage limit".
@@ -496,7 +514,8 @@ class LimitMenu(NoticeBase):
         (there,) = self.queued()
         self.assertEqual(there["card"]["text"].split(" ", 2)[:2], ["Claude", "Code"])
         self.assertNotIn("sarah@example.com", there["card"]["text"])
-        self.assertTrue(there["card"]["text"].endswith(quota_card.IN_DM))
+        self.assertEqual(there["card"]["text"], "Claude Code has reached its usage limit (resets Nov 28, 1pm), so I can't "
+                                                "answer until then. To switch account, message me in our direct message.")
         self.assertEqual(("account_controls" in there["card"], there["card"].get("buttons")), (False, None))
         # The owner asks for a card while out: the limit's card answers, not the model's or the plain account's.
         quota_card.save(self.root, dict(quota_card.load(self.root), said="LIMIT WORDS"))

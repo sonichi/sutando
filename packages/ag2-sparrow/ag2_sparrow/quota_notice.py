@@ -35,6 +35,7 @@ from . import account_switch, card_desk, connector_cards
 FILE, ROOM_FILE = "quota-card.json", "quota-room.json"   # the incident; the owner's DM room
 TASKS_KEEP = 50                 # the owner messages of one limit remembered as told
 RETRY_S = 60.0                  # a card that could not be queued is tried again no sooner than this
+NO_RESET_S = 900.0              # a limit that named no reset time is over this long after its last refusal
 _ROOM = re.compile(r"^![^\s:]+(:\S+)?$")
 # When a runtime's own error text says the limit ends: "resets 3pm", "try again in 2 days 3 hours",
 # "try again at 3:05 PM". Only time-like characters of it are kept: nothing else of the error reaches the DM.
@@ -75,7 +76,8 @@ def words(name: str, reset: str, using: str) -> str:
 
 
 def room_words(name: str, reset: str) -> str:
-    """The limit as said in a shared room: no account named, and nothing there switches one."""
+    """The limit as said in a shared room: no account named, and nothing there switches one. The one wording
+    for every runtime; the core's copy (src/core_quota_notice.py) is held to it by a test."""
     return ("%s has reached its usage limit%s, so I can't answer until then. To switch account, message me in our "
             "direct message." % (name, " (resets %s)" % reset if reset else " (it does not say when that resets)"))
 
@@ -149,6 +151,9 @@ class QuotaNotice:
         until = rec.get("reset_at")
         carded = self.limited() or bool(rec.get("since") and rec.get("tasks"))      # a room's card counts too
         if not carded or (until is not None and self.now() >= float(until)):
+            return ""
+        # No reset time was given: with no turn to clear it (a card ask runs none), it ends by itself.
+        if until is None and self.now() - float(rec.get("last") or rec.get("since") or 0) > NO_RESET_S:
             return ""
         return words(self.name, str(rec.get("reset") or ""), "")
 
@@ -256,6 +261,7 @@ class QuotaNotice:
             rec = {}                     # the earlier limit reset and this is a new one: a new card
         if not rec.get("since"):
             rec = {"since": at}
+        rec["last"] = at                 # the latest refusal: a limit with no reset time is dated from it
         if reset_at is not None:
             rec["reset_at"] = float(reset_at)
         if reset and not rec.get("reset"):

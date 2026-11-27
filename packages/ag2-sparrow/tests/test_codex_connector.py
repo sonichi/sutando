@@ -2610,6 +2610,20 @@ class QuotaCardTest(CardWorld, unittest.TestCase):
         self.assertTrue(notice.says().startswith("Codex has reached its usage limit"))
         notice.now = lambda: time.time() + 10 ** 9
         self.assertEqual(notice.says(), "", "past its reset: not said")
+        # A limit that named no reset time ends by itself: a card ask runs no turn that could clear it.
+        notice.now = time.time
+        rec = notice.load()
+        notice.save({k: v for k, v in rec.items() if k != "reset_at"})
+        self.assertTrue(notice.says())
+        notice.now = lambda: time.time() + quota_notice.NO_RESET_S + 1
+        self.assertEqual(notice.says(), "")
+        # The one wording for a shared room, whatever the runtime.
+        self.assertEqual(quota_notice.room_words("Codex", "3:05 PM"),
+                         "Codex has reached its usage limit (resets 3:05 PM), so I can't answer until then. "
+                         "To switch account, message me in our direct message.")
+        self.assertEqual(quota_notice.room_words("Codex", ""),
+                         "Codex has reached its usage limit (it does not say when that resets), so I can't answer "
+                         "until then. To switch account, message me in our direct message.")
         said = []
         switch = account_switch.AccountSwitch(str(self.work / "state"), str(self.bridge), "Codex", None, None,
                                               lambda *a: said.append(a[0]), lambda: "alice@example.com", None, None,

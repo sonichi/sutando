@@ -29,13 +29,15 @@ types into the session or changes an account.
 from __future__ import annotations
 
 import collections
+import datetime
 import json
 import re
 import time
 import uuid
 from pathlib import Path
 
-from ... import account_switch, card_desk, claude_local_records as records, connect_bridge as cb, connector_cards
+from ... import (account_switch, card_desk, claude_local_records as records, connect_bridge as cb, connector_cards,
+                 quota_notice)
 from ...cli_wedge_patterns import ABNORMAL_PATTERNS, PROVIDER_LIMIT_PATTERNS
 from . import account_card, detector, inbox
 
@@ -64,9 +66,6 @@ _LIMIT = tuple(rx for name, rx in ABNORMAL_PATTERNS if name in PROVIDER_LIMIT_PA
 _ROOM = re.compile(r"^![^\s:]+(:\S+)?$")
 _HINT = re.compile(r"/?usage-credits\b", re.I)    # the credits hint under a banner, itself matched as one
 _MENU_WHEN = re.compile(r"^[\s>❯]*\d+\.\s+Wait here, then continue automatically (?:at|on)\s+(.{1,60})$", re.M | re.I)
-
-
-IN_DM = "To switch account, message me in our direct message."
 
 
 def _read(root, name) -> dict:
@@ -147,6 +146,12 @@ def words(limited: list, text: str, using: str, who: str = "") -> str:
         lead, what, when, "" if who else " " + using)
 
 
+def room_words(text: str) -> str:
+    """The limit as said in a shared room: the wording every runtime shares (quota_notice.room_words)."""
+    when = reset_words(text)
+    return quota_notice.room_words(account_card.NAME, when[len("resets "):] if when.startswith("resets ") else "")
+
+
 def delivery(bridge, rec: dict, at: float) -> str:
     """What became of the card `rec` queued: 'posted', 'dropped' or 'unsure' as the bridge recorded it, 'pending'
     while it is in the outbox or the bridge may still be settling it, 'unknown' when UNKNOWN_S later
@@ -202,6 +207,16 @@ def _history(root, text: str, at: float, session: str) -> bool:
     return bool(lines) and all(n <= old[ln] for ln, n in collections.Counter(lines).items())
 
 
+def _sent_at(sent: dict, path) -> float:
+    """When the task was sent: its own `timestamp` header, which a rewrite of the file does not move;
+    the file's time only for a task that carries none."""
+    stamp = str(sent.get("timestamp") or "").strip()
+    try:
+        return datetime.datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return Path(path).stat().st_mtime
+
+
 def _owner_task(root, task_id: str) -> "tuple[str | None, float, bool]":
     """(the room an owner task's notice goes to, when the task arrived, whether that room is the owner's DM,
     where the card may name the account): the room it was sent in (the owner's
@@ -212,7 +227,7 @@ def _owner_task(root, task_id: str) -> "tuple[str | None, float, bool]":
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
             sent, _ = agent_card.reply_words(f.read())
-        arrived = path.stat().st_mtime
+        arrived = _sent_at(sent, path)
     except (OSError, ValueError):
         return None, 0.0, False
     if agent_card.owner_may_act(sent, dm_only=False) is not None or agent_card.click_tagged(sent):
@@ -332,7 +347,7 @@ def _tell_tasks(root, cfg: dict, bridge: str, limited: list, text: str, log, rec
             rec = dict(rec, said=said)
         # In a room that is not the owner's DM the card names no account and switches none.
         built = (account_switch.limited(card.card("pending", said, ask=True)) if in_dm else
-                 card.card("pending", words(limited, text, "", "").rstrip() + " " + IN_DM))
+                 card.card("pending", room_words(text)))
         try:
             qid = connector_cards.queue(bridge, to, *built,
                                         key=entry["key"],
