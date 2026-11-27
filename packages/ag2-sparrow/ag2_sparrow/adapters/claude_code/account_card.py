@@ -156,6 +156,23 @@ def others(cfg: dict) -> dict:
             if not using or (v.lower() != using and k != saved_key(cfg.get("email") or ""))}
 
 
+def same_dir(mine, other) -> bool:
+    """Whether `other` is the very folder `mine` is (by device and inode, whatever path or link names it):
+    `own_dir`'s realpath comparison resolves what it can and compares the rest as text. Only an `other` that
+    is not there is a different folder; any other error raises, as Refused (fail closed)."""
+    try:
+        here = os.stat(mine)
+    except OSError as e:
+        raise accounts.Refused(OTHERS_UNKNOWN) from e
+    try:
+        there = os.stat(os.path.expanduser(str(other)))
+    except FileNotFoundError:
+        return False
+    except OSError as e:
+        raise accounts.Refused(OTHERS_UNKNOWN) from e
+    return (here.st_dev, here.st_ino) == (there.st_dev, there.st_ino)
+
+
 def config_dir_for_switch(cfg: dict) -> str:
     """The agent's own config dir; accounts.Refused when it has none, or it is not this agent's alone, or the
     credential proxy decides the account (the rules of a sign-in, `account.own_dir`)."""
@@ -166,6 +183,8 @@ def config_dir_for_switch(cfg: dict) -> str:
     except Exception as e:  # noqa: BLE001 - fail closed: a dir shared with another agent cannot be ruled out
         raise accounts.Refused(OTHERS_UNKNOWN) from e
     mine = accounts.own_dir(cfg, dirs)
+    if any(same_dir(mine, other) for other in dirs):
+        raise accounts.Refused(accounts.ANOTHER_AGENTS)
     if os.environ.get(accounts.PROXY_VAR):
         raise accounts.Refused(accounts.PROXIED)
     return mine

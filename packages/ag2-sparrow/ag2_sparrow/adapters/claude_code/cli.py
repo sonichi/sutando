@@ -719,17 +719,23 @@ def other_agents_dirs(local, strict: bool = False) -> list:
 
 
 def _strict_confs(root: Path) -> list:
-    """Every `*.conf` under `root` (what `rglob` finds, symlinked dirs not followed), raising on any directory
-    that cannot be listed: `rglob` skips one silently (Python 3.9 and later), so an incomplete listing would
-    read as fewer agents. A root that is not there is no agent."""
-    if not os.path.lexists(root):
+    """Every `*.conf` under `root` (what `rglob` finds, symlinked dirs not descended), raising on anything
+    that cannot be looked at: `rglob`, `lexists` and `os.walk` each turn some errors into "nothing there",
+    which would read as fewer agents. Only a root that is not there (FileNotFoundError) is no agent."""
+    try:
+        os.lstat(root)
+    except FileNotFoundError:
         return []
-
-    def refuse(e: OSError):
-        raise e
     found = []
-    for top, dirs, files in os.walk(root, onerror=refuse, followlinks=False):
-        found += [Path(top) / n for n in dirs + files if n.endswith(".conf")]
+
+    def walk(folder):
+        with os.scandir(folder) as entries:         # a folder that cannot be listed, or read on, raises
+            for entry in entries:
+                if entry.name.endswith(".conf"):
+                    found.append(Path(entry.path))
+                if entry.is_dir(follow_symlinks=False):     # raises where it cannot tell, never guesses
+                    walk(entry.path)
+    walk(root)
     return sorted(found)
 
 

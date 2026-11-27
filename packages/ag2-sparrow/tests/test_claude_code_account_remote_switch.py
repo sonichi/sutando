@@ -282,7 +282,7 @@ class Tap(Remote):
             self.assertNotIn("Use " + A, [b["label"] for b in self.posted("$x")["buttons"]], "fail closed: no buttons")
         self.assertFalse(self.request().exists())
         from ag2_sparrow.adapters.claude_code import cli as cc
-        with mock.patch.object(cc.os, "walk", side_effect=OSError("x")), self.assertRaises(OSError):
+        with mock.patch.object(cc.os, "scandir", side_effect=OSError("x")), self.assertRaises(OSError):
             cc.other_agents_dirs(cc.LOCAL, strict=True)
         with mock.patch.object(Path, "rglob", side_effect=OSError("x")):
             self.assertEqual(cc.other_agents_dirs(cc.LOCAL), [], "the sign-in's own reading is as before")
@@ -326,6 +326,76 @@ class Tap(Remote):
         self.assertEqual(sorted(cc.other_agents_dirs(cc.LOCAL, strict=True)),
                          sorted([str(self.home / "elsewhere"), str(self.config)]), "listed whole: every peer")
         self.assertEqual(cc._strict_confs(self.home / "none"), [], "no config root: no other agent")
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root reads any directory")
+    def test_a_config_root_that_cannot_be_looked_at_is_never_taken_for_no_peers(self):
+        from ag2_sparrow.adapters.claude_code import cli as cc
+        cfg = self.cfg()
+        parent = cc.cm.config_root().parent
+        parent.chmod(0)
+        self.addCleanup(parent.chmod, 0o700)
+        with self.assertRaises(PermissionError):
+            cc.other_agents_dirs(cc.LOCAL, strict=True)
+        with self.assertRaises(accounts.Refused) as refused:
+            ac.config_dir_for_switch(cfg)
+        self.assertEqual(str(refused.exception), ac.OTHERS_UNKNOWN)
+        parent.chmod(0o700)
+        afile = self.home / "afile"
+        afile.write_text("")
+        with mock.patch.object(cc.cm, "config_root", return_value=afile / "ag2-sparrow"):
+            with self.assertRaises(NotADirectoryError):
+                cc.other_agents_dirs(cc.LOCAL, strict=True)
+            self.assertEqual(cc.other_agents_dirs(cc.LOCAL), [], "lenient: as before")
+        with mock.patch.object(cc.cm, "config_root", return_value=afile):
+            with self.assertRaises(NotADirectoryError):
+                cc.other_agents_dirs(cc.LOCAL, strict=True)
+        with mock.patch.object(cc.cm, "config_root", return_value=self.home / "missing" / "ag2-sparrow"):
+            self.assertEqual(cc.other_agents_dirs(cc.LOCAL, strict=True), [], "truly missing: no peers")
+            self.assertEqual(ac.config_dir_for_switch(cfg), str(self.config))
+
+    def test_an_entry_whose_kind_cannot_be_told_refuses_rather_than_skips(self):
+        from ag2_sparrow.adapters.claude_code import cli as cc
+
+        class Entry:
+            name, path = "sub", str(self.home / "sub")
+
+            def is_dir(self, follow_symlinks=True):
+                raise PermissionError("cannot stat")
+
+        class Listing(list):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+        with mock.patch.object(cc.os, "scandir", return_value=Listing([Entry()])):
+            with self.assertRaises(PermissionError):
+                cc._strict_confs(self.home)
+
+    def test_a_peer_that_names_this_agents_folder_another_way_is_refused_and_unknowns_fail_closed(self):
+        from ag2_sparrow.adapters.claude_code import cli as cc
+        cfg = self.cfg()
+        link = self.home / "link-to-mine"
+        link.symlink_to(self.config)
+        peers = cc.cm.config_root() / "peers"
+        peers.mkdir(parents=True)
+        (peers / "peer.conf").write_text("CLAUDE_CONFIG_DIR=%s\n" % link)
+        with self.assertRaises(accounts.Refused) as refused:
+            ac.config_dir_for_switch(cfg)
+        self.assertEqual(str(refused.exception), accounts.ANOTHER_AGENTS)
+        with mock.patch.object(ac.accounts, "own_dir", side_effect=lambda cfg, dirs: cfg["CLAUDE_CONFIG_DIR"]):
+            with self.assertRaises(accounts.Refused) as refused:
+                ac.config_dir_for_switch(cfg)
+            self.assertEqual(str(refused.exception), accounts.ANOTHER_AGENTS, "by inode, not by resolved text")
+        (peers / "peer.conf").write_text("CLAUDE_CONFIG_DIR=%s\n" % (self.home / "not-made-yet"))
+        self.assertEqual(ac.config_dir_for_switch(cfg), str(self.config), "a peer folder not there is not mine")
+        self.assertFalse(ac.same_dir(self.config, self.home / "not-made-yet"))
+        with mock.patch.object(ac.os, "stat", side_effect=[os.stat(self.config), PermissionError("x")]):
+            with self.assertRaises(accounts.Refused):
+                ac.same_dir(self.config, self.home / "elsewhere")
+        with mock.patch.object(ac.os, "stat", side_effect=PermissionError("x")):
+            with self.assertRaises(accounts.Refused):
+                ac.same_dir(self.config, self.home / "elsewhere")
 
     def test_an_account_no_longer_saved_and_a_request_that_cannot_be_written(self):
         self.index(self.appdata, {})
