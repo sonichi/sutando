@@ -315,6 +315,21 @@ class Watch(Remote):
         self.assertEqual(rm.watch(self.root, nonce), "Could not switch: the saved sign-in has expired")
         self.assertEqual(rm.told({"ok": False}, A), ("error", "Could not switch: the app gave no reason"))
         self.assertEqual(rm.told({"ok": True}, A), ("done", "Switched to %s." % A))
+        self.assertEqual(rm.told({"ok": True, "verified": True}, A), ("done", "Switched to %s." % A))
+
+    def test_a_switch_whose_new_sign_in_is_not_tried_yet_says_so(self):
+        nonce = self.begun()
+        self.claim_it(nonce)
+        self.result(nonce, ok=True, label=A, verified=False)
+        said = rm.watch(self.root, nonce)
+        self.assertEqual(said, rm.UNVERIFIED % A)
+        self.assertTrue(said.startswith("Switched to %s. The new sign-in hasn't been tried yet" % A))
+        self.assertEqual(self.texts(), [("$acct", said)])
+        self.clear_outbox()
+        nonce = self.begun()
+        self.claim_it(nonce)
+        self.result(nonce, ok=True, label=A)      # an older app: no `verified`, read as verified
+        self.assertEqual(rm.watch(self.root, nonce), "Switched to %s." % A)
 
     def test_a_result_for_a_different_nonce_is_ignored(self):
         nonce = self.begun()
@@ -357,7 +372,7 @@ class Watch(Remote):
         self.assertTrue((self.config / (rm.RESULT % nonce)).exists(), "the receipt is where the app left it")
         self.assertEqual([p.name for p in self.config.iterdir()], [rm.RESULT % nonce], "no file under another name")
         with mock.patch.object(rm, "save", side_effect=OSError("disk full")):
-            self.assertIsNone(rm.receive(self.root, rm.load(self.root, nonce)))
+            self.assertIs(rm.receive(self.root, rm.load(self.root, nonce)), rm.RETRY)
         self.assertTrue((self.config / (rm.RESULT % nonce)).exists())
         self.assertEqual(rm.recover(self.root), 0, "the restart's check tells it")
         self.assertEqual(self.texts(), [("$acct", "Switched to %s." % A)])
@@ -377,6 +392,79 @@ class Watch(Remote):
         with mock.patch.object(rm.Path, "unlink", side_effect=PermissionError("ro")):
             kept = dict(rec, outcome={"nonce": nonce, "ok": True})
             self.assertEqual(rm.receive(self.root, kept), kept, "a receipt that cannot be removed yet is left")
+
+    def flaky(self, nonce, name, times=1):
+        """`rm.<name>` failing `times` times as an I/O error would, for the receipt of `nonce` only."""
+        real, left = getattr(rm, name), [times]
+
+        def call(*args, **kw):
+            hit = (str(args[0]).endswith(rm.RESULT % nonce) if name == "read_regular"
+                   else isinstance(args[1], dict) and "outcome" in args[1])
+            if hit and left[0] > 0:
+                left[0] -= 1
+                if name == "read_regular":
+                    return None, "unreadable (EIO)"
+                raise OSError(5, "Input/output error")
+            return real(*args, **kw)
+        return mock.patch.object(rm, name, side_effect=call)
+
+    def test_a_passing_read_error_is_retried_by_the_watcher_never_said_failed(self):
+        nonce = self.begun()
+        self.claim_it(nonce)
+        self.result(nonce, ok=True, label=A)        # the app's claim is gone; its receipt is there
+        seen = []
+
+        def sleep(s):
+            seen.append(((self.config / (rm.RESULT % nonce)).exists(), len(rm.outstanding(self.root)), self.texts()))
+        with self.flaky(nonce, "read_regular"):
+            self.assertEqual(rm.watch(self.root, nonce, sleep=sleep), "Switched to %s." % A)
+        self.assertEqual(seen, [(True, 1, [])], "both kept, nothing said, while it could not be read")
+        self.assertEqual(self.texts(), [("$acct", "Switched to %s." % A)])
+        self.assertEqual((list(self.config.iterdir()), rm.outstanding(self.root)), ([], []))
+
+    def test_a_passing_save_error_is_retried_by_recovery_never_said_failed(self):
+        nonce = self.begun()
+        self.claim_it(nonce)
+        self.result(nonce, ok=True, label=A)
+        self.spawned.clear()
+        with self.flaky(nonce, "save"):
+            self.assertEqual(rm.recover(self.root), 1, "still waiting: its watcher is started again")
+        self.assertEqual(self.texts(), [])
+        self.assertTrue((self.config / (rm.RESULT % nonce)).exists(), "the receipt is kept")
+        self.assertNotIn("outcome", rm.load(self.root, nonce))
+        self.assertEqual(rm.recover(self.root), 0)
+        self.assertEqual(self.texts(), [("$acct", "Switched to %s." % A)])
+        self.assertEqual((list(self.config.iterdir()), rm.outstanding(self.root)), ([], []))
+
+    def test_errors_that_do_not_pass_are_still_waited_out_and_never_said_failed(self):
+        nonce = self.begun()
+        self.claim_it(nonce)
+        self.result(nonce, ok=True, label=A)
+        sleep, clock = self.clock(rm.load(self.root, nonce)["at"])
+        with self.flaky(nonce, "read_regular", times=10 ** 6):
+            self.assertEqual(rm.settle_late(self.root), [])
+            self.assertEqual(rm.watch(self.root, nonce, sleep=sleep, clock=clock), rm.UNTOLD)
+        self.assertEqual([t for _, t in self.texts()], [rm.UNTOLD])
+        self.assertTrue(rm.load(self.root, nonce)["gave_up"], "kept for a later look")
+        self.assertEqual(rm.settle_late(self.root), ["Switched to %s." % A], "told once it reads")
+        nonce = self.begun()
+        self.claim_it(nonce)
+        self.result(nonce, ok=True, label=A)
+        late = []
+        with mock.patch.object(rm, "receive", side_effect=lambda root, rec: late.append(1) or (
+                None if len(late) == 1 else rm.RETRY)):
+            (self.config / (rm.RESULT % nonce)).unlink()
+            self.assertEqual(rm.settle_late(self.root), [], "a receipt that turns up unreadable waits")
+        with mock.patch.object(rm, "receive", side_effect=[None, rm.RETRY, None, None]):
+            self.assertEqual(rm.watch(self.root, nonce, sleep=lambda s: None), rm.UNTOLD)
+
+    def test_a_receipt_read_whole_but_not_an_answer_is_said_so(self):
+        nonce = self.begun()
+        self.claim_it(nonce)
+        (self.config / (rm.CLAIMED % nonce)).unlink()
+        (self.config / (rm.RESULT % nonce)).write_text("{half")
+        self.assertEqual(rm.watch(self.root, nonce), "Could not switch: the app's answer could not be read")
+        self.assertEqual(list(self.config.iterdir()), [])
 
     def test_an_app_restart_mid_switch_says_the_account_now_never_that_it_failed(self):
         nonce = self.begun()

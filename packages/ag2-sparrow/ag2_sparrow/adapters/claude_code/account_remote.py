@@ -33,7 +33,7 @@ import uuid
 from pathlib import Path
 
 from ... import account_switch, card_desk, claude_local_records as records, connector_cards
-from ...bounded_file_read import read_regular
+from ...bounded_file_read import read_regular, unreadable
 from ...file_lock import locked_file, try_lock_fd, unlock_fd
 
 REQUEST = ".ag2-switch-request.json"
@@ -47,6 +47,8 @@ NONCE_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[
 BUSY = "A switch is already running for this agent."
 UNCLAIMED = "The app on this computer did not pick this up — is it running? Nothing was changed."
 WORKING = "Switching to %s… the app on this computer is still working on it."
+UNVERIFIED = ("Switched to %s. The new sign-in hasn't been tried yet; if the next reply fails, sign in again from "
+              "the account card.")
 RESTARTED_ON = "The app restarted during the switch. This agent is now on %s."
 RESTARTED = "The app restarted during the switch; check the account card to see which account is in use."
 UNTOLD = "The app has not said how the switch ended; check the account card again in a moment."
@@ -149,24 +151,31 @@ def _parsed(text, nonce: str) -> dict:
         data = None
     if not isinstance(data, dict) or data.get("nonce") != nonce:
         return {"nonce": nonce, "ok": False, "error": "the app's answer could not be read"}
-    return {k: data.get(k) for k in ("nonce", "ok", "label", "error", "unknown") if k in data}
+    return {k: data.get(k) for k in ("nonce", "ok", "label", "error", "unknown", "verified") if k in data}
+
+
+RETRY = "retry"     # receive(): a receipt there that could not be read or kept just now; both files stay
 
 
 def receive(root, rec: dict):
-    """`rec` with the app's answer to it kept in sparrow's own record ("outcome"); None while there is no
-    answer. Called under the switch lock only. The receipt is read where it is, the answer saved (a whole
-    write), and only then the receipt removed: a stop between any two steps leaves either the receipt or
-    the saved answer, never neither, and a receipt whose answer is already kept is just removed."""
+    """`rec` with the app's answer to it kept in sparrow's own record ("outcome"); None when there is no
+    receipt; RETRY when there is one that could not be read (an I/O error) or whose answer could not be
+    saved just now: the receipt and the record are left as they are, nothing is told, and it is read
+    again later. Only a receipt read whole whose content is not a usable answer is kept as "could not be
+    read". Called under the switch lock only. The answer is saved (a whole write) before the receipt is
+    removed: a stop between any two steps leaves the receipt or the saved answer, never neither."""
     path = Path(rec["config_dir"]) / (RESULT % rec["nonce"])
     if not isinstance(rec.get("outcome"), dict):
         text, why = read_regular(str(path), FILE_MAX, follow=False)
         if text is None and not why:
             return None
+        if text is None and unreadable(why):
+            return RETRY
         rec = dict(rec, outcome=_parsed(text, rec["nonce"]))
         try:
             save(root, rec)
         except OSError:
-            return None
+            return RETRY
     try:
         path.unlink()
     except OSError:
@@ -242,6 +251,8 @@ def told(data, label: str, current=lambda: "") -> tuple:
         return "info", (RESTARTED_ON % now if now else RESTARTED)
     if data.get("ok") is True:
         name = account_switch.shown(str(data.get("label") or "").split(" (")[0])
+        if data.get("verified") is False:      # switched, its sign-in not tried yet; an older app sends none
+            return "done", UNVERIFIED % (name or label)
         return "done", "Switched to %s." % (name or label)
     return "error", "Could not switch: %s" % (one_line(data.get("error")) or "the app gave no reason")
 
@@ -277,12 +288,16 @@ def _settle_late(root, log) -> list:
     for rec in outstanding(root):
         nonce, config_dir = rec["nonce"], rec["config_dir"]
         got = receive(root, rec)
+        if got is RETRY:
+            continue
         if got is not None:
             said.append(settle(root, got, log))
             continue
         if watcher_alive(root, nonce) or request_nonce(config_dir) == nonce or claimed(config_dir, nonce):
             continue
         got = receive(root, rec)       # written just before the claimed file was removed
+        if got is RETRY:
+            continue
         if got is not None:
             said.append(settle(root, got, log))
             continue
@@ -360,31 +375,40 @@ def _watch(root, nonce, sleep, clock, log) -> str:
             if rec is None:
                 return ""
             config_dir, at = rec["config_dir"], float(rec.get("at") or 0)
-            got = receive(root, rec)
-            if got is not None:
-                return settle(root, got, log)
             now = clock()
-            if request_nonce(config_dir) == nonce:
+            got = receive(root, rec)
+            if got is RETRY:
+                if now >= at + GIVE_UP_S:       # still unreadable: said untold, kept for a later look
+                    return _give_up(root, rec, log)
+            elif got is not None:
+                return settle(root, got, log)
+            elif request_nonce(config_dir) == nonce:
                 if now >= at + UNCLAIMED_S and withdraw(config_dir, nonce):
                     tell(rec, "error", UNCLAIMED, "unclaimed", log)
                     drop(root, nonce)
                     return UNCLAIMED
             elif claimed(config_dir, nonce):
                 if now >= at + GIVE_UP_S:
-                    tell(rec, "info", UNTOLD, "untold", log)
-                    save(root, dict(rec, gave_up=True))
-                    return UNTOLD
+                    return _give_up(root, rec, log)
                 if now >= at + UNCLAIMED_S and not rec.get("working"):
                     tell(rec, "pending", WORKING % rec.get("label"), "working", log)
                     save(root, dict(rec, working=True))
             else:
                 got = receive(root, rec)
-                if got is not None:
+                if got is not None and got is not RETRY:
                     return settle(root, got, log)
-                tell(rec, "info", UNTOLD, "lost", log)
-                drop(root, nonce)
-                return UNTOLD
+                if got is None:
+                    tell(rec, "info", UNTOLD, "lost", log)
+                    drop(root, nonce)
+                    return UNTOLD
         sleep(POLL_S)
+
+
+def _give_up(root, rec: dict, log) -> str:
+    """Stop waiting without saying how it ended; the record stays, so a later answer is still told."""
+    tell(rec, "info", UNTOLD, "untold", log)
+    save(root, dict(rec, gave_up=True))
+    return UNTOLD
 
 
 def main(argv=None) -> int:
