@@ -5,8 +5,9 @@ The contract with the app (v2), all in the agent's own CLAUDE_CONFIG_DIR:
   request  `.ag2-switch-request.json` {"v": 2, "key", "nonce", "at"}, 0600, written by this module only
            when no switch is unresolved for the agent, and created exclusively (a temp file linked in).
   claimed  the app renames the request to `.ag2-switch-claimed-<nonce>.json` while it switches.
-  result   then writes `.ag2-switch-result-<nonce>.json` {"v": 2, "nonce", "ok", "label" | "error"} and
-           removes the claimed file.
+  result   then writes `.ag2-switch-result-<nonce>.json` {"v": 2, "nonce", "ok", "label" | "error",
+           "verified", "unknown"} and removes the claimed file. `verified` false (or absent): switched, the
+           new sign-in not tried yet. `unknown` true: the app restarted mid-switch and cannot say.
 
 Each request is kept, until its outcome is told, as `state/account-remote/<nonce>.json` (the card tapped,
 its room, the address asked for). A detached watcher per nonce (`await`, holding `<nonce>.lock`) tells the
@@ -16,7 +17,10 @@ said still in progress, and after GIVE_UP_S said untold (never failed) with the 
 result is still told: `settle_late`, on the next card or tap, and `recover`, which restarts a watcher a
 restart left dead. The app's answer is kept in that record before its receipt is removed, and the
 record is dropped only once the card telling it is queued; an answer the app could not finish knowing
-(`unknown`: it restarted mid-switch) says the account in use now, never that the switch failed.
+(`unknown`: it restarted mid-switch), a receipt read whole that is not an answer, and a claim the app left
+unanswered for STALE_CLAIM_S (by its mtime: the app died for good) say the account in use now, never that the
+switch failed. A stale claim then stops counting as a switch in progress: its record is dropped and the claim
+removed while it still holds that nonce. The watcher's log is owner-only, like every file kept here.
 
     python3 -m ag2_sparrow.adapters.claude_code.account_remote await --root ROOT --nonce NONCE
 """
@@ -43,6 +47,8 @@ FILE_MAX = 16 << 10
 VERSION = 2
 PENDING = "account-remote"
 UNCLAIMED_S, GIVE_UP_S, POLL_S = 90.0, 600.0, 1.0
+STALE_CLAIM_S = 900.0       # a claim with no result this long after its last change: the app is not coming back
+LOG = "account-remote.log"
 NONCE_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
 BUSY = "A switch is already running for this agent."
 UNCLAIMED = "The app on this computer did not pick this up — is it running? Nothing was changed."
@@ -51,6 +57,10 @@ UNVERIFIED = ("Switched to %s. The new sign-in hasn't been tried yet; if the nex
               "the account card.")
 RESTARTED_ON = "The app restarted during the switch. This agent is now on %s."
 RESTARTED = "The app restarted during the switch; check the account card to see which account is in use."
+UNREAD_ON = "The app's answer about this switch could not be read. This agent is now on %s."
+UNREAD = "The app's answer about this switch could not be read; check the account card to see which account is in use."
+STALE_ON = "The app never said how this switch ended. This agent is now on %s."
+STALE = "The app never said how this switch ended; check the account card to see which account is in use."
 UNTOLD = "The app has not said how the switch ended; check the account card again in a moment."
 _popen = subprocess.Popen
 
@@ -81,6 +91,8 @@ def save(root, rec: dict) -> None:
     d.mkdir(mode=0o700, parents=True, exist_ok=True)
     path, tmp = d / (rec["nonce"] + ".json"), d / (rec["nonce"] + ".json.tmp")
     with os.fdopen(os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as f:
+        if hasattr(os, "fchmod"):           # a leftover temp keeps its mode through O_TRUNC
+            os.fchmod(f.fileno(), 0o600)
         json.dump(rec, f)
     os.replace(str(tmp), str(path))
 
@@ -137,11 +149,46 @@ def claimed(config_dir, nonce: str) -> bool:
     return os.path.lexists(str(Path(config_dir) / (CLAIMED % nonce)))
 
 
-def claimed_any(config_dir) -> bool:
+def stale_claim(config_dir, nonce: str, now=None) -> bool:
+    """Whether the claim of `nonce` is there and unchanged for STALE_CLAIM_S."""
     try:
-        return any(n.startswith(".ag2-switch-claimed-") and n.endswith(".json") for n in os.listdir(str(config_dir)))
+        at = os.lstat(str(Path(config_dir) / (CLAIMED % nonce))).st_mtime
     except OSError:
         return False
+    return (time.time() if now is None else now) - at >= STALE_CLAIM_S
+
+
+def claimed_any(config_dir, now=None) -> bool:
+    """Whether the app holds a claim that may still be answered: a stale one (STALE_CLAIM_S) does not count."""
+    try:
+        names = os.listdir(str(config_dir))
+    except OSError:
+        return False
+    return any(n.startswith(".ag2-switch-claimed-") and n.endswith(".json")
+               and not stale_claim(config_dir, n[len(".ag2-switch-claimed-"):-len(".json")], now) for n in names)
+
+
+def drop_stale_claim(config_dir, nonce: str) -> None:
+    """Remove the claim of `nonce` only while it still holds that nonce (moved aside first, then checked)."""
+    path = Path(config_dir) / (CLAIMED % nonce)
+    aside = path.with_name(path.name + ".stale")
+    try:
+        os.rename(str(path), str(aside))
+    except OSError:
+        return
+    try:
+        text, _ = read_regular(str(aside), FILE_MAX, follow=False)
+        try:
+            data = json.loads(text) if text else None
+        except ValueError:
+            data = None
+        if not (isinstance(data, dict) and data.get("nonce") == nonce):
+            try:
+                os.link(str(aside), str(path))      # not that nonce's: left as it was
+            except OSError:
+                pass
+    finally:
+        aside.unlink(missing_ok=True)
 
 
 def _parsed(text, nonce: str) -> dict:
@@ -150,7 +197,7 @@ def _parsed(text, nonce: str) -> dict:
     except ValueError:
         data = None
     if not isinstance(data, dict) or data.get("nonce") != nonce:
-        return {"nonce": nonce, "ok": False, "error": "the app's answer could not be read"}
+        return {"nonce": nonce, "unreadable": True}      # not an answer: how the switch ended is not known
     return {k: data.get(k) for k in ("nonce", "ok", "label", "error", "unknown", "verified") if k in data}
 
 
@@ -244,14 +291,17 @@ def current_account(rec: dict) -> str:
 
 
 def told(data, label: str, current=lambda: "") -> tuple:
-    """(state, words) for the app's answer. One the app could not finish knowing (it restarted during the
-    switch, `unknown`) is never said failed: it says the account in use now, as `current()` reads it."""
-    if data.get("unknown") is True:
-        now = current()
-        return "info", (RESTARTED_ON % now if now else RESTARTED)
+    """(state, words) for the app's answer. One that does not say how the switch ended (the app restarted
+    during it, `unknown`; a receipt that is not an answer, `unreadable`; a claim left unanswered, `stale`)
+    is never said failed: it says the account in use now, as `current()` reads it."""
+    for flag, on, plain in (("unknown", RESTARTED_ON, RESTARTED), ("unreadable", UNREAD_ON, UNREAD),
+                            ("stale", STALE_ON, STALE)):
+        if data.get(flag) is True:
+            now = current()
+            return "info", (on % now if now else plain)
     if data.get("ok") is True:
         name = account_switch.shown(str(data.get("label") or "").split(" (")[0])
-        if data.get("verified") is False:      # switched, its sign-in not tried yet; an older app sends none
+        if data.get("verified") is not True:      # switched; its sign-in not tried yet, or not said (older app)
             return "done", UNVERIFIED % (name or label)
         return "done", "Switched to %s." % (name or label)
     return "error", "Could not switch: %s" % (one_line(data.get("error")) or "the app gave no reason")
@@ -293,7 +343,22 @@ def _settle_late(root, log) -> list:
         if got is not None:
             said.append(settle(root, got, log))
             continue
-        if watcher_alive(root, nonce) or request_nonce(config_dir) == nonce or claimed(config_dir, nonce):
+        if watcher_alive(root, nonce) or request_nonce(config_dir) == nonce:
+            continue
+        if claimed(config_dir, nonce):
+            if not stale_claim(config_dir, nonce):
+                continue
+            drop_stale_claim(config_dir, nonce)     # the app is not coming back: told as unknown, below
+            got = receive(root, rec)
+            if got is RETRY:
+                continue
+            if got is None:
+                got = dict(rec, outcome={"nonce": nonce, "stale": True})
+                try:
+                    save(root, got)     # kept like an answer, so a card that cannot be queued yet is told later
+                except OSError:
+                    continue
+            said.append(settle(root, got, log))
             continue
         got = receive(root, rec)       # written just before the claimed file was removed
         if got is RETRY:
@@ -332,10 +397,24 @@ def publish(root, config_dir, key: str, label: str, room: str, edit: str, bridge
     return nonce
 
 
+def private_log(root):
+    """The watchers' log, opened for appending and owner-only whatever the umask or an earlier mode: what it
+    says may name an account."""
+    fd = os.open(str(records.state_dir(root) / LOG), os.O_WRONLY | os.O_CREAT | os.O_APPEND
+                 | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0), 0o600)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+    except BaseException:
+        os.close(fd)
+        raise
+    return os.fdopen(fd, "ab")
+
+
 def start(root, nonce: str, popen=None) -> bool:
     """The watcher for `nonce`, detached."""
     try:
-        with open(records.state_dir(root) / "account-remote.log", "ab") as fh:
+        with private_log(root) as fh:
             (popen or _popen)([sys.executable, "-m", __name__, "await", "--root", str(root), "--nonce", nonce],
                               stdin=subprocess.DEVNULL, stdout=fh, stderr=subprocess.STDOUT, start_new_session=True)
     except OSError as e:
