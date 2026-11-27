@@ -297,13 +297,16 @@ def is_worker_note_lane(instance: str, worker: str, room_id: str = "", workspace
 def claim_gate(worker: str, *, instance: str = "", workspace=None, route=None):
     """Claim only this worker's stamped notes through their destination lane."""
     from proactive_routing import lane_claims_proactive
-    def gate(path):
+    def gate(path, text=None):
+        """`text`: the body of a file the bridge has already claimed. Its live name `path` is gone
+        while the claim is held, so the body is judged as given, never re-read from that name."""
         if not lane_claims_proactive(path.name, worker):
             return False
         if not instance:
             return True
         try:
-            kind, room, _ = route(path.read_text(encoding="utf-8")) if route else ("", "", "")
+            body = path.read_text(encoding="utf-8") if text is None else text
+            kind, room, _ = route(body) if route else ("", "", "")
         except (OSError, ValueError):
             return False
         return is_worker_note_lane(instance, worker, room if kind == "send" else "", workspace)
