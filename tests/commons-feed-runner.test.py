@@ -422,4 +422,105 @@ check("a result-wrapped missing connection is connector_not_connected",
       fr.failure(run, {"result": {"error": "connect_required"}})["code"]
       == "connector_not_connected")
 
+# The operation_id is the run key plus a hash of what is written: other rows are a new
+# operation, an identical retry the same one.
+KEY = "cron:gabc123def:1794679200000"
+ROWS_A = [{"_id": "e1", "Title": "Standup", "Start": "2026-11-09T18:30:00Z"}]
+ROWS_B = [{"_id": "e1", "Title": "Standup (moved)", "Start": "2026-11-09T19:00:00Z"}]
+write_a = {"grant_id": "gabc123def", "run_key": KEY, "rows": ROWS_A}
+op_a = fr.operation_id(write_a)["operation_id"]
+check("a write's id is the run key, a rows part and 16 hex", re.fullmatch(
+    re.escape(KEY) + r":rows:[0-9a-f]{16}", op_a) is not None)
+check("the same rows give the same id (a plain retry is the same operation)",
+      fr.operation_id(json.loads(json.dumps(write_a)))["operation_id"] == op_a)
+check("key order inside a row does not change the id",
+      fr.operation_id({**write_a, "rows": [dict(reversed(list(ROWS_A[0].items())))]})
+      ["operation_id"] == op_a)
+check("other rows give another id (a retry that re-ran the connector is a new operation)",
+      fr.operation_id({**write_a, "rows": ROWS_B})["operation_id"] != op_a)
+check("no rows is still its own id", fr.operation_id({**write_a, "rows": []})["operation_id"]
+      not in (op_a,))
+# The backend binds an id to the exact rows sent, so rows in another order are another id: one
+# id never carries two argument sets, which the backend would refuse as a conflict.
+TWO = ROWS_A + [{"_id": "e2", "Title": "Review", "Start": "2026-11-09T20:00:00Z"}]
+check("rows in another order give another id (the id covers the rows exactly as sent)",
+      fr.operation_id({**write_a, "rows": TWO})["operation_id"]
+      != fr.operation_id({**write_a, "rows": TWO[::-1]})["operation_id"])
+fail_a = {"grant_id": "gabc123def", "run_key": KEY, "code": "connector_error"}
+op_f = fr.operation_id(fail_a)["operation_id"]
+check("a failure's id is the run key, a fail part and 16 hex", re.fullmatch(
+    re.escape(KEY) + r":fail:[0-9a-f]{16}", op_f) is not None)
+check("another failure code is another id",
+      fr.operation_id({**fail_a, "code": "connector_rate_limited"})["operation_id"] != op_f)
+check("a failure's id never equals a write's", op_f != op_a)
+for bad in ({"rows": ROWS_A}, {"run_key": "", "rows": ROWS_A}, {"run_key": KEY}):
+    try:
+        fr.operation_id(bad)
+        refused = False
+    except fr.Refused:
+        refused = True
+    check(f"opid refuses {sorted(bad)}", refused)
+with tempfile.TemporaryDirectory() as tmp:
+    path = Path(tmp) / "write.json"
+    path.write_text(json.dumps(write_a))
+    cli = subprocess.run([sys.executable, str(_SCRIPT), "opid", str(path)],
+                         capture_output=True, text=True)
+    check("the opid command prints the id", cli.returncode == 0
+          and json.loads(cli.stdout) == {"operation_id": op_a})
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = fr.main(["feed_runner.py", "opid", str(path)])
+    check("main's opid answers the same id in process", code == 0
+          and json.loads(out.getvalue()) == {"operation_id": op_a})
+    (Path(tmp) / "bad.json").write_text("{}")
+    bad_cli = subprocess.run([sys.executable, str(_SCRIPT), "opid", str(Path(tmp) / "bad.json")],
+                             capture_output=True, text=True)
+    check("the opid command refuses arguments with no run key", bad_cli.returncode == 1)
+skill = (_ROOT / "skills" / "commons-feed-runner" / "SKILL.md").read_text()
+check("doc pin: the skill sends both calls with opid's id",
+      skill.count("feed_runner.py opid write.json") == 1
+      and skill.count("feed_runner.py opid fail.json") == 1
+      and "the run key + `:fail`" not in skill)
+
+# `current` refuses a run whose slot has passed: a check before sending, not a fence.
+every_ms = EVERY * 60_000
+slot_start = NOW // every_ms * every_ms
+check("due gives each run the end of its slot", fr.slot_until(EVERY, NOW) == slot_start + every_ms
+      and run["slot_until"] == slot_start + every_ms)
+in_slot = {"slot_until": slot_start + every_ms}
+check("a run inside its slot is current", fr.current(in_slot, NOW) == {"current": True})
+for name, run, at in (("at the slot's end", in_slot, slot_start + every_ms),
+                      ("with no slot_until", {}, NOW),
+                      ("with a boolean slot_until", {"slot_until": True}, NOW)):
+    try:
+        fr.current(run, at)
+        refused = False
+    except fr.Refused:
+        refused = True
+    check(f"a run {name} is not current", refused)
+
+# Doc pins and a model, not behaviour: they pin the stated 16 and model the backend's run memory
+# with list slicing, so no change to feed_runner.py fails them.
+check("doc pin: the run-key history the docs state is 16", fr.RUN_KEY_HISTORY == 16
+      and "(16 per grant)" in skill and "only while the key is among those 16" in skill
+      and "never writes again" not in (fr.current.__doc__ or ""))
+paused = fr.slot_key("g", EVERY, NOW)
+fr.current(in_slot, NOW)  # passes before the request is paused
+for newer, deduped in ((fr.RUN_KEY_HISTORY - 1, True), (fr.RUN_KEY_HISTORY, False)):
+    history = [paused] + [fr.slot_key("g", EVERY, NOW + i * every_ms) for i in range(1, newer + 1)]
+    kept = history[-fr.RUN_KEY_HISTORY:]
+    check(f"model: a paused run with {newer} newer runs is {'still' if deduped else 'no longer'} deduped",
+          len(set(history)) == newer + 1 and (paused in kept) is deduped)
+with tempfile.TemporaryDirectory() as tmp:
+    for name, until, code_want in (("current", 2 ** 62, 0), ("past", 1, 1)):
+        path = Path(tmp) / f"{name}.json"
+        path.write_text(json.dumps({"slot_until": until}))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = fr.main(["feed_runner.py", "current", str(path)])
+        check(f"the current command exits {code_want} for a {name} slot", code == code_want)
+check("doc pin: the skill checks the slot before writing, and qualifies the run-key history",
+      skill.count("feed_runner.py current run.json") == 1 and "16 per grant" in skill
+      and "writes the run key once" not in skill)
+
 print(f"commons-feed-runner: {len(passed)} passed")
