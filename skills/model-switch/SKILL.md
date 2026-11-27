@@ -1,12 +1,12 @@
 ---
 name: model-switch
-description: "Change the core's model without the CLI: send /model to the live core's pane through the shared sender, wait for the CLI to accept it (answering its confirm dialog only under --confirm), record only once accepted; persistence is the CLI's own."
+description: "Change the core's model without the CLI: send /model to the live core's pane through the shared sender, wait for the CLI to accept it (answering its confirm dialog only under --confirm), record only once accepted; persistence is the CLI's own. A pool worker's session is switched only while it runs in a Claude folder of its own, and recorded per worker."
 user-invocable: true
 ---
 
 # model-switch
 
-`scripts/switch-model.sh <model> [--dry-run] [--confirm] [--accept-timeout S]` — `<model>` is one of the
+`scripts/switch-model.sh <model> [--dry-run] [--confirm] [--accept-timeout S] [--target core|worker]` — `<model>` is one of the
 CLI's aliases (`default|opus|sonnet|haiku|fable`) or a `claude-*` id, either with an optional `[1m]`
 tag (`default` takes none);
 anything else is refused before any write (exit 2).
@@ -64,6 +64,42 @@ overrides.
 Python comes from `sutando-config.sh python-bin`, never bare `python3`. The core-side entry
 `scripts/switch-model.sh` only execs this script. An owner message like "switch model to opus" is
 handled by running it; the dashboard's Quota tile shows the model the proxy then sees.
+
+## A pool worker's session
+
+Claude Code's `/model` saves the pick as the default of the Claude folder the session **runs in**
+(this CLI offers only "Yes, switch / No": there is no "this session only"). A pool worker normally
+runs in the core's folder, so a switch typed into its pane would change the core's default and every
+other worker's. So the script first tells whose session it targets (`scripts/worker_target.py`):
+
+- **The core's** (any session that is not a worker's): everything above, unchanged.
+- **A worker's** (`sutando-worker-<worker id>`, from `--session` or the session's own
+  `SUTANDO_TMUX_SESSION`): switched only while its running session uses a Claude folder of its own
+  (`skills/worker-pool/scripts/worker_claude_folder.py`, `<core folder>-workers/<worker id>`). The
+  folder is read from the running process, not from disk: every `claude` process of the session
+  (the launcher's `claude_named_pids`) must carry that session's name and one `CLAUDE_CONFIG_DIR`,
+  which must be the worker's own folder with a `settings.json` of its own. The core's folder, any
+  other folder, no running process or an environment that cannot be read is **exit 15**: nothing
+  sent, nothing recorded; the message says to give the worker its own folder
+  (`worker_claude_folder.py ensure <core folder> <worker id>`) and restart it. A folder made while
+  the worker runs is not in use until that restart.
+- **Not told apart** is **exit 14**, never a switch of the core: a worker session naming no worker
+  id; a session and a `SUTANDO_WORKER_ID` that name different workers (pass `--session` to name the
+  one meant); a worker's session (`SUTANDO_WORKER_ID` set) whose target resolved to the core's;
+  `--target` contradicting the session. `--target core` from a worker's session switches the core on
+  purpose.
+
+A worker's switch runs the same preflight, send, acceptance and confirm steps, with its own lock,
+and records `<workspace>/state/workers/<worker id>/model-switch.json` (the core's fields plus
+`worker`; `previous` and `settings_read` are the worker's own `settings.json`). It then keeps the
+worker's launch pick in step (`skills/worker-pool/scripts/worker_model.py set`; `default` drops the
+pick), so the next start does not undo the switch. It never writes `<workspace>/state/model-switch.json`,
+the model card's state or the core's `settings.json`. `--offline` is the core's (a worker: exit 2),
+and a down worker is never started from here. A picker a worker's switch leaves on screen is not
+dismissed by the core supervisor, which watches the core's pane only.
+
+`--dry-run` prints the session kind (`core`, `worker (<id>)` or `unidentified`), the record path and
+whether the switch would be refused (with the exit code), and exits 0 without sending.
 
 ## A Codex core
 
