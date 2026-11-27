@@ -178,6 +178,12 @@ install_claude_personal_hook
 resolve_claude_cwd_args
 resolve_claude_config_dir_and_seed
 apply_skill_session_config
+# The owner's model pick for this worker rides the launch; `/model` would save it for the core too.
+if [ -n "$WORKER_PY" ] && [ -n "${SUTANDO_WORKSPACE_DIR:-}" ]; then
+  _own_model="$("$WORKER_PY" "$REPO/skills/worker-pool/scripts/worker_model.py" get \
+      "$SUTANDO_WORKSPACE_DIR" "${SUTANDO_WORKER_ID:-$SUTANDO_INSTANCE_ID}" 2>/dev/null)" || _own_model=""
+  [ -n "$_own_model" ] && SESSION_ARGS+=(--model "$_own_model")
+fi
 # A worker given a Claude folder of its own starts in it, so its account and model are its own.
 # None made (the default), or the helper failing: the core's folder, as before.
 if [ -n "$WORKER_PY" ] && [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
