@@ -915,8 +915,6 @@ class Watch(Remote):
         self.assertIn("not recovered (RuntimeError: broken)", logged[1])
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 LINK = "https://claude.ai/oauth/authorize?code=true&client_id=x&state=s"
@@ -1003,3 +1001,6 @@ class PhoneSignIn(Remote):
                          {"code": CODE})
         for bad in ({"9x": "v"}, {"code": 7}, {"code": "x" * 3000}, {}, "code", {str(i): "v" for i in range(9)}):
             self.assertNotIn("input", agent_card.card_click({"card_click": json.dumps(dict(click, input=bad))}), bad)
+
+if __name__ == "__main__":
+    unittest.main()
