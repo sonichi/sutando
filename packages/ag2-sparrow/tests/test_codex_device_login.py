@@ -627,6 +627,7 @@ class RemoteCardTest(Home, CardWorld, unittest.TestCase):
         self.assertIn("open the sign-in page at auth.openai.com", shown["text"])
         self.assertEqual(metrics(self.work)[-1]["card"], "account-device-started")
         self.assertEqual(opened, [], "no browser on this computer")
+        self.assertNotIn("on the computer", shown["text"], "never sent to the computer")
         self.assertTrue(self.dir.exists(), "the device sign-in is running")
 
     def test_switch_account_on_this_computer_ends_a_device_sign_in(self):

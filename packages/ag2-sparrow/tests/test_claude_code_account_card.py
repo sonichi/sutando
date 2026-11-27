@@ -127,22 +127,22 @@ class Account(Base):
         rc, out = self.claim(self.task("task-g", "create an account on GitHub for the demo and tell me which one"))
         self.assertEqual((rc, len(self.queued())), (0, 1), "a longer message about some other account is the session's")
 
-    def test_switch_account_points_to_the_app_and_starts_nothing(self):
+    def test_switch_account_never_sends_the_owner_to_the_computer_and_starts_nothing(self):
+        # Owner 11-27, on her phone: "Switch account" must never answer "open this on the computer".
         self.account_menu()
         said = "Switch account"
         rc, out = self.claim(self.task("task-s", said, reply_to="$acct",
                                        click={"card_id": account_card.account_switch.CARD, "action": said}))
         self.assertEqual(rc, 1)
-        self.assertIn("(account-where)", out["refused"])
+        self.assertIn("(account-none-here)", out["refused"])
         queued, = self.queued()
-        note = queued["card"]
+        card = queued["card"]
         self.assertEqual(queued.get("edit"), "$acct", "shown in place of the card tapped, not as a second card")
-        self.assertEqual(note["text"], "Open this on the computer that runs Claude Code to switch account. The sign-in "
-                                       "code goes into the card there, never into this chat.")
-        # Opened there, the same card draws the controls; it is not the menu, so it retires no account card.
-        self.assertEqual((note["account_controls"], note["id"]), ({"runtime": "claude"}, account_card.account_switch.NOTE))
-        self.assertNotIn("buttons", note)
-        self.assertEqual(self.runs, [], "no sign-in, no status call")
+        self.assertNotIn(account_card.account_switch.elsewhere(account_card.NAME), card["text"])
+        self.assertNotIn("Open this on the computer", card["text"])
+        self.assertIn(account_card.NONE_HERE, card["text"])
+        self.assertEqual([b["label"] for b in card["buttons"]], ["Switch account"])
+        self.assertFalse(any("login" in " ".join(argv) for argv, _ in self.runs), "no sign-in is started")
 
     def test_a_tap_by_a_collaborator_is_refused_and_their_account_ask_goes_to_the_session(self):
         self.account_menu()

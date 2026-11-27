@@ -118,6 +118,7 @@ class Offer(Remote):
         self.assertEqual([b["label"] for b in card["buttons"]], ["Use " + A, "Use " + B, "Switch account"])
         self.assertIn(ac.PICK, card["text"])
         self.assertNotIn("Open this on the computer", card["text"])
+        self.assertNotIn(ac.account_switch.elsewhere(ac.NAME), card["text"])
         self.assertFalse(self.request().exists(), "nothing is switched until an account is tapped")
 
     def test_the_card_offers_each_other_saved_account_by_address_sorted_and_not_the_one_in_use(self):

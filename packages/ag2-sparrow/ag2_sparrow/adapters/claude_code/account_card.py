@@ -37,7 +37,9 @@ NAME = "Claude Code"
 RUNTIME = "claude"
 STATUS_WAIT_S = 10.0     # asked inside the claim: an answer the card cannot wait for reads as unknown
 ASKS = ("/account", "/login")
-WHERE = account_switch.elsewhere(NAME) + " The sign-in code goes into the card there, never into this chat."
+# A "Switch account" tap with none to offer: no other account is saved for this agent yet.
+NONE_HERE = ("No other account is saved for this agent on this computer yet. An account another agent has "
+             "needs one sign-in for this agent on the computer that runs %s." % NAME)
 # A "Switch account" tap with saved accounts to offer: they are the card's "Use" buttons.
 PICK = ("Tap an account below to switch to it. Another account needs one sign-in on the computer that runs %s."
         % NAME)
@@ -247,17 +249,15 @@ class AccountCard(account_switch.AccountSwitch):
         controls, so opened on the agent's computer it is the account card again. Nothing is started here.
         A saved account's key: ask the app to switch to it (`use`)."""
         if verb == "switch":
-            # From the phone (owner 11-27): the accounts this agent can switch to here are offered in place, a
-            # tap away; only with none is the owner sent to the computer, where a sign-in takes its code.
-            if self.offers():
-                text, refused = self.status()
-                self.say(sent.get("channel_id"), self.card("pending", "%s %s" % (text, PICK), ask=True,
-                                                           signed_out=refused),
-                         result_file, card_desk.tapped_event(sent))
-                return "account-picks"
-            self.say(sent.get("channel_id"), account_switch.with_controls(self.card("info", WHERE), RUNTIME),
+            # From the phone (owner 11-27): never "open this on the computer". The accounts this agent can
+            # switch to here are offered in place, a tap away; only an account another agent keeps needs a
+            # sign-in here, said as such.
+            text, refused = self.status()
+            picks = bool(self.offers())
+            self.say(sent.get("channel_id"), self.card("pending", "%s %s" % (text, PICK if picks else NONE_HERE),
+                                                       ask=True, signed_out=refused),
                      result_file, card_desk.tapped_event(sent))
-            return "account-where"
+            return "account-picks" if picks else "account-none-here"
         if KEY_RE.fullmatch(str(verb or "")):
             return self.use(verb, sent, result_file)
         self.publish(result_file, self.quoted(account_switch.EXPIRED_NO_CARD) + "\n")
