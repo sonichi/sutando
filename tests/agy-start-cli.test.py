@@ -380,6 +380,11 @@ esac
             "SUTANDO_AGY_TMUX_SESSION": "sutando-agy-test",
             "SUTANDO_AGY_ONBOARDING_PATH": str(self.onboarding_path),
             "HOME": str(self.root),
+            # The stub tmux never runs the notifier, so no sentinel can appear.
+            "SUTANDO_WATCHER_READY_TIMEOUT": "0",
+            # Slice-1 scope (the bare launcher); a missing script keeps
+            # ensure_task_notifier a no-op regardless of the host's real PATH.
+            "SUTANDO_AGY_NOTIFIER_SCRIPT": str(self.root / "no-such-notifier.sh"),
         })
         if extra:
             env.update(extra)
@@ -534,6 +539,9 @@ class StaleWatcherRetirementTests(unittest.TestCase):
             "SUTANDO_AGY_TMUX_SOCKET": self.sock,
             "SUTANDO_AGY_TMUX_SESSION": self.SESSION,
             "SUTANDO_AGY_ONBOARDING_PATH": str(self.root / "onboarding.json"),
+            # Isolates retire_stale_watcher from ensure_task_notifier's own
+            # launch (covered separately): a missing notifier makes it a no-op.
+            "SUTANDO_AGY_NOTIFIER_SCRIPT": str(self.root / "no-such-notifier.sh"),
         })
 
     def _tmux(self, *args):
@@ -575,7 +583,8 @@ class StaleWatcherRetirementTests(unittest.TestCase):
             result = self._launch()
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertNotIn("Retired", result.stdout)
-            self.assertEqual(result.stderr, "")
+            # ensure_task_notifier's own (expected) warning, not retirement under test.
+            self.assertIn("agy task notifier not found/executable", result.stderr)
         self.assertTrue(self._alive(f"{self.SESSION}-watcher2"))
         self.assertTrue(self._alive(self.SESSION))
 
