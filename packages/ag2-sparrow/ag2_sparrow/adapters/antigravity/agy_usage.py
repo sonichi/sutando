@@ -44,6 +44,8 @@ from ... import bounded_file_read, quota_notice
 ASK_MAX = 80
 UNAVAILABLE = "Antigravity's usage isn't available right now, so I can't say how much is left."
 ON_API_KEY = "This agent uses its own Gemini API key, so its usage isn't shown here."
+# A room hears no usage numbers: they are the owner's account data, shown only in the owner's DM.
+ASK_IN_DM = "Ask me in our direct message to see my usage."
 
 # Not "limit" alone: "how do you limit" asks about something else.
 _TOPIC = ("usage", "quota", "quotas", "limits", "rate limits", "rate limit", "usage limit", "usage limits", "credits",

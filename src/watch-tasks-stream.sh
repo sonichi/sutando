@@ -1008,12 +1008,21 @@ dispatch_task() {
   # The owner's bare "switch account / model / core" gets its card in code, not from the core
   # (src/switch_card_intercept.py): the core missed it in words and cannot answer at its limit.
   # Anything it does not post, or any failure, falls through to the core unchanged.
-  if [ -z "${SUTANDO_INSTANCE_ID:-}" ] && [ ! -e "$CLAIMS_DIR/$filename" ] \
-     && [ "$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/switch_card_intercept.py" "$task_path" \
-          --workspace "$WORKSPACE_DIR" --results-dir "$RESULTS_DIR" --repo "$__REPO_ROOT")" = switch-card-answered ]; then
+  local card_verdict=""
+  if [ -z "${SUTANDO_INSTANCE_ID:-}" ] && [ ! -e "$CLAIMS_DIR/$filename" ]; then
+    card_verdict="$("$SUTANDO_PY_BIN" "$__REPO_ROOT/src/switch_card_intercept.py" "$task_path" \
+          --workspace "$WORKSPACE_DIR" --results-dir "$RESULTS_DIR" --repo "$__REPO_ROOT")" || true
+  fi
+  if [ "$card_verdict" = switch-card-answered ]; then
     DECISION_IDENTITY="$identity"
     dispatch_note "$filename" "the owner's switch request got its card in code; not announced"
     record_admission
+    return 0
+  fi
+  if [ "$card_verdict" = switch-card-held ]; then
+    # Recognised, its line not written: held, never announced or admitted; the held retry asks again.
+    hold_task "$filename"
+    dispatch_note "$filename" "a card line could not be written; held for the retry, not announced"
     return 0
   fi
   read_handler_config_now

@@ -348,9 +348,14 @@ class AccountCardTest(unittest.TestCase):
         said, _ = self.usage_ask("task-un", "what's your usage", reader=lambda a: {"rows": self.ROWS,
                                                                                    "account": "new@example.com"})
         self.assertIn("(this computer's Google sign-in, new@example.com):", said)
-        # In a room the owner gets the same answer, with no account named and nothing to switch with.
-        said, _ = self.usage_ask("task-ur", "what's your usage", kind="room")
-        self.assertTrue(said.startswith(gc.quoted("Antigravity's usage (this computer's Google sign-in):")), said)
+        # In a room the owner is only told to ask in the DM: no numbers, no account, and no read at all.
+        reads = []
+        said, prompted = self.usage_ask("task-ur", "what's your usage", kind="room",
+                                        reader=lambda a: reads.append(a) or {"rows": self.ROWS})
+        self.assertEqual((said, prompted, reads), (gc.quoted(agy_usage.ASK_IN_DM) + "\n", 0, []))
+        self.assertNotIn("%", said)
+        self.assertEqual(self.w.metrics()[-1]["card"], "usage-ask-in-dm")
+        self.assertEqual(self.posted("$ur"), [], "and no card")
 
     def test_a_usage_that_cannot_be_read_is_said_so_and_never_shown_as_zero(self):
         # The desktop app does not answer (not running here): said so, and the request is taken back.
@@ -370,7 +375,7 @@ class AccountCardTest(unittest.TestCase):
             self.assertEqual(said, gc.quoted(agy_usage.UNAVAILABLE) + "\n")
             self.assertNotIn("0%", said)
         said, _ = self.usage_ask("task-ur", "你还剩多少额度", kind="room")
-        self.assertEqual(said, gc.quoted(agy_usage.UNAVAILABLE) + "\n")
+        self.assertEqual(said, gc.quoted(agy_usage.ASK_IN_DM) + "\n", "a room is sent to the DM, readable or not")
         # On this agent's own API key the sign-in's usage is not its usage.
         self.keychain["saved"] = True
         said, _ = self.usage_ask("task-uk", "what's your usage", reader=lambda a: {"rows": self.ROWS})
@@ -480,15 +485,47 @@ class AccountCardTest(unittest.TestCase):
         self.assertIn("To switch account, message me in our direct message.", said)
         self.assertEqual(self.posted("$ur"), [])
 
-    def test_usage_in_other_senses_and_anyone_elses_ask_go_to_the_model(self):
+    def test_usage_in_other_senses_goes_to_the_model_and_anyone_elses_ask_gets_no_numbers(self):
         for n, said in enumerate(("show CLI usage", "usage of this function", "what's the usage of X",
                                   "what is usage", "show usage", "how do you limit the output")):
             _, prompted = self.usage_ask("task-n%d" % n, said,
                                          reader=lambda a: {"rows": self.ROWS})
             self.assertEqual(prompted, 1, said)
             self.assertNotEqual(self.w.metrics()[-1].get("card"), "usage", said)
-        _, prompted = self.usage_ask("task-c", "what's your usage", tier="team", collaborator=True, kind="room")
-        self.assertEqual(prompted, 1, "a collaborator's ask is theirs to the model, as before")
+        reads = []
+        said, prompted = self.usage_ask("task-c", "what's your usage", tier="team", collaborator=True, kind="room",
+                                        reader=lambda a: reads.append(a) or {"rows": self.ROWS})
+        self.assertEqual((prompted, reads), (0, []), "a collaborator's ask is never read, nor sent to the model")
+        self.assertNotIn("%", said)
+        self.assertEqual(self.w.metrics()[-1]["card"], "card-not-owner")
+
+    def test_after_a_restart_at_the_limit_the_first_ask_gets_only_the_limits_card_and_a_switch_ends_it(self):
+        # RC6 acceptance (Dots): the first "account", "model" or "/model" after the agent restarted, at the limit.
+        self.dm("task-q1", "STUB:QUOTA hi")
+        self.serve()
+        (limit,) = self.posted("$q1")
+        for n, ask in enumerate(("account", "model", "/model")):
+            self.connector = None            # a restart: a new connector, reading what the last one kept
+            self.dm("task-r%d" % n, ask)
+            self.serve()
+            (shown,) = self.posted("$r%d" % n)
+            self.assertEqual((shown["text"], shown["account_controls"]), (limit["text"], limit["account_controls"]), ask)
+        # The owner switched to this agent's own API key: the limit was the Google sign-in's, not this one's.
+        self.keychain["saved"] = True
+        self.connector = None
+        self.dm("task-m", "/model")
+        self.serve()
+        self.assertNotIn("quota-card-asked", json.dumps(self.w.metrics()[-1]))
+        self.assertEqual([c for c in self.posted("$m") if "usage limit" in c["text"]], [], "no limit card for it")
+        self.dm("task-a", "account")
+        self.serve()
+        (card,) = self.posted("$a")
+        self.assertNotIn("usage limit", card["text"])
+        self.assertEqual(card["account_controls"], {"runtime": "antigravity", "agent": AGENT})
+        self.dm("task-t", "STUB:TEXT hi")
+        self.serve()
+        self.assertNotEqual(self.w.result("task-t"), gc.LIMITED_NO_SEND)
+        self.assertEqual(self.posted("$t"), [], "a turn, and no card")
 
     def test_a_collaborator_who_asks_while_agy_is_at_its_limit_is_told_why_there_is_no_answer(self):
         # Review of #6713: once the owner's card was queued, anyone else who asked got no reply at all.

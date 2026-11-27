@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import re
 
+from . import card_words
+
 ASK_MAX = 80
 ACCOUNT, MODEL = "account", "model"
 
@@ -63,12 +65,27 @@ _SPACE = re.compile(r"[\s,，、:：;；.。!！?？~～]+")
 
 def asked(text) -> frozenset:
     """Which cards a whole short message asks for: {"account"}, {"model"}, both, or none."""
+    return _read(text)[0]
+
+
+def switches(text) -> bool:
+    """Whether a message `asked` reads as a card ask asks to switch ("switch account", "换模型"), not which
+    one is in use ("which model are you on"). False for a message that asks for no card."""
+    kinds, switch = _read(text)
+    return bool(kinds) and switch
+
+
+names_a_pick = card_words.names_a_pick     # a pick named in words, the one policy with the core
+
+
+def _read(text) -> tuple:
+    """(the cards asked for, whether as a switch)."""
     said = (text or "").replace("’", "'").strip().lower()
     if not said or len(text) > ASK_MAX:
-        return frozenset()
+        return frozenset(), False
     if said.startswith("/"):
         # A slash command is the desk's exact match ("/model"), never these words ("/models please").
-        return frozenset((ACCOUNT,)) if said == "/account" else frozenset()
+        return (frozenset((ACCOUNT,)), True) if said == "/account" else (frozenset(), False)
     words, at, cut = [], 0, False      # (word, its kind, whether punctuation stands before it)
     while at < len(said):
         gap = _SPACE.match(said, at)
@@ -77,22 +94,22 @@ def asked(text) -> frozenset:
             continue
         word = _WORD.match(said, at)
         if not word:
-            return frozenset()
+            return frozenset(), False
         w = re.sub(r"\s+", " ", word.group())
         words.append((w, _KIND_OF[w], cut))
         cut, at = False, word.end()
     kinds = {k for _, k, _ in words}
     if "defines" in kinds or ("mine" in kinds and "switch" not in kinds):
-        return frozenset()
+        return frozenset(), False
     # Asked with a question or a switch; else only a bare name for it ("我说 agy account", "account?").
     if not kinds & {"ask", "switch"} and any(k == "glue" and w not in _BARE for w, k, _ in words):
-        return frozenset()
+        return frozenset(), False
     for n, (_, kind, cut) in enumerate(words):
         before = words[n - 1][0] if n and not cut else ""
         after = words[n + 1][0] if n + 1 < len(words) and not words[n + 1][2] else ""
         if kind == "topic:" + MODEL and (before in _DOER or after in _OBJECT):
-            return frozenset()      # "can you model this", "what can you model": a verb, not the card
-    return frozenset(k[len("topic:"):] for k in kinds if k.startswith("topic:"))
+            return frozenset(), False      # "can you model this", "what can you model": a verb, not the card
+    return frozenset(k[len("topic:"):] for k in kinds if k.startswith("topic:")), "switch" in kinds
 
 def asks_for_account(text) -> bool:
     return ACCOUNT in asked(text)
