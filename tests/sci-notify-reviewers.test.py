@@ -53,6 +53,14 @@ class NotifyReviewers(unittest.TestCase):
         self.assertIn("!triage:x", p.stdout)
         self.assertIn("cc @rui:x", p.stdout)
 
+    def test_exclusive_discord_requires_documented_provider_path(self):
+        p = run({"kim": {"stand": "123456789", "channel_id": "987654321",
+                          "provider": "discord", "exclusive": True}},
+                "--reviewers", "kim", "--message", "m")
+        self.assertEqual(p.returncode, 3, p.stderr)
+        self.assertNotIn("room_ops.py", p.stdout)
+        self.assertIn("UNUSABLE", p.stderr)
+
     def test_unknown_reviewer_refused_exit_2(self):
         p = run(GOOD, "--reviewers", "ghost", "--message", "m")
         self.assertEqual(p.returncode, 2)
