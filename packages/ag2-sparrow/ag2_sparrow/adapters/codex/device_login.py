@@ -257,6 +257,35 @@ def note_card(state_dir, room: str, edit: str) -> None:
             write_private(d / "meta.json", dict(meta, room=room, edit=edit, cards=cards))
 
 
+def owed(state_dir) -> list:
+    """The card edits still owed for `state_dir`'s sign-ins: [{room, event, kind}]."""
+    data = read_json(Path(state_dir).parent / WITHDRAW_FILE).get("owed")
+    return [o for o in data if isinstance(o, dict) and o.get("room") and o.get("event")] if isinstance(data, list) else []
+
+
+def keep_owed(state_dir, owe) -> None:
+    path = Path(state_dir).parent / WITHDRAW_FILE
+    if owe:
+        write_private(path, {"owed": owe})
+    elif path.exists():
+        path.unlink()
+
+
+def _journal(d: Path, room: str, cards) -> None:
+    """Owe a withdrawal for every card of this sign-in, saved before its state (which names them) goes; the
+    card that then gets the outcome is struck off once that is queued (`paid`)."""
+    known = {(o["room"], o["event"]) for o in owed(d)}
+    new = [{"room": room, "event": e, "kind": WITHDRAWN_CARD} for e in cards if room and e and (room, e) not in known]
+    if new:
+        keep_owed(d, owed(d) + new)
+
+
+def paid(state_dir, room: str, event: str) -> None:
+    """`event` shows something else now: its withdrawal is no longer owed."""
+    left = [o for o in owed(state_dir) if (o["room"], o["event"]) != (room, event)]
+    keep_owed(state_dir, left)
+
+
 def over(state_dir, codex: str, env: dict, run=subprocess.run, now=None, wait_s=None) -> dict:
     """What became of the sign-in since last asked, {} for nothing new: {phase: "confirm", email} once Codex
     signed the staging home in; {exit, why} when it failed, was ended for taking too long ("timeout") or its
@@ -273,6 +302,7 @@ def over(state_dir, codex: str, env: dict, run=subprocess.run, now=None, wait_s=
         if meta.get("phase") == CONFIRM_PHASE:
             if now - float(meta.get("asked_at") or 0) <= wait_s:
                 return {}
+            _journal(d, where["room"], where["cards"])
             _discard(d, codex, env, run)
             return dict(where, exit="unanswered")
         result = read_json(d / "result.json")
@@ -288,6 +318,7 @@ def over(state_dir, codex: str, env: dict, run=subprocess.run, now=None, wait_s=
             write_private(d / "meta.json", {"id": meta.get("id"), "phase": CONFIRM_PHASE, "email": email,
                                             "asked_at": now, **where})
             return dict(where, phase=CONFIRM_PHASE, email=email)
+        _journal(d, where["room"], where["cards"])
         _discard(d, codex, env, run)
     why = _why(said, meta.get("code") or "", meta.get("link") or "") if code != 0 else \
         "Codex finished, but I could not read which account it signed in"
@@ -315,6 +346,7 @@ def answer(state_dir, event: str, use: bool, codex: str, env: dict, run=subproce
         if meta.get("phase") != CONFIRM_PHASE or not event or event != meta.get("edit"):
             return "stale", "", []
         write_private(d / "meta.json", dict(meta, phase=SETTLING))      # first answer only, before anything is done
+        _journal(d, meta.get("room") or "", cards)
         if now - float(meta.get("asked_at") or 0) > (LOGIN_WAIT_S if wait_s is None else wait_s):
             _discard(d, codex, env, run)
             return "expired", meta["email"], cards
@@ -346,7 +378,7 @@ def swap(staged: Path, live_home) -> None:
     except OSError as e:
         if e.errno != errno.EXDEV:
             raise
-        shutil.copyfile(str(staged), str(tmp))      # another file system: copied, then renamed into place
+        _copy_private(staged, tmp)      # another file system: copied, then renamed into place
     try:
         os.chmod(str(tmp), 0o600)
         if live.exists():
@@ -363,11 +395,21 @@ def swap(staged: Path, live_home) -> None:
             previous.unlink()
 
 
+def _copy_private(src: Path, dst: Path) -> None:
+    """`src`'s bytes into a new `dst` that is owner-only from its creation (never read as a login here)."""
+    fd = os.open(str(dst), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(fd, "wb") as out, open(str(src), "rb") as inp:
+        if hasattr(os, "fchmod"):
+            os.fchmod(out.fileno(), 0o600)
+        shutil.copyfileobj(inp, out)
+
+
 def cancel(state_dir, codex: str = "codex", env=None, run=subprocess.run) -> dict:
     """End and forget the sign-in: {room, cards} of the one there was ({} for none), its cards to withdraw."""
     d = Path(state_dir)
     with locked(d):
         meta = read_json(d / "meta.json")
+        _journal(d, meta.get("room") or "", meta.get("cards") or [])
         if not _discard(d, codex, dict(env or {}), run):
             return {}
         return {"room": meta.get("room") or "", "cards": meta.get("cards") or []}
@@ -419,28 +461,21 @@ class Remote:
         return bool(current(self.dir))
 
     def stop(self) -> None:
-        was = cancel(self.dir, self.codex, self.env, self.run)
-        if was:
-            self.withdraw(was["room"], was["cards"])
+        if cancel(self.dir, self.codex, self.env, self.run):
+            self.retry()
             self.log("device sign-in ended: another sign-in was started")
 
     def withdraw(self, room, cards, keep="") -> None:
         """Show every card of this sign-in but `keep` (which gets its outcome) without the link or code. An
         edit that cannot be queued now is kept owed and tried again on each upkeep (`retry`)."""
-        owed = self.owed() + [{"room": room, "event": e, "kind": WITHDRAWN_CARD} for e in cards if e != keep and room]
-        self._keep_owed(owed)
+        _journal(self.dir, room, [e for e in cards if e != keep])
         self.retry()
 
     def owed(self) -> list:
-        data = read_json(self.dir.parent / WITHDRAW_FILE).get("owed")
-        return [o for o in data if isinstance(o, dict) and o.get("room") and o.get("event")] if isinstance(data, list) else []
+        return owed(self.dir)
 
-    def _keep_owed(self, owed) -> None:
-        path = self.dir.parent / WITHDRAW_FILE
-        if owed:
-            write_private(path, {"owed": owed})
-        elif path.exists():
-            path.unlink()
+    def _keep_owed(self, owe) -> None:
+        keep_owed(self.dir, owe)
 
     def retry(self) -> int:
         """Queue each owed withdrawal; those that still cannot be are kept. How many are left."""
@@ -518,8 +553,8 @@ class Remote:
             return "account-not-started"
         built = self.confirm_card(meta["email"]) if meta["phase"] == CONFIRM_PHASE else self.code_card(meta)
         if not self.accounts.post(room, built, edit=tapped):
-            was = cancel(self.dir, self.codex, self.env, self.run)
-            self.withdraw(was.get("room"), was.get("cards") or [])
+            if cancel(self.dir, self.codex, self.env, self.run):
+                self.retry()
             self.accounts.publish(result_file, self.accounts.quoted(NO_CARD) + "\n")
             return "account-not-started"
         note_card(self.dir, room, tapped)
@@ -544,8 +579,11 @@ class Remote:
             self.log("staged account not used:", said[:200])
             built = self.accounts.card("error", "I could not use that account: %s. %s" % (said, self.accounts.using()),
                                        ask=True)
-        self.accounts.say(room, built, result_file, tapped)
-        self.withdraw(room, cards, keep=tapped)
+        shown = self.accounts.post(room, built, edit=tapped)
+        self.accounts.publish(result_file, account_switch.ANSWERED if shown else self.accounts.quoted(built[1]["text"]) + "\n")
+        if shown:
+            paid(self.dir, room, tapped)
+        self.retry()
         self.log("device sign-in ->", outcome)
         return "account-device-" + outcome
 
@@ -587,7 +625,12 @@ class Remote:
         shown = bool(done["room"]) and self.accounts.post(done["room"], built, edit=done["edit"])
         if not shown:
             self.log("device sign-in outcome not shown:", outcome)      # its card is withdrawn instead
-        self.withdraw(done["room"], done["cards"], keep=done["edit"] if shown else "")
+        if done.get("phase") == CONFIRM_PHASE:
+            self.withdraw(done["room"], done["cards"], keep=done["edit"] if shown else "")
+        else:
+            if shown:
+                paid(self.dir, done["room"], done["edit"])
+            self.retry()
         self.log("device sign-in ->", outcome)
         return outcome
 

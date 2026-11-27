@@ -20,7 +20,7 @@ from unittest import mock
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE))
-from ag2_sparrow import account_switch, detached_login, signin_watch  # noqa: E402
+from ag2_sparrow import account_switch, connector_cards, detached_login, signin_watch  # noqa: E402
 from ag2_sparrow.adapters.codex import codex_connector as cc, device_login as dl  # noqa: E402
 
 from test_codex_connector import CardWorld, metrics, result, run_connector  # noqa: E402
@@ -328,11 +328,22 @@ class SignInTest(Home, unittest.TestCase):
     def test_a_staged_login_on_another_file_system_is_copied_then_renamed_into_place(self):
         staged = self.state / "auth.json"
         staged.write_text("new")
-        real = os.replace
-        with mock.patch.object(dl.os, "replace", side_effect=lambda a, b: (_ for _ in ()).throw(
-                OSError(errno.EXDEV, "cross")) if a == str(staged) else real(a, b)):
-            dl.swap(staged, self.home)
+        real, real_copy, modes = os.replace, dl.shutil.copyfileobj, []
+
+        def copy(src, dst):     # the copy's mode while its bytes go in: private from the start
+            modes.append(oct(os.fstat(dst.fileno()).st_mode & 0o777))
+            real_copy(src, dst)
+        old = os.umask(0o022)
+        try:
+            with mock.patch.object(dl.os, "replace", side_effect=lambda a, b: (_ for _ in ()).throw(
+                    OSError(errno.EXDEV, "cross")) if a == str(staged) else real(a, b)), \
+                    mock.patch.object(dl.shutil, "copyfileobj", side_effect=copy):
+                dl.swap(staged, self.home)
+        finally:
+            os.umask(old)
+        self.assertEqual(modes, ["0o600"])
         self.assertEqual((self.home / "auth.json").read_text(), "new")
+        self.assertEqual(oct((self.home / "auth.json").stat().st_mode & 0o777), "0o600")
         with self.assertRaises(OSError):
             dl.swap(self.state / "missing.json", self.home)
         with mock.patch.object(dl.os, "replace", side_effect=OSError(errno.EIO, "io")):
@@ -459,7 +470,12 @@ class RemoteCardTest(Home, CardWorld, unittest.TestCase):
         self.assertEqual([(b["label"], b.get("command")) for b in card["buttons"]],
                          [("Switch account", "card:account:agent:switch"), ("Add account", "card:account:agent:add")])
         self.assertEqual(self.tap("task-add", card, "Add account", "$card1"), account_switch.ANSWERED)
+        outbox = self.bridge.joinpath(*connector_cards.OUTBOX)
+        self.assertEqual({oct(p.stat().st_mode & 0o777) for p in outbox.iterdir()} | {oct(outbox.stat().st_mode & 0o777)},
+                         {"0o600", "0o700"}, "the card carrying the code is readable by its owner only")
         ((room, shown),) = self.posted("$card1")
+        posted = self.bridge.joinpath(*connector_cards.POSTED)
+        self.assertEqual({oct(p.stat().st_mode & 0o777) for p in posted.iterdir()}, {"0o600"})
         self.assertEqual(self.ops(), [("edit", "$card1")], "shown in place of the card tapped")
         self.assertEqual((room, shown["id"], shown["state"]), (self.DM, dl.DEVICE_CARD, "pending"))
         self.assertIn("open the sign-in page at auth.openai.com", shown["text"])
@@ -650,7 +666,7 @@ class RemoteUnitTest(Home, unittest.TestCase):
         with mock.patch.object(dl, "answer", return_value=("expired", "b@x.org", ["$old", "$e"])):
             self.assertEqual(r.tapped(dl.USE, self.OWNER, "out"), "account-device-expired")
         r.accounts.card.assert_called_with("error", dl.UNANSWERED % (5, "I'm using a."), ask=True)
-        self.assertEqual([c.kwargs["edit"] for c in r.accounts.post.call_args_list], ["$old"], "the other copy withdrawn")
+        self.assertEqual([c.kwargs["edit"] for c in r.accounts.post.call_args_list], ["$e", "$e"], "the outcome, on the card answered")
         self.mode("logout-fail")
         self.assertEqual(r.tapped(dl.SIGN_OUT, self.OWNER, "out"), "account-not-signed-out")
         r.accounts.card.assert_called_with("error", "I could not sign out: codex logout ended with exit code 1.", ask=True)
@@ -686,6 +702,29 @@ class RemoteUnitTest(Home, unittest.TestCase):
         self.assertFalse(any(CODE in json.dumps(card) or "auth.openai.com" in json.dumps(card) for *_, card in queued))
         self.assertEqual(r.tick(), "")
         self.assertEqual(len(r.accounts.post.call_args_list), 2, "each withdrawal queued once")
+
+    def test_a_stop_after_the_sign_in_state_went_still_withdraws_its_cards(self):
+        self.mode("fail")
+        r = self.remote()
+        dl.start(str(self.codex), self.env, r.dir)
+        dl.note_card(r.dir, "!dm:s", "$e1")
+        dl.note_card(r.dir, "!dm:s", "$e2")
+        end = time.time() + 15
+        while not (r.dir / "result.json").exists() and time.time() < end:
+            time.sleep(0.05)
+        r.accounts.post.side_effect = RuntimeError("the process stops here")
+        with self.assertRaises(RuntimeError):
+            r.tick()
+        self.assertFalse(r.dir.exists(), "the sign-in state, which named the cards, is gone")
+        record = json.loads((self.state / dl.WITHDRAW_FILE).read_text())
+        self.assertEqual([o["event"] for o in record["owed"]], ["$e1", "$e2"], "saved before it went")
+        self.assertNotIn(CODE, json.dumps(record))
+        restarted = self.remote()
+        self.assertEqual(restarted.tick(), "")
+        queued = [(c.kwargs["edit"], c.args[1][1]) for c in restarted.accounts.post.call_args_list]
+        self.assertEqual([(e, card["id"]) for e, card in queued], [("$e1", dl.WITHDRAWN_CARD), ("$e2", dl.WITHDRAWN_CARD)])
+        self.assertFalse(any(CODE in json.dumps(card) for _, card in queued))
+        self.assertFalse((self.state / dl.WITHDRAW_FILE).exists())
 
     def test_an_outcome_whose_card_cannot_be_shown_is_logged(self):
         self.mode("fail")
