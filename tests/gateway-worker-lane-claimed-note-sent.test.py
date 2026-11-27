@@ -118,6 +118,27 @@ def main() -> int:
         ws = workspace()
         posts = drain(ws, lambda path: True)
         check([p.get("room_id") for p in posts] == [OWNER_DM], "c) a path-only host check still delivers the note")
+
+        # d) A TypeError raised inside a check that takes the body is a failed check, not an old-style
+        # hook: it is never called again with the path alone, and the note waits.
+        ws = workspace()
+        calls: list = []
+
+        def breaks(path, text=None):
+            calls.append(text is None)
+            if text is not None:
+                raise TypeError("the check itself failed")
+            return True
+        posts = drain(ws, breaks)
+        check(posts == [], f"d) nothing is posted on a check that failed, got {[p.get('room_id') for p in posts]}")
+        check(calls.count(False) >= 1 and calls[-1] is False,
+              f"d) the failing check is not retried with the path alone, got {calls}")
+        kept = sorted(p.name for p in (ws / "results").glob("proactive-*"))
+        check(kept == [NOTE], f"d) the note is back under its own name for a later pass, got {kept}")
+        # The shape is read from the signature: *args and unreadable ones take the body.
+        check(gb._takes_body(lambda path, text: True) and gb._takes_body(lambda *a: True)
+              and not gb._takes_body(lambda path: True) and gb._takes_body(print),
+              "d) path-only, two-argument, *args and unreadable signatures are told apart")
     finally:
         L.is_worker_note_lane = saved_lane
     print("\n%d failure(s)" % len(FAILS) if FAILS else "\nall passed")

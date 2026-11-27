@@ -71,6 +71,7 @@ import hashlib
 import hmac
 import io
 import http.client
+import inspect
 import json
 import math
 import os
@@ -2505,6 +2506,18 @@ def owns_unaddressed() -> bool:
         return not GATEWAY_INSTANCE
 
 
+def _takes_body(hook) -> bool:
+    """Whether the host's own-file hook takes the claimed body beside the path. Read from its signature,
+    never from a TypeError: one raised inside the check is a failed check, and the note waits."""
+    try:
+        params = list(inspect.signature(hook).parameters.values())
+    except (TypeError, ValueError):
+        return True     # no signature to read: the current two-argument call
+    if any(p.kind is p.VAR_POSITIONAL for p in params):
+        return True
+    return len([p for p in params if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]) >= 2
+
+
 def owner_directed_is_mine(path: Path, text: "str | None" = None) -> bool:
     """Whether this lane delivers the owner-directed file `path`: the primary delivers every one
     (`owns_unaddressed`); any other lane only one the host names as its own (PROACTIVE_OWN_FILE).
@@ -2515,12 +2528,9 @@ def owner_directed_is_mine(path: Path, text: "str | None" = None) -> bool:
     if PROACTIVE_OWN_FILE is None:
         return False
     try:
-        if text is None:
+        if text is None or not _takes_body(PROACTIVE_OWN_FILE):
             return bool(PROACTIVE_OWN_FILE(path))
-        try:
-            return bool(PROACTIVE_OWN_FILE(path, text))
-        except TypeError:   # a host hook that takes the path alone
-            return bool(PROACTIVE_OWN_FILE(path))
+        return bool(PROACTIVE_OWN_FILE(path, text))
     except Exception as e:  # noqa: BLE001 - an unanswerable host keeps the primary-only rule
         _log_backoff(("own-file", type(e).__name__), f"own-file check failed ({diagnostics.describe(e)})")
         return False
