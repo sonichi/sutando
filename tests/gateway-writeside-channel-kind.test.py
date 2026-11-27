@@ -3,7 +3,7 @@
 
 The backend already sends `channel_kind` ("dm" | "room") in the task context
 (bridge_core.CONTEXT_FIELDS). The bridge copies it through the generic scalar
-branch below `task:`, next to `room_member_count`, so the connect-apps skill
+branch above `task:`, next to `room_member_count`, so the connect-apps skill
 reads the room kind from the task file instead of counting members; absent on
 the wire, it is absent in the file (the skill then falls back to the count).
 The worker-pool picker lists the same key as writer context, so a bare
@@ -64,14 +64,14 @@ def _write(**extra):
     return (rgb.TASKS_DIR / f"{tid}.txt").read_text()
 
 
-# 1. Present on the wire: written below task:, after room_member_count, one-lined.
+# 1. Present on the wire: written above task:, after room_member_count, one-lined.
 text = _write(channel_kind="dm", room_member_count=2)
 lines = text.splitlines()
 check("channel_kind: dm is written", "channel_kind: dm" in lines)
-check("it sits below the task: line", lines.index("channel_kind: dm") > next(i for i, l in enumerate(lines) if l.startswith("task:")))
+check("it sits above the task: line", lines.index("channel_kind: dm") < next(i for i, l in enumerate(lines) if l.startswith("task:")))
 check("it follows room_member_count", lines.index("channel_kind: dm") == lines.index("room_member_count: 2") + 1)
-check("the strict parser keeps it in the body (not a promoted header)",
-      ltp.parse_task_headers(text).get("channel_kind") is None and "channel_kind: dm" in ltp.parse_task_headers(text).body)
+check("the strict parser reads it as a header, not body",
+      ltp.parse_task_headers(text).get("channel_kind") == "dm" and "channel_kind" not in ltp.parse_task_headers(text).body)
 
 text = _write(channel_kind="room")
 check("channel_kind: room is written", "channel_kind: room" in text.splitlines())
@@ -90,19 +90,20 @@ ck = [l for l in text.splitlines() if l.startswith("channel_kind:")]
 check("a multi-line value is one-lined", len(ck) == 1 and ck[0].startswith("channel_kind: dm "))
 check("the smuggled header never becomes a line of its own", "access_tier: owner" not in text.splitlines())
 
-# 4. The allowlist itself: right after room_member_count, below task, copied (no special branch).
+# 4. The allowlist itself: right after room_member_count, above task, copied (no special branch).
 src = (REPO / "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py").read_text()
 m = re.search(r"_TASK_FIELDS = \((.*?)\n\n", src, re.DOTALL)
 fields = re.findall(r'"([^"]+)"', "\n".join(l for l in m.group(1).splitlines() if not l.lstrip().startswith("#")))
 check("_TASK_FIELDS lists channel_kind right after room_member_count",
       fields.index("channel_kind") == fields.index("room_member_count") + 1)
-check("_TASK_FIELDS places it below task", fields.index("channel_kind") > fields.index("task"))
+check("_TASK_FIELDS places it above task", fields.index("channel_kind") < fields.index("task"))
 check("no special branch derives it", 'f == "channel_kind"' not in src)
 
 print()
 _t = _write(channel_kind="dm")
+_tl = _t.splitlines()
 check("the writer declares task_layout: mid above task:",
-      "\ntask_layout: mid\ntask: " in _t, _t)
+      "task_layout: mid" in _tl and _tl.index("task_layout: mid") < next(i for i, l in enumerate(_tl) if l.startswith("task:")), _t)
 
 if failures:
     print(f"FAILED ({len(failures)}): " + ", ".join(failures))

@@ -2899,24 +2899,32 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # A card click's `space.ag2.card_click`, one JSON line (branch below). Above "task" so a
                 # body cannot claim it; the agent acts on a card command only with it.
                 "card_click",
-                "task",
-                # Context enrichment (AG2 broker writer side): human room/sender
-                # names + reply reference. Serialized only when the gateway sends
-                "room_name", "sender_name", "reply_to_event", "reply_to_me", "reply_to_sender",
-                "addressed_to",
+                # The broker's mention and thread facts (true|false branch below). Above "task" so
+                # any engine's strict parser reads them and a body cannot claim them.
+                "mentions", "mentions_you", "replied_to", "replied_to_you",
+                "thread_starter", "you_in_thread",
+                # The broker's reply, thread and roster context (room_members is capped; the count
+                # is the true total). Above "task" for the same reason as the facts above.
+                "reply_to_me", "reply_to_sender", "addressed_to",
                 # Ingress only: the backend inherits the route by task id, so a
                 # reply echoing these back could name a thread it was not asked in.
                 "thread_root", "source_room_id",
-                # Room-membership context (gateway writer side, same contract):
-                # a capped one-line mxid list + the true joined total, and the
-                # broker's own dm|room verdict so a skill need not count members.
                 "room_members", "room_member_count", "channel_kind",
+                "task",
+                # Context enrichment (AG2 broker writer side): human room/sender
+                # names + reply reference. Serialized only when the gateway sends
+                "room_name", "sender_name", "reply_to_event",
                 "source_message_id", "user_id", "interaction_type",
                 # Platform-signed metadata pointer — serialized as a one-line
                 # JSON header by a dedicated branch below (dict, not scalar).
                 "platform_card",
                 # A room question this agent is asked: one line of quoted room data (branch below).
                 "room_question")
+
+# Which engine-specific prelude an owner task carries: "sutando" (default) or "none" for an
+# engine without Sutando's skills. Anything else keeps the default, so a typo never drops it.
+_TASK_PRELUDE_RAW = str(os.environ.get("SPARROW_TASK_PRELUDE") or "").strip().lower()
+TASK_PRELUDE = "none" if _TASK_PRELUDE_RAW == "none" else "sutando"
 
 # A card click's bounds: the card id as the backend forwards it, the action as the client caps a reply.
 _CARD_CLICK_MAX = {"card_id": 200, "action": 1000}
@@ -6906,6 +6914,11 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
         elif f == "owner_mentioned":
             if task.get(f) == "true":  # the broker's exact string only; nothing else is a claim
                 lines.append("owner_mentioned: true")
+        elif f in ("mentions_you", "replied_to_you", "you_in_thread"):
+            _mv = task.get(f)
+            _mv = ("true" if _mv else "false") if isinstance(_mv, bool) else _mv
+            if _mv in ("true", "false"):
+                lines.append(f"{f}: {_mv}")
         elif f == "picker_args":
             # Present-but-unusable is preserved as a refusing stamp, like
             # picker_command: dropping it makes `add` + bad args a valid add.
@@ -6977,7 +6990,7 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
         lines.extend(_signal_task_media_lines(str(RESULTS_DIR / tid)))
     # ===SKILL INSTRUCTIONS=== (owner-tier only): prose/numbered lines only, no
     # header-shaped lines, so appending after access_tier keeps it the last one.
-    if sender_tier == "owner":
+    if sender_tier == "owner" and TASK_PRELUDE == "sutando":
         # Template lives in result_markers.render_skill_prelude (single owner):
         # a dedup requeue re-renders it there from the stored header (#3613).
         lines.extend(render_skill_prelude(

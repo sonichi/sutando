@@ -891,6 +891,7 @@ task delivery — a channel failure never affects the task loop.
 | `SPARROW_HA_OWNER` | owner mxid; enables human-action decision routing — the owner's typed/reacted answers to pending question cards resolve them. HITL card clicks use it when set, else the owner the gateway registry (`/v1/agents`) names for this agent |
 | `SPARROW_HA_ROOM` | room id where question cards are posted (with `SPARROW_HA_OWNER`) |
 | `SPARROW_HA_A2UI` | `1` attaches interactive A2UI blocks to cards (default off; requires a client that renders them) |
+| `SPARROW_TASK_PRELUDE` | `sutando` (default) appends the Sutando `===SKILL INSTRUCTIONS===` block to owner tasks; `none` leaves it out, for an engine without Sutando's skills. Any other value keeps the default |
 
 ## Directories & single source
 
