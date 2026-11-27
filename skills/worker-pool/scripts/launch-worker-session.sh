@@ -178,6 +178,27 @@ install_claude_personal_hook
 resolve_claude_cwd_args
 resolve_claude_config_dir_and_seed
 apply_skill_session_config
+# The owner's model pick for this worker rides the launch; `/model` would save it for the core too.
+if [ -n "$WORKER_PY" ] && [ -n "${SUTANDO_WORKSPACE_DIR:-}" ]; then
+  _own_model="$("$WORKER_PY" "$REPO/skills/worker-pool/scripts/worker_model.py" get \
+      "$SUTANDO_WORKSPACE_DIR" "${SUTANDO_WORKER_ID:-$SUTANDO_INSTANCE_ID}" 2>/dev/null)" || _own_model=""
+  [ -n "$_own_model" ] && SESSION_ARGS+=(--model "$_own_model")
+fi
+# A worker given a Claude folder of its own starts in it, so its account and model are its own.
+# None made (the default): the core's folder, as before. One made that cannot be made ready: refuse,
+# never fall back to the core's folder and so the core's account.
+if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+  . "$REPO/skills/worker-pool/scripts/worker-claude-folder.sh"
+  if ! _own_ccd="$(worker_claude_folder "$REPO" "$WORKER_PY" "$CLAUDE_CONFIG_DIR" \
+      "${SUTANDO_WORKER_ID:-$SUTANDO_INSTANCE_ID}")"; then
+    echo "  ⚠ worker session $SESSION not started: its own Claude folder is not ready (see above)." >&2
+    exit 1
+  fi
+  if [ "${_own_ccd%/}" != "${CLAUDE_CONFIG_DIR%/}" ]; then
+    export CLAUDE_CONFIG_DIR="$_own_ccd"
+    echo "  ✓ CLAUDE_CONFIG_DIR=$_own_ccd (this worker's own)"
+  fi
+fi
 resolve_claude_settings_args
 apply_claude_obs_metering
 apply_claude_tmux_defaults
