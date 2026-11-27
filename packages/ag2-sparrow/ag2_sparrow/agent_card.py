@@ -509,13 +509,15 @@ def card_click(headers: Mapping[str, str]) -> Optional[dict]:
     if not isinstance(click, dict) or not _text(click.get("card_id"), "id") or not _text(click.get("action"), "reply"):
         return None
     out = {"card_id": click["card_id"], "action": click["action"]}
-    given = click_input(click.get("input"))
-    return dict(out, input=given) if given else out
+    ref = click.get("input_ref")
+    return dict(out, input_ref=ref) if isinstance(ref, str) and _INPUT_REF_RE.fullmatch(ref) else out
 
 
 # A tap's typed value travels in the click, never in the message's text (a sign-in code, say): at most
 # CLICK_INPUTS named values of CLICK_INPUT_MAX characters each.
 CLICK_INPUTS, CLICK_INPUT_MAX = 4, 2048
+# The bridge keeps a typed value out of the task file (card_input) and passes only this reference to it.
+_INPUT_REF_RE = re.compile(r"[0-9a-f]{32}")
 
 
 def click_input(given) -> dict:

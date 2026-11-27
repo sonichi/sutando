@@ -91,11 +91,14 @@ class WriterCarriesTheClick(_Base):
         self.assertLess(text.index("card_click:"), text.index("\ntask:"))
         self.assertEqual(json.loads(ltp.parse_task_headers_trusted(text).headers["card_click"]), CLICK)
 
-    def test_a_cards_typed_input_rides_in_the_click_and_a_bad_one_is_dropped(self):
-        # A sign-in code typed into a card (owner 11-27) reaches the agent in the click, never in the text.
+    def test_a_cards_typed_input_is_kept_one_time_and_only_its_reference_rides_in_the_task(self):
+        # A sign-in code typed into a card (owner 11-27) never goes in the durable task file (review of #6907).
+        from ag2_sparrow import card_input
         text = self.write("cc-in", card_click={**CLICK, "input": {"code": "abcd1234#state99"}})
-        line = next(ln for ln in text.split("\n") if ln.startswith("card_click: "))
-        self.assertEqual(json.loads(line[len("card_click: "):]), {**CLICK, "input": {"code": "abcd1234#state99"}})
+        self.assertNotIn("abcd1234#state99", text)
+        click = json.loads(ltp.parse_task_headers_trusted(text).headers["card_click"])
+        self.assertEqual({k: v for k, v in click.items() if k != "input_ref"}, CLICK)
+        self.assertEqual(card_input.take(rgb._STATE, click["input_ref"]), {"code": "abcd1234#state99"})
         for i, bad in enumerate(({"9x": "v"}, {"code": 7}, {"code": "x" * 3000}, "code")):
             text = self.write(f"cc-in{i}", card_click={**CLICK, "input": bad})
             self.assertEqual(json.loads(ltp.parse_task_headers_trusted(text).headers["card_click"]), CLICK, bad)

@@ -325,7 +325,7 @@ from ._dirs import task_dir as _task_dir, result_dir as _result_dir, state_dir a
 from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
 from .task_archive import find_task_file
 from .local_task_protocol import find_archived_task
-from . import (agent_card, agent_identity, agent_triggers, diagnostics, gateway_credential_io, gateway_credential_sources,
+from . import (agent_card, agent_identity, card_input, agent_triggers, diagnostics, gateway_credential_io, gateway_credential_sources,
                gateway_credentials, gateway_instance, local_task_protocol, routing_migrations,
                setup_fetch)
 from .bounded_file_read import read_fd_bytes, read_private, read_regular, read_regular_text
@@ -6901,7 +6901,11 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
                 passed = {"card_id": click["card_id"], "action": click["action"]}
                 typed = agent_card.click_input(click.get("input"))
                 if typed:
-                    passed["input"] = typed     # the card's typed value, which the message's text never carries
+                    # Typed into the card (a sign-in code): kept one-time beside the task, never in the task file.
+                    try:
+                        passed["input_ref"] = card_input.put(_STATE, typed)
+                    except OSError as e:
+                        _log(f"card input not kept ({type(e).__name__}); the tap goes on without it")
                 lines.append("card_click: " + json.dumps(passed, separators=(",", ":")))
             elif click not in (None, ""):
                 # A click that cannot be used stays a click: the agent refuses it, never reads it as chat.

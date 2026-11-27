@@ -959,48 +959,72 @@ class PhoneSignIn(Remote):
         card = self.started_card()
         self.assertEqual(self.started, [(str(self.config), str(Path(self.root) / "state" / "account-sign-in"))])
         self.assertEqual(card["input"]["name"], ac.CODE_INPUT)
+        self.assertNotIn("message", card["text"].replace("don't send it as a message", ""))
         self.assertEqual([(b["kind"], b["label"]) for b in card["buttons"]],
                          [("url", "Open sign-in page"), ("reply", "Submit code")])
         self.assertEqual(card["buttons"][0]["url"], LINK)
         self.assertTrue(card["buttons"][1]["uses_input"])
         self.assertNotIn("on the computer", card["text"])
 
-    def test_the_code_typed_into_the_card_signs_in_and_is_never_in_the_chat_text(self):
+    def tap_code(self, tid, code):
+        """The bridge's side of a Submit tap: the typed value kept one-time, only its reference in the task."""
+        from ag2_sparrow import card_input
+        ref = card_input.put(self.bridge, {"code": code})
+        return self.claim(self.task(tid, "Submit code", reply_to="$acct",
+                                    click={"card_id": ac.account_switch.NOTE, "action": "Submit code", "input_ref": ref}))
+
+    def test_the_code_typed_into_the_card_signs_in_and_is_never_in_the_task_or_the_card(self):
         self.started_card()
-        rc, out = self.claim(self.task("task-code", "Submit code", reply_to="$acct",
-                                       click={"card_id": ac.account_switch.NOTE, "action": "Submit code",
-                                              "input": {"code": CODE}}))
+        rc, out = self.tap_code("task-code", CODE)
         self.assertIn("(account-signed-in)", out["refused"])
         self.assertEqual(self.given, [CODE])
-        done = self.queued()[-1]["card"]
-        self.assertIn("Signed in.", done["text"])
+        self.assertIn("Signed in.", self.queued()[-1]["card"]["text"])
         self.assertNotIn(CODE, json.dumps(self.queued()))
+        archived = [p.read_text() for p in Path(self.root).rglob("task-code*.txt")]
+        self.assertTrue(archived and all(CODE not in t for t in archived), "the task file carries a reference only")
+        self.assertEqual(list((self.bridge / "card-input").glob("*.json")), [], "taken once, then gone")
 
-    def test_the_code_sent_as_a_dm_message_signs_in_and_says_the_message_can_be_deleted(self):
+    def test_a_code_sent_as_a_dm_message_is_never_taken(self):
+        # Review of #6907: no DM fallback; a waiting sign-in does not turn chat into a code.
         self.started_card()
-        rc, out = self.claim(self.task("task-typed", CODE))
-        self.assertIn("(account-signed-in)", out["refused"], "taken here, never the model's")
-        self.assertEqual(self.given, [CODE])
-        self.assertIn(ac.TYPED_NOTE, self.queued()[-1]["card"]["text"])
-
-    def test_no_code_is_taken_when_no_sign_in_waits_or_from_anyone_but_the_owner_in_her_dm(self):
-        rc, out = self.claim(self.task("task-n1", CODE))
-        self.assertNotIn("account-signed-in", json.dumps(out), "no sign-in is waiting: ordinary words")
-        self.started_card()
-        for tid, kw in (("task-n2", {"tier": "team", "sender": "@eve:s.space"}), ("task-n3", {"kind": "room"})):
-            rc, out = self.claim(self.task(tid, CODE, **kw))
-            self.assertNotIn("account-signed-in", json.dumps(out), kw)
-        rc, out = self.claim(self.task("task-n4", "thanks, signing in now"))
-        self.assertNotIn("account-signed-in", json.dumps(out), "words that are not a code")
+        for tid, said in (("task-m1", CODE), ("task-m2", "sonichi/sutando#6907 is ready")):
+            rc, out = self.claim(self.task(tid, said))
+            self.assertNotIn("account-signed-in", json.dumps(out), said)
         self.assertEqual(self.given, [])
+        self.assertTrue(self.waiting, "the sign-in still waits for the card")
 
-    def test_a_click_carries_its_input_only_when_it_is_one(self):
+    def test_a_typed_value_that_is_not_a_code_ends_the_sign_in(self):
+        self.started_card()
+        with mock.patch.object(accounts, "cancel", lambda d: self.cancelled.append(str(d)) or True):
+            self.cancelled = []
+            rc, out = self.tap_code("task-bad", "sonichi/sutando#6907")
+        self.assertIn("(account-signin-bad-code)", out["refused"])
+        self.assertEqual((self.given, len(self.cancelled)), ([], 1))
+
+    def test_the_box_takes_only_a_whole_code(self):
+        card = self.started_card()
+        self.assertTrue(card["input"]["pattern"].startswith("^(?:") and card["input"]["pattern"].endswith(")$"))
+
+    def test_a_click_carries_a_reference_never_the_value(self):
         from ag2_sparrow import agent_card
         click = {"card_id": "c", "action": "a"}
-        self.assertEqual(agent_card.card_click({"card_click": json.dumps(dict(click, input={"code": CODE}))})["input"],
-                         {"code": CODE})
-        for bad in ({"9x": "v"}, {"code": 7}, {"code": "x" * 3000}, {}, "code", {str(i): "v" for i in range(9)}):
-            self.assertNotIn("input", agent_card.card_click({"card_click": json.dumps(dict(click, input=bad))}), bad)
+        ref = "0123456789abcdef0123456789abcdef"
+        self.assertEqual(agent_card.card_click({"card_click": json.dumps(dict(click, input_ref=ref))})["input_ref"], ref)
+        for bad in ("../x", "ABC", 7, ref + "0"):
+            self.assertNotIn("input_ref", agent_card.card_click({"card_click": json.dumps(dict(click, input_ref=bad))}))
+        self.assertNotIn("input", agent_card.card_click({"card_click": json.dumps(dict(click, input={"code": CODE}))}))
+
+    def test_the_one_time_store_is_private_taken_once_and_swept(self):
+        from ag2_sparrow import card_input
+        ref = card_input.put(self.bridge, {"code": CODE}, now=1000.0)
+        f = self.bridge / "card-input" / (ref + ".json")
+        self.assertEqual((oct(f.stat().st_mode & 0o777), oct(f.parent.stat().st_mode & 0o777)), ("0o600", "0o700"))
+        self.assertEqual(card_input.take(self.bridge, ref, now=1001.0), {"code": CODE})
+        self.assertEqual(card_input.take(self.bridge, ref, now=1001.0), {}, "once")
+        late = card_input.put(self.bridge, {"code": CODE}, now=1000.0)
+        self.assertEqual(card_input.take(self.bridge, late, now=1000.0 + card_input.TTL_S + 1), {}, "expired")
+        self.assertFalse((self.bridge / "card-input" / (late + ".json")).exists())
+        self.assertEqual(card_input.take(self.bridge, "../../etc/passwd"), {})
 
 if __name__ == "__main__":
     unittest.main()
