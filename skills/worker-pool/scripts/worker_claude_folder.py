@@ -109,15 +109,26 @@ def settings(core_settings: dict, own_settings: dict) -> dict:
     return merged
 
 
+# The only .claude.json answers a worker takes from the core: first-run and folder-trust prompts, never
+# an account, key, or server config (an unknown key stays the core's).
+ONBOARDING = ("hasCompletedOnboarding", "lastOnboardingVersion", "theme", "bypassPermissionsModeAccepted",
+              "hasAcknowledgedCostThreshold", "shiftEnterKeyBindingInstalled")
+TRUST = ("hasTrustDialogAccepted", "hasCompletedProjectOnboarding", "projectOnboardingSeenCount")
+
+
 def account_file(core_file: dict, own_file: dict) -> dict:
     """The worker's .claude.json: its own, plus the core's answers to first-run and folder-trust
     questions it has not answered itself. The account is never taken from the core: whoever signs
     this folder in writes it."""
-    merged = {k: v for k, v in core_file.items() if k not in ("oauthAccount", "projects")}
+    merged = {k: core_file[k] for k in ONBOARDING if k in core_file}
+    core_projects = core_file.get("projects") if isinstance(core_file.get("projects"), dict) else {}
+    projects = {path: {k: v[k] for k in TRUST if k in v}
+                for path, v in core_projects.items() if isinstance(v, dict)}
+    projects = {path: v for path, v in projects.items() if v}
     merged.update(own_file)
-    projects = dict(core_file.get("projects") or {}) if isinstance(core_file.get("projects"), dict) else {}
     if isinstance(own_file.get("projects"), dict):
-        projects.update(own_file["projects"])
+        for path, v in own_file["projects"].items():
+            projects[path] = {**projects.get(path, {}), **v} if isinstance(v, dict) else v
     if projects:
         merged["projects"] = projects
     return merged

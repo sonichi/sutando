@@ -106,6 +106,7 @@ def main() -> int:
           and F.main(["x", "ensure", str(core / "absent"), WORKER]) == 1, "f) the command line answers 0, 2 and 1")
     file_auth_isolation()
     private_account_file()
+    account_file_takes_only_onboarding_and_trust()
     launcher_refuses_a_failed_folder()
     launcher_refuses_an_undeterminable_folder()
     print("\n%d failure(s)" % len(FAILS) if FAILS else "\nall passed")
@@ -169,6 +170,28 @@ def private_account_file() -> None:
     other.parent.mkdir(exist_ok=True)
     other.write_text("not a folder")
     check(F.main(["x", "launch", str(core), "w2"]) == 1, "h) a worker path that is not a folder is a failure, not 'none'")
+
+
+def account_file_takes_only_onboarding_and_trust() -> None:
+    """Qingyun's agent: .claude.json is copied by allowlist, so an unknown or account-bearing key never
+    reaches a worker."""
+    core = core_folder()
+    data = read(core / ".claude.json")
+    data.update({"primaryApiKey": "sk-ant-dummy", "customApiKeyResponses": {"approved": ["x"]},
+                 "userID": "core-user", "theme": "dark", "someFutureAccountKey": {"token": "t"}})
+    data["projects"]["/work"].update({"mcpServers": {"s": {"env": {"API_KEY": "k"}}}, "allowedTools": ["Bash"]})
+    (core / ".claude.json").write_text(json.dumps(data))
+    own = F.ensure(core, WORKER)
+    mine = read(own / ".claude.json")
+    for key in ("primaryApiKey", "customApiKeyResponses", "userID", "oauthAccount", "someFutureAccountKey"):
+        check(key not in mine, f"k) the core's {key} is not in the worker's .claude.json")
+    check(mine.get("hasCompletedOnboarding") is True and mine.get("theme") == "dark",
+          "k) first-run answers are taken from the core")
+    work = (mine.get("projects") or {}).get("/work", {})
+    check(work == {"hasTrustDialogAccepted": True}, f"k) a project brings only its trust answers, got {work}")
+    mine = F.account_file(data, {"primaryApiKey": "worker-own", "projects": {"/w2": {"x": 1}}})
+    check(mine.get("primaryApiKey") == "worker-own" and mine["projects"]["/w2"] == {"x": 1},
+          "k) the worker's own keys are kept as they are")
 
 
 def _resolve(core: Path, worker: str, py: str) -> "subprocess.CompletedProcess[str]":
