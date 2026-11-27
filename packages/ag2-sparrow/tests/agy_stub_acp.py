@@ -126,6 +126,9 @@ def media_turn(sid, text):
     chunk(sid, "saw %d attachment(s)" % len(paths))
 
 
+_silent = set()   # Sessions that stay silent when asked again (STUB:SILENT)
+
+
 def prompt(rid, params):
     sid = params["sessionId"]
     text = "".join(b.get("text", "") for b in params.get("prompt") or [])
@@ -148,7 +151,16 @@ def prompt(rid, params):
         return
     cwd = sessions().get(sid) or os.getcwd()
     told = re.search(r"write the result to (results/\S+?\.txt)", text)
-    if told:
+    silent = "STUB:SILENT" in text
+    if "was not granted" in text and "Answer the message now" in text:
+        # Asked again after a refusal: answers, as agy does when told what it may not do.
+        if sid not in _silent:
+            chunk(sid, "answered with what I had; I could not read the file outside my folder")
+    elif "STUB:READSTOP" in text:
+        # agy's measured shape: a read outside the folder is refused, and the turn ends with no text.
+        if ask(sid, {"title": "Read /etc/outside.txt", "kind": "read", "locations": [{"path": "/etc/outside.txt"}]}):
+            chunk(sid, "read it")
+    elif told:
         send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {
             "sessionUpdate": "tool_call", "toolCallId": "c-file", "title": "File " + told.group(1), "kind": "edit"}}})
         ask(sid, {"title": "File " + told.group(1), "kind": "edit", "rawInput": {"Content": "hello"}})
@@ -211,6 +223,8 @@ def prompt(rid, params):
         chunk(sid, "tried odd ones")
     else:
         chunk(sid, "hello from agy-stub")
+    if silent:
+        _silent.add(sid)
     send({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn"}})
 
 

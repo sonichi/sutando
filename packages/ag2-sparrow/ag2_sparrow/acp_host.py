@@ -699,7 +699,7 @@ def use_model(client, session_id, wanted, models, on_models, timeout, log):
 
 def run_prompt(client_factory, args, headers, task_id, prompt, decide, store, stderr_name, not_signed_in, log,
                isolated=None, model=None, on_models=None, media=None, mcp_servers=None, on_initialized=None,
-               view=None):
+               view=None, answer_after_refusal=None):
     """One task's turn: spawn `args.acp_argv`, `initialize`, resume the task's Session (else open one), send one
     `session/prompt` and wait for it to stop. `decide(params) -> (allowed, reason, result)` answers each
     permission request. (status, text, detail, turn): status is completed | cancelled | timeout | gone | failed
@@ -713,7 +713,8 @@ def run_prompt(client_factory, args, headers, task_id, prompt, decide, store, st
     how this process is authenticated, is saved with the Session, and a saved Session opened under another one
     (a missing `auth` counts as SIGNED_IN_AUTH) is not resumed: a new one is opened. With `view` (a
     `live_view.Writer`), the turn's words, tool calls and permission decisions are written to the agent's live
-    view as they happen; never the prompt."""
+    view as they happen; never the prompt. With `answer_after_refusal`, a turn that stopped with no text after a
+    refused request gets that text as one more prompt in the same Session, once."""
     turn = Turn()
     turn.view = view
     cwd = isolated.cwd if isolated else args.cwd
@@ -787,12 +788,20 @@ def run_prompt(client_factory, args, headers, task_id, prompt, decide, store, st
                   + ([{"type": "text", "text": note}] if note else [])}
         try:
             res = client.call("session/prompt", params, args.turn_timeout)
+            stop = res.get("stopReason") or ""
+            # An agent that stopped with no text once a request was refused (agy ends its turn there) is asked
+            # once more, in the same Session, to answer with what it has and say what it could not do.
+            if answer_after_refusal and stop in COMPLETED_STOPS and not turn.text.strip() \
+                    and any(not d.get("allowed") for d in turn.decisions):
+                log("no text after a refused request; asking once for an answer", session_id)
+                res = client.call("session/prompt", {"sessionId": session_id, "prompt": [
+                    {"type": "text", "text": answer_after_refusal}]}, args.turn_timeout)
+                stop = res.get("stopReason") or ""
         except AcpTimeout:
             log("turn timeout; session/cancel", session_id)
             with contextlib.suppress(AcpError):
                 client.notify("session/cancel", {"sessionId": session_id})
             return "timeout", turn.text, "not finished after %ss" % args.turn_timeout, turn
-        stop = res.get("stopReason") or ""
         return ("completed" if stop in COMPLETED_STOPS else
                 "cancelled" if stop == "cancelled" else "failed"), turn.text, stop or "no stopReason", turn
     except AcpGone as e:
@@ -805,6 +814,12 @@ def run_prompt(client_factory, args, headers, task_id, prompt, decide, store, st
         return "failed", turn.text, str(e), turn
     finally:
         client.close(args.interrupt_grace)
+
+
+# What an agent that stopped with no text after a refused request is asked next (`run_prompt`).
+ANSWER_AFTER_REFUSAL = ("Some of what you asked to do on this turn was not granted (for example reading a file outside "
+                        "your working directory), so it did not happen. Do not ask for it again. Answer the message "
+                        "now with what you have, and say in one line what you could not read or do.")
 
 
 def start_only(client_factory, args, stderr_name, log) -> bool:

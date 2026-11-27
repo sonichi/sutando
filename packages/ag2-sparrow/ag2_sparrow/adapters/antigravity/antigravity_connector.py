@@ -750,7 +750,8 @@ class Connector:
                                            model=self.models.wanted(),
                                            on_models=self.models_seen,
                                            mcp_servers=self.mcp_servers_for(headers, kind),
-                                           on_initialized=self.use_app_gemini_key)
+                                           on_initialized=self.use_app_gemini_key,
+                                           answer_after_refusal=acp_host.ANSWER_AFTER_REFUSAL)
         if isolated is None:
             with guest_turn(self.args, headers, message) as pair:
                 return self.run_turn(task_id, headers, prompt, False, pair, message=message)
@@ -766,7 +767,8 @@ class Connector:
         with acp_host.task_media(own_attachment_headers(headers, message), readable=False) as media:
             return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt, decide,
                                        self.store, STDERR_NAME, NOT_SIGNED_IN, log, isolated=turn, view=self.view,
-                                       media=acp_host.Media(images=media.images), model=self.models.wanted())
+                                       media=acp_host.Media(images=media.images), model=self.models.wanted(),
+                                       answer_after_refusal=acp_host.ANSWER_AFTER_REFUSAL)
 
     def renew_sign_in(self) -> bool:
         """Start agy and open a Session, with no prompt (acp_host.start_only): agy renews its Google sign-in as it
