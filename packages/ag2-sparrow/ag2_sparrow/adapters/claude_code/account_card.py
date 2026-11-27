@@ -38,6 +38,18 @@ RUNTIME = "claude"
 STATUS_WAIT_S = 10.0     # asked inside the claim: an answer the card cannot wait for reads as unknown
 ASKS = ("/account", "/login")
 WHERE = account_switch.elsewhere(NAME) + " The sign-in code goes into the card there, never into this chat."
+# Signing in to another account from the phone (owner 11-27): this connector starts Claude Code's two-step
+# sign-in for the agent's own config dir and shows its link; the code the page then shows comes back either
+# typed into the card (the tap carries it, never the chat's text) or as the owner's own message in her DM.
+# Only these, never the model: a sign-in is never started or finished on anything the session says.
+SIGN_IN, CODE = "signin", "code"
+SIGN_IN_LABEL = "Sign in to another account"
+CODE_INPUT = "code"
+# Claude Code's sign-in page shows "<code>#<state>": the "#" keeps a short word of the owner's from reading as one.
+CODE_WORDS = re.compile(r"[A-Za-z0-9_\-.~+/=]{4,1024}#[A-Za-z0-9_\-.~+/=]{4,1024}")
+SIGN_IN_TEXT = ("Open the sign-in page and sign in with the account you want. Then paste the code it shows into the "
+                "box below and tap Submit code, or send me the code here in our DM. The code works once.")
+TYPED_NOTE = "You can delete your message with the code: it has been used and cannot be used again."
 _run = subprocess.run       # Claude Code's own `auth status`, the one command this card runs
 
 # The desktop app's saved accounts for this agent, and the request/answer files it watches in the config dir.
@@ -235,9 +247,70 @@ class AccountCard(account_switch.AccountSwitch):
             words = ("Use " + email)[:agent_card.LIMITS["label"]]
             uses.append(agent_card.button(words, "reply", style="secondary", reply=words,
                                           command=agent_card.reply(self.KIND, "agent", key)))
-        if uses:
-            card = dict(card, buttons=uses + list(card.get("buttons") or []))
+        more = [agent_card.button(SIGN_IN_LABEL, "reply", style="secondary", reply=SIGN_IN_LABEL,
+                                  command=agent_card.reply(self.KIND, "agent", SIGN_IN))] if self.signs_in() else []
+        if uses or more:
+            # The card's own buttons and the sign-in first; as many "Use" buttons as fit beside them.
+            room = agent_card.LIMITS["buttons"] - len(card.get("buttons") or []) - len(more)
+            card = dict(card, buttons=uses[:max(room, 0)] + list(card.get("buttons") or []) + more)
         return body, card
+
+    def signs_in(self) -> bool:
+        """Whether a sign-in may be started here: the agent's config dir is its own (`config_dir_for_switch`)."""
+        try:
+            config_dir_for_switch(self.cfg)
+        except accounts.Refused:
+            return False
+        return not self.seen.get("proxy")
+
+    def sign_in_dir(self) -> Path:
+        return Path(records.state_dir(self.root)) / "account-sign-in"
+
+    def sign_in(self, sent, result_file) -> str:
+        """Start the sign-in and show its page and the code box in place of the card tapped."""
+        room, tapped = sent.get("channel_id"), card_desk.tapped_event(sent)
+        try:
+            config_dir_for_switch(self.cfg)
+            env = dict(os.environ, CLAUDE_CONFIG_DIR=str(self.cfg.get("CLAUDE_CONFIG_DIR") or ""))
+            link = accounts.start(dict(self.cfg, CLAUDE=self.cfg.get("CLAUDE") or "claude"), env, self.sign_in_dir(),
+                                  **({"popen": self.popen} if self.popen else {}))
+            if not account_switch.page_ok(link):
+                accounts.cancel(self.sign_in_dir())
+                raise accounts.Refused("the sign-in page I was given is not one I can show")
+        except accounts.Refused as e:
+            self.say(room, self.card("error", "I could not start a sign-in: %s" % e), result_file, tapped)
+            return "account-signin-refused"
+        agent_card, _ = connector_cards._core()
+        built = agent_card.build(account_switch.NOTE, "pending", title="Account", body="Account of %s" % self.name,
+                                 text=SIGN_IN_TEXT,
+                                 input_={"name": CODE_INPUT, "label": "Sign-in code",
+                                         "hint": "The code the sign-in page shows", "pattern": CODE_WORDS.pattern},
+                                 buttons=[agent_card.button("Open sign-in page", "url", url=link),
+                                          agent_card.button("Submit code", "reply", reply="Submit code", uses_input=True,
+                                                            command=agent_card.reply(self.KIND, "agent", CODE))])
+        self.say(room, built, result_file, tapped)
+        return "account-signin-started"
+
+    def finish(self, code: str, sent, result_file, typed: bool) -> str:
+        """Hand the waiting sign-in its code and say how it ended, in place of the card tapped (a new card
+        for a code sent as a message)."""
+        ok, why = accounts.give_code(self.sign_in_dir(), code)
+        room = sent.get("channel_id")
+        tapped = "" if typed else card_desk.tapped_event(sent)
+        if not ok:
+            self.say(room, self.card("error", "The sign-in did not finish: %s" % why), result_file, tapped)
+            return "account-signin-failed"
+        text, refused = self.status()
+        said = "Signed in. %s New conversations use this account." % text + (" " + TYPED_NOTE if typed else "")
+        self.say(room, self.card("done", said, signed_out=refused), result_file, tapped)
+        return "account-signed-in"
+
+    def takes_words(self, said: str) -> bool:
+        """The owner's DM message is the waiting sign-in's code: a whole message in the code's shape."""
+        return bool(CODE_WORDS.fullmatch(said)) and accounts.waiting(self.sign_in_dir())
+
+    def took_words(self, said: str, sent, result_file) -> str:
+        return self.finish(said, sent, result_file, typed=True)
 
     def tapped(self, verb, sent, result_file) -> str:
         """"Switch account": where to switch it, shown in place of the card tapped and still carrying the
@@ -247,6 +320,15 @@ class AccountCard(account_switch.AccountSwitch):
             self.say(sent.get("channel_id"), account_switch.with_controls(self.card("info", WHERE), RUNTIME),
                      result_file, card_desk.tapped_event(sent))
             return "account-where"
+        if verb == SIGN_IN:
+            return self.sign_in(sent, result_file)
+        if verb == CODE:
+            agent_card, _ = connector_cards._core()
+            code = ((agent_card.card_click(sent) or {}).get("input") or {}).get(CODE_INPUT, "")
+            if not code:
+                self.publish(result_file, self.quoted("Paste the code from the sign-in page into the box first.") + "\n")
+                return "account-signin-no-code"
+            return self.finish(code, sent, result_file, typed=False)
         if KEY_RE.fullmatch(str(verb or "")):
             return self.use(verb, sent, result_file)
         self.publish(result_file, self.quoted(account_switch.EXPIRED_NO_CARD) + "\n")

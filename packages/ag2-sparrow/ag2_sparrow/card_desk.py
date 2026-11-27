@@ -81,6 +81,11 @@ class Desk:
             return self.in_room(ask, said, result_file)
         if agent_card.owner_may_act(sent) is not None:
             return ""
+        # The owner's own words a card is waiting for (a sign-in's code, in her DM): taken here, never the model's.
+        for card in self.cards:
+            takes = getattr(card, "takes_words", None)
+            if takes is not None and card.usable() and takes(said.strip()):
+                return self.drawn(card, result_file, lambda: card.took_words(said.strip(), sent, result_file))
         slash = [card for card in self.cards if ask.lower() == card.ASK and card.usable()]
         named = [(card, card.named_in(said.strip())) for card in self.cards
                  if getattr(card, "named_in", None) and card.usable()]

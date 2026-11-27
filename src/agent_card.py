@@ -508,7 +508,24 @@ def card_click(headers: Mapping[str, str]) -> Optional[dict]:
         return None
     if not isinstance(click, dict) or not _text(click.get("card_id"), "id") or not _text(click.get("action"), "reply"):
         return None
-    return {"card_id": click["card_id"], "action": click["action"]}
+    out = {"card_id": click["card_id"], "action": click["action"]}
+    given = click_input(click.get("input"))
+    return dict(out, input=given) if given else out
+
+
+# A tap's typed value travels in the click, never in the message's text (a sign-in code, say): at most
+# CLICK_INPUTS named values of CLICK_INPUT_MAX characters each.
+CLICK_INPUTS, CLICK_INPUT_MAX = 4, 2048
+
+
+def click_input(given) -> dict:
+    """`{name: value}` a card click carried for the card's input, {} when there is none or it is not one."""
+    if not isinstance(given, dict) or not 0 < len(given) <= CLICK_INPUTS:
+        return {}
+    if not all(isinstance(k, str) and _INPUT_NAME_RE.fullmatch(k) and isinstance(v, str) and len(v) <= CLICK_INPUT_MAX
+               for k, v in given.items()):
+        return {}
+    return dict(given)
 
 
 def click_tagged(headers: Mapping[str, str]) -> bool:

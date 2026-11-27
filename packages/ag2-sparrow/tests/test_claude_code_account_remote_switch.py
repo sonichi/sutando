@@ -108,7 +108,7 @@ class Remote(Base):
 class Offer(Remote):
     def test_the_card_offers_each_other_saved_account_by_address_sorted_and_not_the_one_in_use(self):
         card = self.posted()
-        self.assertEqual([b["label"] for b in card["buttons"]], ["Use " + A, "Use " + B, "Switch account"])
+        self.assertEqual([b["label"] for b in card["buttons"]], ["Use " + A, "Use " + B, "Switch account", ac.SIGN_IN_LABEL])
         self.assertEqual(card["buttons"][0]["command"], "card:account:agent:" + ac.saved_key(A))
         self.assertEqual(card["buttons"][0]["reply"], "Use " + A, "the plan suffix is never shown")
 
@@ -117,7 +117,8 @@ class Offer(Remote):
         self.index(self.appdata, many)
         self.answer = {"loggedIn": False}
         card = self.posted()
-        self.assertEqual([b["label"] for b in card["buttons"]][:-1], ["Use u%d@example.com" % i for i in range(5)])
+        # Six buttons at most: "Switch account" and "Sign in to another account" leave room for four.
+        self.assertEqual([b["label"] for b in card["buttons"]][:-2], ["Use u%d@example.com" % i for i in range(4)])
 
     def test_no_buttons_when_a_switch_here_would_be_refused(self):
         for over in ({"CLAUDE_CONFIG_DIR": ""}, {"CLAUDE_CONFIG_DIR": str(self.home / ".claude-sutando")}):
@@ -916,3 +917,89 @@ class Watch(Remote):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+LINK = "https://claude.ai/oauth/authorize?code=true&client_id=x&state=s"
+CODE = "abcdEFGH1234#stateXYZ987"
+
+
+class PhoneSignIn(Remote):
+    """Owner 11-27: a new Claude account signed in from the phone. The card starts Claude Code's two-step
+    sign-in here and shows its link; the code comes back typed into the card (the tap carries it, never the
+    chat's text) or as the owner's own DM message. Never the model's to start or finish."""
+
+    def setUp(self):
+        super().setUp()
+        self.started, self.given, self.waiting = [], [], False
+
+        def start(cfg, env, state_dir, **kw):
+            self.started.append((env.get("CLAUDE_CONFIG_DIR"), str(state_dir)))
+            self.waiting = True
+            return LINK
+
+        def give(state_dir, code, **kw):
+            self.given.append(code)
+            self.waiting = False
+            return True, ""
+
+        for name, fake in (("start", start), ("give_code", give), ("waiting", lambda d: self.waiting)):
+            p = mock.patch.object(accounts, name, fake)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def started_card(self):
+        self.posted()
+        rc, out = self.tap("task-si", ac.SIGN_IN_LABEL)
+        self.assertIn("(account-signin-started)", out["refused"])
+        card = self.queued()[-1]["card"]
+        _, issued = connector_cards._core()
+        issued.record(Path(self.root), "$acct", card, room=DM, lane="")    # posted in place, as the bridge records it
+        self.clear_outbox()
+        return card
+
+    def test_sign_in_shows_the_page_and_a_code_box_whose_button_carries_the_code(self):
+        card = self.started_card()
+        self.assertEqual(self.started, [(str(self.config), str(Path(self.root) / "state" / "account-sign-in"))])
+        self.assertEqual(card["input"]["name"], ac.CODE_INPUT)
+        self.assertEqual([(b["kind"], b["label"]) for b in card["buttons"]],
+                         [("url", "Open sign-in page"), ("reply", "Submit code")])
+        self.assertEqual(card["buttons"][0]["url"], LINK)
+        self.assertTrue(card["buttons"][1]["uses_input"])
+        self.assertNotIn("on the computer", card["text"])
+
+    def test_the_code_typed_into_the_card_signs_in_and_is_never_in_the_chat_text(self):
+        self.started_card()
+        rc, out = self.claim(self.task("task-code", "Submit code", reply_to="$acct",
+                                       click={"card_id": ac.account_switch.NOTE, "action": "Submit code",
+                                              "input": {"code": CODE}}))
+        self.assertIn("(account-signed-in)", out["refused"])
+        self.assertEqual(self.given, [CODE])
+        done = self.queued()[-1]["card"]
+        self.assertIn("Signed in.", done["text"])
+        self.assertNotIn(CODE, json.dumps(self.queued()))
+
+    def test_the_code_sent_as_a_dm_message_signs_in_and_says_the_message_can_be_deleted(self):
+        self.started_card()
+        rc, out = self.claim(self.task("task-typed", CODE))
+        self.assertIn("(account-signed-in)", out["refused"], "taken here, never the model's")
+        self.assertEqual(self.given, [CODE])
+        self.assertIn(ac.TYPED_NOTE, self.queued()[-1]["card"]["text"])
+
+    def test_no_code_is_taken_when_no_sign_in_waits_or_from_anyone_but_the_owner_in_her_dm(self):
+        rc, out = self.claim(self.task("task-n1", CODE))
+        self.assertNotIn("account-signed-in", json.dumps(out), "no sign-in is waiting: ordinary words")
+        self.started_card()
+        for tid, kw in (("task-n2", {"tier": "team", "sender": "@eve:s.space"}), ("task-n3", {"kind": "room"})):
+            rc, out = self.claim(self.task(tid, CODE, **kw))
+            self.assertNotIn("account-signed-in", json.dumps(out), kw)
+        rc, out = self.claim(self.task("task-n4", "thanks, signing in now"))
+        self.assertNotIn("account-signed-in", json.dumps(out), "words that are not a code")
+        self.assertEqual(self.given, [])
+
+    def test_a_click_carries_its_input_only_when_it_is_one(self):
+        from ag2_sparrow import agent_card
+        click = {"card_id": "c", "action": "a"}
+        self.assertEqual(agent_card.card_click({"card_click": json.dumps(dict(click, input={"code": CODE}))})["input"],
+                         {"code": CODE})
+        for bad in ({"9x": "v"}, {"code": 7}, {"code": "x" * 3000}, {}, "code", {str(i): "v" for i in range(9)}):
+            self.assertNotIn("input", agent_card.card_click({"card_click": json.dumps(dict(click, input=bad))}), bad)
