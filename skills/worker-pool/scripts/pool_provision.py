@@ -85,9 +85,11 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def http_json(method: str, url: str, *, bearer: str = "", payload: Optional[dict] = None,
-              headers: Optional[Mapping[str, str]] = None, timeout: float = HTTP_TIMEOUT_S) -> Reply:
+              headers: Optional[Mapping[str, str]] = None, timeout: float = HTTP_TIMEOUT_S,
+              max_bytes: int = REPLY_MAX) -> Reply:
     """One JSON request and its answer, whatever the status. Only https, or plain http to this
-    machine; a redirect is never followed. A body that is not a JSON object reads as {}."""
+    machine; a redirect is never followed. A body that is not a JSON object, or is longer than
+    `max_bytes`, reads as {}."""
     parts = urllib.parse.urlsplit(url)
     host = parts.hostname or ""
     if not (parts.scheme == "https" and host) and not (parts.scheme == "http" and host in _LOOPBACK):
@@ -102,9 +104,9 @@ def http_json(method: str, url: str, *, bearer: str = "", payload: Optional[dict
     req = urllib.request.Request(url, data=data, method=method, headers=send)
     try:
         with urllib.request.build_opener(_NoRedirect).open(req, timeout=timeout) as resp:
-            status, raw, got = resp.status, resp.read(REPLY_MAX), resp.headers
+            status, raw, got = resp.status, resp.read(max_bytes), resp.headers
     except urllib.error.HTTPError as exc:
-        status, raw, got = exc.code, exc.read(REPLY_MAX), exc.headers
+        status, raw, got = exc.code, exc.read(max_bytes), exc.headers
         exc.close()
     except (urllib.error.URLError, OSError) as exc:
         raise TransportError(type(getattr(exc, "reason", exc)).__name__) from None

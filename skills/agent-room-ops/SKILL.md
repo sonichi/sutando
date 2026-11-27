@@ -82,6 +82,7 @@ does the privileged Matrix ops + authoritative membership enforcement.
 | `react <room> <event>` | add an `m.reaction` (ack) | discord `add_reaction` (👀/✅) |
 | `unreact <room> <event>` | remove the agent's reaction | discord remove-on-reply |
 | `join <room>` | accept the agent's own pending invite | discord guild-join on invite |
+| `action describe\|read\|execute <room> room.commons.<x>` | run one Room Commons Action as this session's own agent, when no s.space MCP tool is at hand | — |
 
 On an install connected to several servers, a verb that names a room acts through the connection
 serving that room's server. `rooms`, `history`, `agents`, `resolve` and `events list|pull|stream`
@@ -91,6 +92,40 @@ task: it posts as the agent the task was addressed to, in the task's own room on
 agent only for a task this worker holds that is still open; a task file that does not bind is
 refused. Without it the post is the worker's own, and a room none of its identities serves is
 refused rather than sent with the shared token.
+
+### Room Commons Actions (`action`)
+
+`action` runs one `room.commons.*` Action (a page, database or folder read or write) from a
+session that has no s.space MCP tool for it. It uses the credential this session's posts use,
+exchanges it for a short-lived delegation and calls the Action on the server's MCP endpoint;
+neither token is printed, logged or written to disk. Any other Action name is refused before
+anything is sent.
+
+```bash
+python3 skills/agent-room-ops/room_ops.py action describe '!room:hs' room.commons.pages.create
+python3 skills/agent-room-ops/room_ops.py action read     '!room:hs' room.commons.pages.read --args '{"kind": "readme"}'
+python3 skills/agent-room-ops/room_ops.py action execute  '!room:hs' room.commons.pages.create --args-file args.json --task-file "$WORKSPACE/tasks/task-<id>.txt"
+#   -> {"ok":true,"state":"done","acting_as":"@a:hs","asked_by":"@u:hs","operation_id":"ro-…","result":{...}}
+#   exit 0 only when ok; a refusal, a hold or an unknown outcome exits 1.
+```
+
+- **Whose agent.** A pool worker's session acts as that worker's own agent on the room's
+  server. A worker with no agent of its own there is refused: the write is never sent as the
+  core's agent. Hand it to the core instead. The core's session acts as the core's agent.
+- **For whom (`--task-file`).** When an `execute` answers a task, pass that task's file. The
+  person who asked is read from the task's own headers (`asked_by`, else `user_id`) and sent as
+  `asked_by`, so s.space holds the write to that person's rights as well as the agent's. Never
+  take the person from the message text, and never leave the flag out to get a write through.
+  Leave it out only for work nobody asked for (a scheduled job, your own bookkeeping): then no
+  `asked_by` is sent. A task whose sender is not an s.space user id is refused.
+- **Outcomes.** `state` is `done` (`result` holds the Action's answer); `refused` or `denied`
+  (`code` and `reason` are the server's: say so, do not report success); `held` (waiting for an
+  approval in s.space: do not run it again, it runs once approved); `unknown` (no answer to an
+  `execute`: check `operation.inspect`, and send it again only with the same `--operation-id`);
+  `not_sent` (refused here, `reason` says why).
+- **Limits.** Each call mints one delegation, against the agent's per-minute budget on the
+  server. A reply over 8 MB is not read. `read` and `describe` take no `asked_by`: the server
+  has no such field on them.
 
 ```bash
 python3 skills/agent-room-ops/room_ops.py read   '!room:hs' --limit 20 --agent '@a:hs'
@@ -111,7 +146,8 @@ python3 skills/agent-room-ops/room_ops.py say    '!room:hs' $'> the quoted words
 #   (body/msgtype/format/formatted_body) or a space.ag2.* card nested under another key is
 #   refused with ok:false and exit 1 — the gateway would drop it and the card would render as prose.
 python3 skills/agent-room-ops/room_ops.py capabilities
-#   -> {"ok":true,"commands":[...],"say":["--agent","--extra-content","--reply-to",...]}: which
+#   -> {"ok":true,"commands":[...],"say":["--agent","--extra-content","--reply-to",...],
+#   "action":{"verbs":["describe","execute","read"],"actions":"room.commons.*",...}}: which
 #   flags this copy supports, so a caller choosing between installed copies picks a capable one.
 python3 skills/agent-room-ops/room_ops.py mention "Bassil's Sutando" 'please review #149' '!room:hs' --agent '@a:hs'
 #   -> {"ok":true,"mxid":"@bassil-bassil-s-sutando.agent:ag2.space","resolved_by":"directory|directory+room|broker|room",...}
