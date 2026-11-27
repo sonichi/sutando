@@ -363,23 +363,27 @@ class HitlManager:
             self.store.save(req)
             return action
 
-    def resolve(self, req_id: str) -> List[str]:
-        """Mark resolved; returns the blocked task ids to resume."""
-        return self._terminate(req_id, STATUS_RESOLVED)
+    def resolve(self, req_id: str, outcome: Optional[str] = None, text: str = "") -> List[str]:
+        """Mark resolved; returns the blocked task ids to resume. `outcome` (done | failed) and
+        `text` say on the card what came of the answer, in the same write."""
+        return self._terminate(req_id, STATUS_RESOLVED, outcome, text)
 
-    def cancel(self, req_id: str) -> List[str]:
-        return self._terminate(req_id, STATUS_CANCELLED)
+    def cancel(self, req_id: str, outcome: Optional[str] = None, text: str = "") -> List[str]:
+        return self._terminate(req_id, STATUS_CANCELLED, outcome, text)
 
     def expire(self, req_id: str) -> List[str]:
         return self._terminate(req_id, STATUS_EXPIRED)
 
-    def _terminate(self, req_id: str, status: str) -> List[str]:
+    def _terminate(self, req_id: str, status: str, outcome: Optional[str] = None,
+                   text: str = "") -> List[str]:
         with self.store.locked():
             req = self.store.load(req_id)
             if req is None:
                 return []
             if req.status in TERMINAL_STATUSES:
                 return []
+            if outcome is not None:
+                req.set_outcome(outcome, text)
             req.transition(status)
             self.store.save(req)
         _activity(req.blocked_task_ids, "RUNNING", status)

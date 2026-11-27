@@ -27,7 +27,7 @@ python3 skills/pending-questions/scripts/pq.py reconcile
 python3 skills/pending-questions/scripts/pq.py resolve <ask-id> [--answered]
 python3 skills/pending-questions/scripts/pq.py remind [--force]
 python3 skills/pending-questions/scripts/pq.py clicks [--json]
-python3 skills/pending-questions/scripts/pq.py ack <ask-id> --token <token>
+python3 skills/pending-questions/scripts/pq.py ack <ask-id> --token <token> [--failed] [--note "<line>"]
 ```
 
 **Trigger: any time you would write a question for the owner into terminal or summary text, file
@@ -173,7 +173,9 @@ adapter's `clicks` (`scripts/pending_questions_clicks.py`):
   prints once, as `[<ask-id>] chose <action-id> '<label>' -> <consequence> … ack with --token
   <token>`, to that caller alone. Later passes, by any consumer, print it as "handed out earlier,
   awaiting ack — not a new decision" for the lease (`HANDED_LEASE_SEC`, 10 minutes).
-- The core acts, then runs `… ack <ask-id> --token <token>`, which settles the card. A handed claim
+- The core acts, then runs `… ack <ask-id> --token <token>`, which settles the card. The card
+  shows "running" from the click until then, and "done" after it; `--failed` shows that it could
+  not be carried out, and `--note "<line>"` gives the card one short line on how it went. A handed claim
   whose lease has expired is re-offered as `chose` to the next pass, ONCE, with a fresh token and
   a new lease, so a consumer that died after the handoff does not strand the choice. After that
   single re-offer an unacked claim is listed as "NEEDS ATTENTION — handed out twice, never

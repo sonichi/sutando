@@ -22,6 +22,24 @@ NOTICE_FIELD = "space.ag2.hitl_notice"
 WIRE_SUBJECT_FIELDS = ("tool", "input", "options", "choices")
 # A recovery card also shows its tap's receipt outcome (hitl.recovery), so a client knows the answer.
 WIRE_RECEIPT_OUTCOMES = ("done", "refused", "stale", "failed")
+# What came of the owner's answer (the card's `outcome`): applied now, then done or failed. `closed`
+# is neutral: the card closed before verification saw a result, so it is neither success nor failure.
+OUTCOME_RUNNING, OUTCOME_DONE, OUTCOME_FAILED, OUTCOME_CLOSED = "running", "done", "failed", "closed"
+OUTCOME_STATES = (OUTCOME_RUNNING, OUTCOME_DONE, OUTCOME_FAILED, OUTCOME_CLOSED)
+OUTCOME_TEXT_MAX = 200
+RECEIPT_FAILED_TEXT = {
+    "refused": "It was refused, so nothing was done.",
+    "stale": "The card changed before your answer arrived, so nothing was done.",
+    "failed": "It could not be done.",
+}
+SUPERSEDED_TEXT = "It is still blocked. A new card follows."
+CLOSED_UNVERIFIED_TEXT = "Closed without verification."
+# What verification saw after a done recovery action that counts as done: the session working again.
+# Still blocked, a failed restart, or up with its waiting work not seen starting is not success.
+VERIFY_SEEN_DONE = ("working",)
+# What verification saw that is no evidence either way (a check window or a restart's deadline ran
+# out unseen): the card closes neutral, never as failed. Failed is only a failure seen.
+VERIFY_SEEN_UNKNOWN = ("up", "unknown")
 
 
 # Canonical JSON's integer range; a number outside it is refused like a float.
@@ -128,6 +146,8 @@ class HumanRequirement:
     updated_at: float = field(default_factory=time.time)
     # The room the card is for; when set, a reply from any other room is stale.
     room: str = ""
+    # The producer's own word on what came of the answer ({state, text}); see wire_outcome.
+    outcome: Optional[Dict[str, str]] = None
 
     def __post_init__(self) -> None:
         if self.kind not in KINDS:
@@ -158,6 +178,48 @@ class HumanRequirement:
         self.guard = guard
         self.revision += 1
         self.updated_at = time.time()
+
+    def set_outcome(self, state: str, text: str = "") -> None:
+        """Record what came of the owner's answer; it outranks what the status alone would say."""
+        if state not in OUTCOME_STATES:
+            raise ValueError(f"unknown outcome state: {state!r}")
+        self.outcome = outcome_wire(state, text)
+
+    def wire_outcome(self) -> Optional[Dict[str, str]]:
+        """The card's `outcome`, or None while it still asks or nobody answered it. The producer's
+        own outcome wins, then a recovery receipt, then the status (in_progress runs, resolved is done).
+        A done receipt is only dispatched: it runs until verification has seen what came of it, and
+        a card closed before then is `closed`, never done; failed is only what verification saw."""
+        if self.status == STATUS_PENDING or not self.chosen_action:
+            return None
+        own = self.outcome
+        if isinstance(own, dict) and own.get("state") in OUTCOME_STATES:
+            return outcome_wire(own["state"], own.get("text"))
+        subject = self.subject or {}
+        receipt = subject.get("receipt")
+        if isinstance(receipt, dict) and receipt.get("outcome") in WIRE_RECEIPT_OUTCOMES:
+            text = receipt.get("text")
+            check = subject.get("verify")
+            seen = check.get("seen") if isinstance(check, dict) else None
+            if seen in VERIFY_SEEN_UNKNOWN:
+                return outcome_wire(OUTCOME_CLOSED, text or CLOSED_UNVERIFIED_TEXT)
+            if receipt["outcome"] != "done":
+                return outcome_wire(OUTCOME_FAILED, text or RECEIPT_FAILED_TEXT[receipt["outcome"]])
+            if subject.get("superseded") is True:
+                return outcome_wire(OUTCOME_FAILED, text or SUPERSEDED_TEXT)
+            if isinstance(check, dict) and not seen:
+                # Still verifying (or a fallback restart runs), with no deadline; closed first is unknown.
+                if self.terminal:
+                    return outcome_wire(OUTCOME_CLOSED, CLOSED_UNVERIFIED_TEXT)
+                return outcome_wire(OUTCOME_RUNNING)
+            if seen in VERIFY_SEEN_DONE or not isinstance(check, dict):
+                return outcome_wire(OUTCOME_DONE, text)
+            return outcome_wire(OUTCOME_FAILED, text or SUPERSEDED_TEXT)
+        if self.status == STATUS_IN_PROGRESS:
+            return outcome_wire(OUTCOME_RUNNING)
+        if self.status == STATUS_RESOLVED:
+            return outcome_wire(OUTCOME_DONE)
+        return None  # cancelled or expired: the status says it
 
     def wire_device(self) -> Optional[Dict[str, str]]:
         """The device as a reader sees it: the producer's dict plus `host` (this
@@ -233,9 +295,20 @@ class HumanRequirement:
             wire["expires_at"] = self.expires_at
         if self.turn_on_action:
             wire["turn_on_action"] = True
+        outcome = self.wire_outcome()
+        if outcome:
+            wire["outcome"] = outcome
         # `answer` is inbound-only (what the human typed back); a card never
         # renders it, so it is persisted but deliberately not on the wire.
         return wire_safe(wire)
+
+
+def outcome_wire(state: str, text: Optional[str] = None) -> Dict[str, str]:
+    """{state, text?}: the text as one line, cut at a word to OUTCOME_TEXT_MAX."""
+    line = " ".join(str(text or "").split())
+    if len(line) > OUTCOME_TEXT_MAX:
+        line = line[:OUTCOME_TEXT_MAX - 1].rsplit(" ", 1)[0].rstrip(" ,;:") + "…"
+    return {"state": state, **({"text": line} if line else {})}
 
 
 class StaleRequirementError(Exception):

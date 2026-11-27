@@ -449,7 +449,7 @@ def _answer_card(manager, req, line: str, outcome: str, now: float, check: Optio
         if not (outcome == "done" and (check or {}).get("detached")):
             # A detached restart's card carries no receipt until its outcome is known (verify_step):
             # a client reading the card never sees "done" for a restart that then failed.
-            subject["receipt"] = {"outcome": outcome, "at": int(now)}
+            subject["receipt"] = _card_receipt(outcome, now, line)
         cur.subject = subject
         cur.revision += 1
         cur.updated_at = time.time()
@@ -467,7 +467,12 @@ def _final_receipt(workspace: Path, req_id: str, check: Dict, outcome: str, reas
                 str(prior.get("hitl_id") or req_id), str(prior.get("incident") or ""),
                 str(prior.get("action_id") or ""), outcome, reason, now,
                 {k: v for k, v in (prior.get("recovery") or {}).items() if k != "state"}))
-    return {"outcome": outcome, "at": int(now)}
+    return _card_receipt(outcome, now, reason)
+
+
+def _card_receipt(outcome: str, now: float, line: Optional[str] = None) -> Dict:
+    """The card's receipt; `line` is the card's outcome text (hitl.schema wire_outcome)."""
+    return {"outcome": outcome, "at": int(now), **({"text": line} if line else {})}
 
 
 #: How long a session may stay blocked after a done action before its card says so.
@@ -476,7 +481,8 @@ STILL_BLOCKED = "It is still blocked. A new card follows with what you can do no
 WORKING_AGAIN = "It is working again."
 #: The core is up again and has taken up the work that was waiting when the owner tapped.
 RESUMED = "It is working again and has picked up the work that was waiting."
-#: Up again, but none of that work was seen starting within RESUME_S: said plainly, not as success.
+#: Up again, but none of that work was seen starting within RESUME_S: said plainly, neither success
+#: nor failure (the card's outcome is neutral, `closed`).
 NOT_RESUMED = ("It is up again, but I have not seen the waiting work start yet. If it does not, "
                "send the message again.")
 #: How long after a done action an unblocked core may take to start the waiting work.
@@ -594,6 +600,10 @@ def verify_step(manager, workspace: Path, session: str, blocked: bool, now: Opti
                 continue
             cur.message = f"{cur.message}\n\n{line}"
             cur.subject = {**(cur.subject or {}), "verify": {**check, "seen": seen}}
+            receipt = cur.subject.get("receipt")
+            if isinstance(receipt, dict) and receipt.get("outcome") == "done":
+                # What was seen after a dispatched action is its outcome; a failure keeps its own line.
+                cur.subject["receipt"] = {**receipt, "text": line}
             cur.revision += 1
             cur.updated_at = time.time()
             manager.store.save(cur)
@@ -645,7 +655,7 @@ def _fallback_restart(manager, workspace: Path, req, check: Dict, target: Target
             return
         cur.message = f"{cur.message}\n\n{line}"
         cur.subject = {**(cur.subject or {}), "verify": {**(cur.subject or {}).get("verify", {}), "seen": "failed"},
-                       "receipt": {"outcome": "failed", "at": int(now)}}
+                       "receipt": _card_receipt("failed", now, line)}
         cur.revision += 1
         cur.updated_at = time.time()
         manager.store.save(cur)
@@ -675,7 +685,9 @@ def _restart_failed(manager, workspace: Path, req_id: str, check: Dict, done, no
         if cur is None or cur.terminal:
             return
         cur.message = f"{cur.message}\n\n{line}"
-        cur.subject = {**(cur.subject or {}), "verify": {**check, "seen": "failed"},
+        # A deadline that passed unanswered is no evidence of failure: the card closes neutral.
+        seen = "unknown" if done.state == detached_action.EXPIRED else "failed"
+        cur.subject = {**(cur.subject or {}), "verify": {**check, "seen": seen},
                        "receipt": _final_receipt(workspace, req_id, check, "failed", line, now)}
         cur.revision += 1
         cur.updated_at = time.time()

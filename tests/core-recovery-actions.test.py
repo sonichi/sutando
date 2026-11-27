@@ -157,6 +157,10 @@ class Base(unittest.TestCase):
         """The detached restart's own terminal report, as its wrapper (or the pool) writes it."""
         detached_action.report(self.ws, self.spawned.key(i), outcome, reason, rc)
 
+    def outcome(self, req):
+        """The card's `outcome` as the space.ag2.hitl wire carries it to a client."""
+        return self.mgr.get(req.id).to_wire().get("outcome")
+
     def card(self, kind="usage-limit", prompt=LIMIT, seat=None, runtime="claude", fresh=True):
         """A new card for this state: a limit card is one per session, so an open one is closed."""
         session = SEAT_SESSION if seat else CORE
@@ -613,6 +617,8 @@ class Executor(Base):
                     self.assertEqual(RA.verify_step(self.mgr, self.ws, CORE, blocked=True, now=later), [req.id])
                     self.assertIn("did not complete" if how == "failed" else "couldn't confirm",
                                   self.mgr.get(req.id).message)
+                    # A restart seen failing is failed; one that never answered is unknown, so neutral.
+                    self.assertEqual(self.outcome(req)["state"], "failed" if how == "failed" else "closed")
                 self.assertIsNotNone(core_limit_hold.active_hold(self.ws, now + 6), "a failed restart left no pause")
 
     def test_a_seats_failed_restart_keeps_it_paused(self):
@@ -1140,9 +1146,11 @@ class SeatRetryEscFirst(Base):
         self.assertEqual(core_limit_hold.read_hold(self.ws, SEAT_SESSION)["status"], "cleared")
         self.assertEqual(self.audit()[-1]["path"], RA.PATH_ESC)
         self.assertIn(RA.ESC_LINE, self.mgr.get(req.id).message)
+        self.assertEqual(self.outcome(req), {"state": "running"}, "Escape sent is not yet done")
         RA.verify_step(self.mgr, self.ws, SEAT_SESSION, blocked=False, now=now + 5, target=target, runner=run)
         card = self.mgr.get(req.id)
         self.assertIn(RA.WORKING_AGAIN, card.message)
+        self.assertEqual(self.outcome(req), {"state": "done", "text": RA.WORKING_AGAIN})
         self.assertNotIn(RA.FALLBACK_LINE, card.message)
         self.assertEqual(run.calls, [], "an unblocked worker is never restarted")
 
@@ -1150,6 +1158,7 @@ class SeatRetryEscFirst(Base):
         now, req, target = self._tap()
         run = Run()
         RA.run_pending(self.mgr, target, runner=run, now=now, follow_ups=[])
+        self.assertEqual(self.outcome(req), {"state": "running"}, "Escape sent, the worker still blocked")
         self.assertEqual(RA.verify_step(self.mgr, self.ws, SEAT_SESSION, blocked=True, now=now + 5,
                                         target=target, runner=run), [], "still inside the verify window")
         self.assertEqual(run.calls, [])
@@ -1161,16 +1170,19 @@ class SeatRetryEscFirst(Base):
         card = self.mgr.get(req.id)
         self.assertIn(RA.FALLBACK_LINE, card.message)
         self.assertFalse(card.terminal, "the card stays on checking until the restart answers")
+        self.assertEqual(self.outcome(req), {"state": "running"}, "the fallback restart is still running")
         receipt = recovery.read_receipt(self.ws, req.id)
         self.assertEqual((receipt["outcome"], receipt["recovery"]["path"]), ("done", RA.PATH_FALLBACK))
         self.assertEqual([a.get("path") for a in self.audit()], [RA.PATH_ESC, RA.PATH_FALLBACK])
         RA.verify_step(self.mgr, self.ws, SEAT_SESSION, blocked=True, now=now + RA.VERIFY_S + 2,
                        target=target, runner=run)
         self.assertEqual(len(run.calls), 1, "the fallback restart runs once")
+        self.assertEqual(self.outcome(req), {"state": "running"})
         detached_action.report(self.ws, env[detached_action.KEY_ENV], detached_action.DONE)
         RA.verify_step(self.mgr, self.ws, SEAT_SESSION, blocked=False, now=now + RA.VERIFY_S + 3,
                        target=target, runner=run)
         self.assertIn(RA.WORKING_AGAIN, self.mgr.get(req.id).message)
+        self.assertEqual(self.outcome(req), {"state": "done", "text": RA.WORKING_AGAIN})
 
     def test_a_failed_fallback_restart_keeps_the_worker_paused(self):
         now, req, target = self._tap()
@@ -1181,6 +1193,9 @@ class SeatRetryEscFirst(Base):
         self.assertEqual((receipt["outcome"], receipt["recovery"]["path"]), ("failed", RA.PATH_FALLBACK))
         self.assertIsNotNone(core_limit_hold.active_hold(self.ws, now + RA.VERIFY_S + 2, SEAT_SESSION))
         self.assertTrue(self.mgr.get(req.id).terminal, "closed for a fresh card")
+        out = self.outcome(req)
+        self.assertEqual(out["state"], "failed")
+        self.assertTrue(out["text"].startswith("The worker did not restart"), out)
 
     def test_a_dead_session_is_restarted_at_once(self):
         now, req, _ = self._tap()
@@ -1588,21 +1603,27 @@ class ResumeReported(Base):
         req = self.done_switch()
         self.assertEqual(self.mgr.get(req.id).subject["verify"]["waiting"], ["task-1"])
         now = time.time()
+        self.assertEqual(self.outcome(req), {"state": "running"}, "dispatched, the waiting work not yet seen")
         self.assertEqual(RA.verify_step(self.mgr, self.ws, CORE, blocked=False, now=now + 5, state="idle"), [])
         M.resolve_escalations(self.mgr, CORE, "❯ \n", "claude", workspace=self.ws)
         self.assertFalse(self.mgr.get(req.id).terminal, "kept open while the resume is still being checked")
+        self.assertEqual(self.outcome(req), {"state": "running"}, "up, the waiting work still queued")
         self.assertEqual(RA.verify_step(self.mgr, self.ws, CORE, blocked=False, now=now + RA.RESUME_S + 1,
                                         state="idle"), [req.id])
         card = self.mgr.get(req.id)
         self.assertIn(RA.NOT_RESUMED, card.message)
         self.assertNotIn(RA.WORKING_AGAIN, card.message)
+        self.assertEqual(self.outcome(req), {"state": "closed", "text": RA.NOT_RESUMED},
+                         "not seen either way: never said as success, nor as failure")
 
     def test_the_waiting_task_leaving_the_queue_is_the_resume(self):
         self.waiting()
         req = self.done_switch()
+        self.assertEqual(self.outcome(req), {"state": "running"})
         (self.ws / "tasks" / "task-1.txt").unlink()
         self.assertEqual(RA.verify_step(self.mgr, self.ws, CORE, blocked=False, state="idle"), [req.id])
         self.assertIn(RA.RESUMED, self.mgr.get(req.id).message)
+        self.assertEqual(self.outcome(req), {"state": "done", "text": RA.RESUMED})
 
     def test_a_refused_turn_resumes_when_the_core_is_seen_running(self):
         req = self.card(kind="turn-rejected", prompt=FABLE_REFUSED)
@@ -1624,13 +1645,16 @@ class ResumeReported(Base):
         self.click(req, "restart_core")
         self.run_pending(Run())
         self.assertEqual(RA.verify_step(self.mgr, self.ws, CORE, blocked=False), [], "the restart has not answered")
+        self.assertEqual(self.outcome(req), {"state": "running"})
         self.answer(detached_action.DONE)
         RA.verify_step(self.mgr, self.ws, CORE, blocked=False, state="idle")
         card = self.mgr.get(req.id)
         self.assertEqual(card.subject["receipt"]["outcome"], "done")
         self.assertNotIn("seen", card.subject["verify"], "still checking that the waiting work starts")
+        self.assertEqual(self.outcome(req), {"state": "running"}, "restarted, the resume not yet seen")
         RA.verify_step(self.mgr, self.ws, CORE, blocked=False, state="running")
         self.assertIn(RA.RESUMED, self.mgr.get(req.id).message)
+        self.assertEqual(self.outcome(req), {"state": "done", "text": RA.RESUMED})
 
     def test_an_unreadable_queue_is_no_evidence(self):
         with mock.patch("task_queue.pending_files", side_effect=OSError("no")):
