@@ -2905,7 +2905,7 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 "thread_starter", "you_in_thread",
                 # The broker's reply, thread and roster context (room_members is capped; the count
                 # is the true total). Above "task" for the same reason as the facts above.
-                "reply_to_me", "reply_to_sender", "addressed_to",
+                "reply_to_me", "reply_to_sender", "addressed_to", "addressed_via",
                 # Ingress only: the backend inherits the route by task id, so a
                 # reply echoing these back could name a thread it was not asked in.
                 "thread_root", "source_room_id",
@@ -6914,6 +6914,9 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
         elif f == "owner_mentioned":
             if task.get(f) == "true":  # the broker's exact string only; nothing else is a claim
                 lines.append("owner_mentioned: true")
+        elif f == "addressed_via":
+            if task.get(f) == "owner":  # the broker's one value; anything else is no claim
+                lines.append("addressed_via: owner")
         elif f in ("mentions_you", "replied_to_you", "you_in_thread"):
             _mv = task.get(f)
             _mv = ("true" if _mv else "false") if isinstance(_mv, bool) else _mv

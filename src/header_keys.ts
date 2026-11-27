@@ -77,6 +77,7 @@ export const HEADER_KEYS: readonly string[] = [
 	'you_in_thread',
 	'replied_to',
 	'replied_to_you',
+	'addressed_via',
 	'room_members',
 	'room_member_count',
 ];
