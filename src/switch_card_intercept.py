@@ -103,10 +103,7 @@ def limit_lead(workspace: Path, now=time.time) -> str:
     try:
         import core_quota_notice
         rec = json.loads(Path(workspace).joinpath(*core_quota_notice.FILE).read_text(encoding="utf-8"))
-        if not isinstance(rec, dict) or not rec.get("since") or (rec.get("why") or "quota") != "quota":
-            return ""
-        until = rec.get("reset_at")
-        if until is not None and now() >= float(until):
+        if not core_quota_notice.in_force(rec, now()):
             return ""
         return core_quota_notice.words(str(rec.get("name") or "The core"), str(rec.get("reset") or ""),
                                        credits=bool(rec.get("credits")))

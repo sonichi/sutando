@@ -100,15 +100,44 @@ def words(name: str, reset: str, why: str = "quota", credits: bool = False) -> s
     return said + (" " + CREDITS_LINE if credits else "")
 
 
+NO_RESET_S = 900.0  # a limit that named no reset time is over this long after it was last seen
+
+
 def room_words(name: str, reset: str) -> str:
-    """The limit as told under a message in a shared room: no account named, nothing that switches one."""
-    return ("On hold: %s has reached its usage limit%s, so I can't answer until then. Your request is kept. "
-            "Accounts are switched in my owner's direct message, not here."
-            % (name, " (resets %s)" % reset if reset else " (it does not say when that resets)"))
+    """The limit as told under a message in a shared room: no account named, nothing that switches one.
+    The same words the local agents use (ag2_sparrow.quota_notice.room_words); a test holds them equal."""
+    return ("%s has reached its usage limit%s, so I can't answer until then. To switch account, message me in our "
+            "direct message." % (name, " (resets %s)" % reset if reset else " (it does not say when that resets)"))
+
+
+def in_force(rec: dict, now: float) -> bool:
+    """Whether the limit `rec` records still stands: not past its reset time, or, when it named none,
+    seen within NO_RESET_S (nothing else would ever end it for a caller that runs no turn)."""
+    if not isinstance(rec, dict) or not rec.get("since") or (rec.get("why") or "quota") != "quota":
+        return False
+    until = rec.get("reset_at")
+    if until is not None:
+        return now < float(until)
+    return now - float(rec.get("seen") or rec.get("since") or 0) <= NO_RESET_S
+
+
+def _room_task(path, workspace) -> bool:
+    """Whether the task at `path` was sent in a shared room by someone the core answers there: the owner
+    or a collaborator. Read from its attested headers, never from its words."""
+    import task_envelope
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    h = task_envelope.attested_task_headers(text, Path(workspace)).headers
+    kind = (h.get("channel_kind") or "").strip()
+    answered = (h.get("access_tier") or "").strip() == "owner" or (h.get("collaborator") or "").strip().lower() == "true"
+    return bool(kind) and kind != "dm" and answered
 
 
 def room_tasks(workspace) -> dict:
-    """{task id: its file} for the tasks waiting in the core's queue that were sent in a shared room."""
+    """{task id: its file} for the tasks waiting in the core's queue that were sent in a shared room and
+    that the core would answer. A room message it would not have replied to is told nothing."""
     out = {}
     try:
         import task_queue
@@ -116,13 +145,7 @@ def room_tasks(workspace) -> dict:
     except Exception:  # noqa: BLE001 - no queue read: nobody to tell
         return out
     for p in files:
-        try:
-            with open(p, encoding="utf-8") as f:
-                head = [line for _, line in zip(range(80), f)]
-        except OSError:
-            continue
-        kind = next((ln.split(":", 1)[1].strip() for ln in head if ln.startswith("channel_kind:")), "")
-        if kind and kind != "dm":
+        if _room_task(p, workspace):
             out[p.name[:-4] if p.name.endswith(".txt") else p.name] = p
     return out
 
@@ -234,6 +257,7 @@ class QuotaNotice:
             rec = {"since": at}
         rec["name"] = self.name
         rec["why"] = why
+        rec["seen"] = at                 # a limit with no reset time is dated from when it was last seen
         if reset_at is not None:
             rec["reset_at"] = float(reset_at)
         if reset and not rec.get("reset"):

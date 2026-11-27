@@ -113,7 +113,8 @@ class Intercept(unittest.TestCase):
         import core_quota_notice
         state = self.ws.joinpath(*core_quota_notice.FILE)
         state.parent.mkdir(parents=True, exist_ok=True)
-        state.write_text(json.dumps({"since": 1.0, "name": "Codex", "reset": "3:05 PM", "told": True}))
+        import time
+        state.write_text(json.dumps({"since": time.time(), "name": "Codex", "reset": "3:05 PM", "told": True}))
         lead = "Codex has reached its usage limit (resets 3:05 PM), so I can't answer until then. Switch to another account to go on now."
         for words in ("/model", "switch core", "account"):
             self.calls.clear()
@@ -123,10 +124,15 @@ class Intercept(unittest.TestCase):
             self.assertEqual(argv[argv.index("post") + 1:],
                              ["--room", "!dm:s.space", "--retry", "--lead", lead, "--reply-to", "$evt"], words)
         # No limit, one past its reset, a sign-out, or a record that cannot be read: the card asked for, as before.
-        for rec in ("{}", json.dumps({"since": 1.0, "reset_at": 2.0}), json.dumps({"since": 1.0, "why": "signed_out"}),
-                    "[1]", "not json"):
+        # ... nor one that named no reset time and was last seen long ago: nothing else would ever end it.
+        stale = time.time() - core_quota_notice.NO_RESET_S - 1
+        for rec in ("{}", json.dumps({"since": 1.0, "reset_at": 2.0}), json.dumps({"since": time.time(), "why": "signed_out"}),
+                    json.dumps({"since": stale}), json.dumps({"since": 1.0, "seen": stale}), "[1]", "not json"):
             state.write_text(rec)
             self.assertEqual(sci.limit_lead(self.ws), "", rec)
+        state.write_text(json.dumps({"since": 1.0, "seen": time.time()}))
+        self.assertTrue(sci.limit_lead(self.ws), "seen just now: still in force")
+        state.write_text("{}")
         self.calls.clear()
         self.assertTrue(self.run_with("/model"))
         self.assertTrue(self.calls[0][1].endswith("skills/model-switch/scripts/model_card.py"))

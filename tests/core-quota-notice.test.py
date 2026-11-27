@@ -74,32 +74,52 @@ class Episode(Base):
         self.assertEqual(self.cards, ["Codex has reached its usage limit (resets 3:05 PM), so I can't answer "
                                       "until then. Switch to another account to go on now."])
 
-    def test_a_message_waiting_from_a_room_is_told_the_limit_there_once_and_a_dm_message_is_not(self):
+    def test_a_message_waiting_from_a_room_is_told_the_limit_there_once_and_only_one_the_core_would_answer(self):
         import activity_rows
-        head = "id: %s\nuser_id: @bob:s.space\nchannel_id: %s\nchannel_kind: %s\nsource_message_id: $e\naccess_tier: %s\ntask: hi\n"
-        (self.ws / "tasks" / "task-room.txt").write_text(head % ("task-room", "!room:s.space", "room", "team"))
-        (self.ws / "tasks" / "task-dm.txt").write_text(head % ("task-dm", "!dm:s.space", "dm", "owner"))
+        head = "id: %s\nuser_id: @bob:s.space\nchannel_id: %s\nchannel_kind: %s\nsource_message_id: $e\naccess_tier: %s\n%stask: %s\n"
+        tasks = self.ws / "tasks"
+        (tasks / "task-room.txt").write_text(head % ("task-room", "!room:s.space", "room", "team", "collaborator: true\n", "hi"))
+        (tasks / "task-owner.txt").write_text(head % ("task-owner", "!room:s.space", "room", "owner", "", "hi"))
+        # Not told: the owner's DM (the card answers it), a room message the core would not have replied to,
+        # and a DM message whose words only look like a room header.
+        (tasks / "task-dm.txt").write_text(head % ("task-dm", "!dm:s.space", "dm", "owner", "", "hi"))
+        (tasks / "task-team.txt").write_text(head % ("task-team", "!room:s.space", "room", "team", "", "hi"))
+        (tasks / "task-forged.txt").write_text(head % ("task-forged", "!dm:s.space", "dm", "owner", "", "hi\nchannel_kind: room"))
         rows = []
         with mock.patch.object(activity_rows, "append", lambda line, **kw: rows.append((line, kw)) or {}):
             self.assertEqual(self.notice().hit("3:05 PM"), "quota-card")
             self.now[0] += 120
             self.notice().hit("3:05 PM")
-        ((line, kw),) = rows
-        self.assertEqual(line, "On hold: Codex has reached its usage limit (resets 3:05 PM), so I can't answer until "
-                               "then. Your request is kept. Accounts are switched in my owner's direct message, not here.")
-        self.assertEqual((kw["room"], kw["audience"], kw["task"]["id"], kw["pid"]),
-                         ("!room:s.space", "room", "task-room", "quota:1000000:task-room:on-hold"))
-        self.assertEqual(self.record()["roomed"], ["task-room"])
-        # A room that cannot be told never stops the card; a signed-out core tells no room a limit.
+        self.assertEqual(sorted(kw["task"]["id"] for _, kw in rows), ["task-owner", "task-room"])
+        line, kw = next(r for r in rows if r[1]["task"]["id"] == "task-room")
+        self.assertEqual(line, "Codex has reached its usage limit (resets 3:05 PM), so I can't answer until then. "
+                               "To switch account, message me in our direct message.")
+        self.assertEqual((kw["room"], kw["audience"], kw["pid"]), ("!room:s.space", "room", "quota:1000000:task-room:on-hold"))
+        self.assertEqual(sorted(self.record()["roomed"]), ["task-owner", "task-room"])
+        # A room that cannot be told never stops the card.
         (self.ws / "state" / "core-quota-card.json").unlink()
         with mock.patch.object(activity_rows, "append", side_effect=OSError("ro")):
             self.assertEqual(self.notice().hit("3:05 PM"), "quota-card")
         self.assertNotIn("roomed", self.record())
-        self.assertEqual(cqn.room_words("Codex", ""), "On hold: Codex has reached its usage limit (it does not say when "
-                         "that resets), so I can't answer until then. Your request is kept. Accounts are switched in "
-                         "my owner's direct message, not here.")
         with mock.patch("task_queue.pending_files", side_effect=OSError("gone")):
             self.assertEqual(cqn.room_tasks(self.ws), {})
+        self.assertFalse(cqn._room_task(tasks / "gone.txt", self.ws))
+
+    def test_the_rooms_words_are_the_local_agents_and_a_limit_with_no_reset_ends_by_itself(self):
+        sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
+        from ag2_sparrow import quota_notice
+        for reset in ("3:05 PM", ""):
+            self.assertEqual(cqn.room_words("Codex", reset), quota_notice.room_words("Codex", reset))
+        self.assertEqual(cqn.NO_RESET_S, quota_notice.NO_RESET_S)
+        at = 1_000_000.0
+        self.assertTrue(cqn.in_force({"since": at, "reset_at": at + 60}, at))
+        self.assertFalse(cqn.in_force({"since": at, "reset_at": at + 60}, at + 61))
+        self.assertTrue(cqn.in_force({"since": at - 10 ** 6, "seen": at}, at + cqn.NO_RESET_S))
+        self.assertFalse(cqn.in_force({"since": at}, at + cqn.NO_RESET_S + 1))
+        for rec in ({}, [], {"since": at, "why": cqn.SIGNED_OUT}):
+            self.assertFalse(cqn.in_force(rec, at))
+        self.notice().hit("")
+        self.assertEqual(self.record()["seen"], self.now[0])
 
     def test_no_reset_known_says_so(self):
         self.notice().hit()
