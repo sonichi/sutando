@@ -225,11 +225,30 @@ def launcher_refuses_an_undeterminable_folder() -> None:
         check(r.returncode == 1 and r.stdout == "", "j) its own folder unsearchable + no Python: refused")
     finally:
         workers.chmod(0o755)
+    workers.chmod(0o000)
+    try:
+        r = _resolve(core, WORKER, sys.executable)
+        check(r.returncode == 1 and r.stdout == "",
+              f"j) its own folder unsearchable + the real helper: refused, got {r.returncode} {r.stdout!r}")
+        # Python 3.14's Path.exists()/is_symlink() return False on an inaccessible path; act it out here.
+        from unittest import mock
+        with mock.patch.object(Path, "exists", lambda self, **k: False), \
+                mock.patch.object(Path, "is_symlink", lambda self: False):
+            try:
+                got = F.launch(core, WORKER)
+                check(False, f"j) launch() on an unsearchable workers' folder raises, not {got}")
+            except PermissionError:
+                check(True, "j) launch() on an unsearchable workers' folder raises, not the core's folder")
+    finally:
+        workers.chmod(0o755)
     gone = core.with_name(".claude-gone")
     gone.mkdir()
     r = _resolve(gone, WORKER, str(stub))
     check(r.returncode == 0 and r.stdout.strip() == str(gone),
           "j) no workers' folder at all, its parent searchable: confirmed missing, the core's folder")
+    r = _resolve(gone, WORKER, sys.executable)
+    check(r.returncode == 0 and r.stdout.strip() == str(gone),
+          "j) no workers' folder at all + the real helper: confirmed missing, the core's folder")
     top = core.parent / "locked-top"
     (top / ".claude").mkdir(parents=True)
     top.chmod(0o000)

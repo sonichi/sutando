@@ -165,9 +165,11 @@ def launch(core: "str | os.PathLike", worker_id: str) -> Path:
         own = folder(core, worker_id)
     except ValueError:
         return Path(core)
-    if not own.exists() and not own.is_symlink():
-        return Path(core)
-    return ensure(core, worker_id)
+    try:
+        os.lstat(own)                # exists()/is_symlink() read a permission error as "absent"
+    except FileNotFoundError:
+        return Path(core)            # confirmed missing: the shared default
+    return ensure(core, worker_id)   # any other lookup error propagates: refused, never the core's
 
 
 def main(argv) -> int:
