@@ -35,6 +35,7 @@ class DesignAClaimBackend:
     (declared) as the administrative-destruction mechanism."""
 
     persists_receipt_metadata = True   # record_delivered() stores both
+    refuses_claims = False
     persists_provider_ref = True       # ...and the provider's reference (an event id)
     records_source_digest = True       # publish(source_ready_sha256=) persists the source
     records_lifecycle = True           # publish(lifecycle=) persists the claim the item was published under
