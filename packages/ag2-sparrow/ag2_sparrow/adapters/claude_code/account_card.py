@@ -38,6 +38,9 @@ RUNTIME = "claude"
 STATUS_WAIT_S = 10.0     # asked inside the claim: an answer the card cannot wait for reads as unknown
 ASKS = ("/account", "/login")
 WHERE = account_switch.elsewhere(NAME) + " The sign-in code goes into the card there, never into this chat."
+# A "Switch account" tap with saved accounts to offer: they are the card's "Use" buttons.
+PICK = ("Tap an account below to switch to it. Another account needs one sign-in on the computer that runs %s."
+        % NAME)
 _run = subprocess.run       # Claude Code's own `auth status`, the one command this card runs
 
 # The desktop app's saved accounts for this agent, and the request/answer files it watches in the config dir.
@@ -244,6 +247,14 @@ class AccountCard(account_switch.AccountSwitch):
         controls, so opened on the agent's computer it is the account card again. Nothing is started here.
         A saved account's key: ask the app to switch to it (`use`)."""
         if verb == "switch":
+            # From the phone (owner 11-27): the accounts this agent can switch to here are offered in place, a
+            # tap away; only with none is the owner sent to the computer, where a sign-in takes its code.
+            if self.offers():
+                text, refused = self.status()
+                self.say(sent.get("channel_id"), self.card("pending", "%s %s" % (text, PICK), ask=True,
+                                                           signed_out=refused),
+                         result_file, card_desk.tapped_event(sent))
+                return "account-picks"
             self.say(sent.get("channel_id"), account_switch.with_controls(self.card("info", WHERE), RUNTIME),
                      result_file, card_desk.tapped_event(sent))
             return "account-where"

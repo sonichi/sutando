@@ -614,11 +614,26 @@ class RemoteCardTest(Home, CardWorld, unittest.TestCase):
         self.assertEqual(metrics(self.work)[-1]["card"], "account-not-started")
         self.assertEqual(self.calls(), [])
 
+    def test_switch_account_on_the_phone_is_the_device_code_sign_in_and_never_opens_a_browser(self):
+        # Owner 11-27: "Switch account" tapped on the phone opened a browser on the Mac, which nobody there
+        # could finish. It now shows the link and one-time code on the card, as "Add account" does.
+        self.mode("hang")
+        opened = []
+        with mock.patch.object(cc, "open_page", side_effect=lambda url: opened.append(url) or True):
+            self.assertEqual(self.tap("task-switch", self.ask("$card1"), "Switch account", "$card1"),
+                             account_switch.ANSWERED)
+        ((_, shown),) = self.posted("$card1")
+        self.assertEqual((shown["id"], shown["state"]), (dl.DEVICE_CARD, "pending"))
+        self.assertIn("open the sign-in page at auth.openai.com", shown["text"])
+        self.assertEqual(metrics(self.work)[-1]["card"], "account-device-started")
+        self.assertEqual(opened, [], "no browser on this computer")
+        self.assertTrue(self.dir.exists(), "the device sign-in is running")
+
     def test_switch_account_on_this_computer_ends_a_device_sign_in(self):
         self.mode("hang")
         self.tap("task-add", self.ask("$card1"), "Add account", "$card1")
         self.posted("$card1")
-        with mock.patch.object(cc, "open_page", return_value=True):
+        with mock.patch.object(cc, "SWITCH_ANYWHERE", False), mock.patch.object(cc, "open_page", return_value=True):
             self.tap("task-switch", self.ask("$card2"), "Switch account", "$card2")
         self.assertFalse(self.dir.exists())
         self.assertTrue(self.stub_gone())

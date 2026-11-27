@@ -106,6 +106,8 @@ class AccountSwitch:
         # `remote`: a connector's sign-in the owner finishes on another device ("Add account", "Sign out"),
         # set by that connector after it makes the card; None offers neither.
         self.remote = None
+        # `switch_anywhere`: "Switch account" starts `remote`'s sign-in too, never the browser on this computer.
+        self.switch_anywhere = False
         self.state_dir, self.bridge_state, self.name, self.runtime = state_dir, bridge_state, name, runtime
         # `lapsed()`: the runtime itself refused this login (unauthorized even after a restart), not merely read
         # no account; asked again on every card, so an earlier answer is never carried into a later one.
@@ -218,6 +220,11 @@ class AccountSwitch:
         is checked, and its card built, before anything is opened or kept: a page that is not a plain
         https address is given up at once, so a retry cannot open a browser again and again."""
         room, tapped = str(sent.get("channel_id") or ""), card_desk.tapped_event(sent)
+        # A tap does not say which device it came from, and a browser sign-in only finishes on this computer: a
+        # connector that sets `switch_anywhere` switches with its sign-in finished on any device (owner 11-27:
+        # "Switch account" on the phone opened a browser on the Mac and nothing could be done there).
+        if self.remote is not None and self.switch_anywhere and verb == "switch":
+            verb = "add"
         if self.remote is not None and verb in ("add", "use", "discard", "signout"):
             return self.remote.tapped(verb, sent, result_file)
         if verb != "switch":

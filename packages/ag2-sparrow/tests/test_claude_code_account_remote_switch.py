@@ -106,6 +106,20 @@ class Remote(Base):
 
 
 class Offer(Remote):
+    def test_switch_account_from_the_phone_offers_the_saved_accounts_in_place(self):
+        # Owner 11-27 (claude-code-2 on her phone): "Switch account" only said to open the computer, though
+        # this Mac had other accounts saved for it. With accounts to offer, the card shows them in place.
+        self.posted()
+        rc, out = self.tap("task-s", "Switch account")
+        self.assertIn("(account-picks)", out["refused"])
+        queued, = self.queued()
+        self.assertEqual(queued.get("edit"), "$acct", "in place of the card tapped")
+        card = queued["card"]
+        self.assertEqual([b["label"] for b in card["buttons"]], ["Use " + A, "Use " + B, "Switch account"])
+        self.assertIn(ac.PICK, card["text"])
+        self.assertNotIn("Open this on the computer", card["text"])
+        self.assertFalse(self.request().exists(), "nothing is switched until an account is tapped")
+
     def test_the_card_offers_each_other_saved_account_by_address_sorted_and_not_the_one_in_use(self):
         card = self.posted()
         self.assertEqual([b["label"] for b in card["buttons"]], ["Use " + A, "Use " + B, "Switch account"])

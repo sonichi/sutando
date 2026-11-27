@@ -248,6 +248,9 @@ def limit_reset(snapshot, now=None) -> "float | None":
     return max(found) if found else None
 
 
+# "Switch account" from the owner's phone: the device-code sign-in (link and one-time code on the card), which
+# finishes on any device; the browser sign-in only finishes on this computer (owner 11-27).
+SWITCH_ANYWHERE = True
 USAGE_READ_S = 10.0     # `account/rateLimits/read`: a usage read before a card ask waits no longer than this
 
 
@@ -522,6 +525,7 @@ class Connector:
             # "Add account" from the owner's phone: Codex's device-code sign-in, run by its own CLI here.
             self._accounts.remote = device_login.Remote(self._accounts, self.args.state, self.root,
                                                         getattr(self.args, "codex", "codex"), child_env(), log)
+            self._accounts.switch_anywhere = SWITCH_ANYWHERE
         return self._accounts
 
     @property
