@@ -248,6 +248,9 @@ KNOWN_HEADER_KEYS = (
     # AgentTrigger context (vocabulary: agent_triggers.py). Bridge-written above task:,
     # so the guard defangs forged body copies.
     "event_type", "agent_trigger_id", "playbook",
+    # The room a voice call was docked in, on its session-end task. Metadata only: no
+    # bridge routes on it, so the task's result is delivered as an undocked one.
+    "voice_room_id",
     # The broker's handle for the window the owner messaged from; the agent passes it to the
     # ui_* MCP tools. Bridge-written above task:, so the guard defangs a forged body copy.
     "ui_origin",
