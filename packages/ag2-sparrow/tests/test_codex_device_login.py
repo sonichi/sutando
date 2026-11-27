@@ -470,7 +470,8 @@ class RemoteCardTest(Home, CardWorld, unittest.TestCase):
         self.mode("ok bob@example.org")
         card = self.ask("$card1")
         self.assertEqual([(b["label"], b.get("command")) for b in card["buttons"]],
-                         [("Switch account", "card:account:agent:switch"), ("Add account", "card:account:agent:add")])
+                         [("Switch account", "card:account:agent:switch"), ("Add account", "card:account:agent:add"),
+                          (account_switch.HERE_LABEL, "card:account:agent:here")])
         self.assertEqual(self.tap("task-add", card, "Add account", "$card1"), account_switch.ANSWERED)
         outbox = self.bridge.joinpath(*connector_cards.OUTBOX)
         self.assertEqual({oct(p.stat().st_mode & 0o777) for p in outbox.iterdir()} | {oct(outbox.stat().st_mode & 0o777)},
@@ -629,6 +630,23 @@ class RemoteCardTest(Home, CardWorld, unittest.TestCase):
         self.assertEqual(opened, [], "no browser on this computer")
         self.assertNotIn("on the computer", shown["text"], "never sent to the computer")
         self.assertTrue(self.dir.exists(), "the device sign-in is running")
+
+    def test_a_device_code_that_cannot_start_leaves_the_sign_in_on_this_computer_one_tap_away(self):
+        # Review of #6905: with "Switch account" as device code, the browser sign-in stays reachable by name.
+        (self.user / ".codex").mkdir()
+        (self.user / ".codex" / "stub-account").write_text("alice@example.com")
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(self.user / ".codex")}):
+            self.tap("task-switch", self.ask("$card1"), "Switch account", "$card1")
+        ((_, refused),) = self.posted("$card1")
+        self.assertEqual(refused["state"], "error")
+        self.assertEqual(metrics(self.work)[-1]["card"], "account-not-started")
+        labels = [b["label"] for b in refused["buttons"]]
+        self.assertIn(account_switch.HERE_LABEL, labels, "the way that does not need device code")
+        opened = []
+        with mock.patch.object(cc, "open_page", side_effect=lambda url: opened.append(url) or True):
+            self.tap("task-here", self.ask("$card2"), account_switch.HERE_LABEL, "$card2")
+        self.assertEqual(metrics(self.work)[-1]["card"], "account-started")
+        self.assertEqual(len(opened), 1, "the browser sign-in on this computer, asked for by name")
 
     def test_switch_account_on_this_computer_ends_a_device_sign_in(self):
         self.mode("hang")

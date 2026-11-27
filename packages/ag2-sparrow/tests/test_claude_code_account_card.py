@@ -140,7 +140,8 @@ class Account(Base):
         self.assertEqual(queued.get("edit"), "$acct", "shown in place of the card tapped, not as a second card")
         self.assertNotIn(account_card.account_switch.elsewhere(account_card.NAME), card["text"])
         self.assertNotIn("Open this on the computer", card["text"])
-        self.assertIn(account_card.NONE_HERE, card["text"])
+        # This agent's dir is the core's: the card says why nothing can be switched here, not "none saved".
+        self.assertIn("No account can be switched here:", card["text"])
         self.assertEqual([b["label"] for b in card["buttons"]], ["Switch account"])
         self.assertFalse(any("login" in " ".join(argv) for argv, _ in self.runs), "no sign-in is started")
 

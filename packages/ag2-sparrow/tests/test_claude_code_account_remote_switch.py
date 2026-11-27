@@ -106,6 +106,17 @@ class Remote(Base):
 
 
 class Offer(Remote):
+    def test_with_only_the_account_in_use_saved_the_card_says_none_and_offers_none(self):
+        # Review of #6905: the words and the buttons come from one reading, taken after the account in use.
+        self.index(self.appdata, {ac.saved_key(SARAH): SARAH})
+        self.posted()
+        rc, out = self.tap("task-s1", "Switch account")
+        self.assertIn("(account-none-here)", out["refused"])
+        card = self.queued()[-1]["card"]
+        self.assertIn(ac.NONE_HERE, card["text"])
+        self.assertNotIn(ac.PICK, card["text"])
+        self.assertFalse([b for b in card["buttons"] if b["label"].startswith("Use ")])
+
     def test_switch_account_from_the_phone_offers_the_saved_accounts_in_place(self):
         # Owner 11-27 (claude-code-2 on her phone): "Switch account" only said to open the computer, though
         # this Mac had other accounts saved for it. With accounts to offer, the card shows them in place.

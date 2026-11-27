@@ -22,6 +22,8 @@ import uuid
 from . import card_ask, card_desk, connector_cards
 
 FILE, CARD = "account.json", "account-switch"
+# "Switch account" by the browser on this computer, where `switch_anywhere` makes Switch the device-code one.
+HERE, HERE_LABEL = "here", "Sign in on this computer"
 # A card with no "Switch account" button is not the account card: recorded under its id it would retire
 # that card (one live card per id and room) while the owner still sees its button.
 NOTE = "account-switch-status"
@@ -176,6 +178,10 @@ class AccountSwitch:
             if self.remote is not None:
                 buttons.append(agent_card.button("Add account", "reply", reply="Add account",
                                                  command=agent_card.reply("account", "agent", "add")))
+            if self.remote is not None and self.switch_anywhere:
+                # The browser sign-in, asked for by name: on this computer only, and the way when device code fails.
+                buttons.append(agent_card.button(HERE_LABEL, "reply", reply=HERE_LABEL,
+                                                 command=agent_card.reply("account", "agent", HERE)))
         if url:
             buttons.append(agent_card.button("Open sign-in page", "url", url=url))
         built = agent_card.build(CARD if ask else NOTE, state, title="Account", body="Account of %s" % self.name,
@@ -224,6 +230,8 @@ class AccountSwitch:
         # opened the Mac's browser): `switch_anywhere` switches with the sign-in finished on any device.
         if self.remote is not None and self.switch_anywhere and verb == "switch":
             verb = "add"
+        elif verb == HERE:
+            verb = "switch"     # the browser sign-in on this computer, by name
         if self.remote is not None and verb in ("add", "use", "discard", "signout"):
             return self.remote.tapped(verb, sent, result_file)
         if verb != "switch":
