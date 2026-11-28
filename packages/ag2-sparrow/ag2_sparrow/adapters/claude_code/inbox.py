@@ -474,16 +474,16 @@ def claim(root, task_id) -> dict:
             if kind is None:
                 outcome = lc.complete_without_call(task_id, refusal_body(root, headers), why)
                 raise Refused("%s not admitted (%s); the owner-only refusal is %s" % (task_id, why, outcome))
+            # While the session started with the room tools runs on (or its mark cannot be read), nobody but the
+            # owner is served: not in it, and not by a turn started beside it, nor by a card, whatever the install allows.
+            if kind != task_io.OWNER and tools_generation(root, generation) is not False:
+                outcome = lc.complete_without_call(task_id, refusal_body(root, headers), TOOLS_SESSION_LIVE)
+                raise Refused("%s not admitted (%s); the owner-only refusal is %s" % (task_id, TOOLS_SESSION_LIVE, outcome))
             carded, body = card_matter(root, task_id)
             if carded:
                 # A tap on the model card, or the owner's /model: answered here, never submitted to the session.
                 outcome = lc.complete_without_call(task_id, body, "card: %s" % carded)
                 raise Refused("%s answered by its card (%s); its answer is %s" % (task_id, carded, outcome))
-            # While the session started with the room tools runs on (or its mark cannot be read), nobody but the
-            # owner is served: not in it, and not by a turn started beside it, whatever the install now allows.
-            if kind != task_io.OWNER and tools_generation(root, generation) is not False:
-                outcome = lc.complete_without_call(task_id, refusal_body(root, headers), TOOLS_SESSION_LIVE)
-                raise Refused("%s not admitted (%s); the owner-only refusal is %s" % (task_id, TOOLS_SESSION_LIVE, outcome))
             outside = kind == task_io.RESTRICTED
             try:
                 attempt = lc.prepare(task_id, INTERRUPTED_BODY, mode=lifecycle.LOCAL, generation=generation)

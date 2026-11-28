@@ -754,6 +754,20 @@ class OnlyTheOwnersSessionHasRoomTools(ConnectBase):
         rc, out = self.claim("task-o", "owner")
         self.assertEqual((rc, out.get("admission")), (0, "owner"), "the owner is still served: %s" % out)
 
+    def test_a_refused_non_owner_never_reaches_the_card_handling(self):
+        self.with_tools()
+        self.loosen()
+        with mock.patch.object(inbox, "card_matter", side_effect=AssertionError("card handling was entered")) as card:
+            for i, (tier, extra) in enumerate((("team", "collaborator: true\n"), ("team", ""), ("guest", ""))):
+                rc, out = self.claim("task-k%d" % i, tier, extra)
+                self.assertEqual(rc, 1, out)
+                self.assertIn(inbox.TOOLS_SESSION_LIVE, out["refused"])
+            card.assert_not_called()
+        with mock.patch.object(inbox, "card_matter", return_value=("", "")) as card:
+            rc, out = self.claim("task-o", "owner")
+            self.assertEqual((rc, out.get("admission")), (0, "owner"), out)
+            card.assert_called_once()
+
     def test_once_the_tools_session_is_gone_the_usual_non_owner_flow_is_back(self):
         self.with_tools()
         self.loosen()
