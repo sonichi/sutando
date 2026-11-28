@@ -368,7 +368,8 @@ class CollaboratorTurnsGetNoRoomTools(ConnectBase):
         return forward is not None, (json.loads(reply)["error"]["message"] if reply else "")
 
     def test_an_owner_turn_calls_the_tools_and_a_collaborator_turn_is_refused_at_the_shim(self):
-        self.assertEqual(self.call(), (True, ""), "nothing in flight: the owner at the session")
+        self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_NO_OWNER),
+                         "nothing in flight: finding no collaborator is not the owner's authorization")
         rc, out = self.claim("task-o", "owner")
         self.assertEqual((rc, out.get("admission")), (0, "owner"), out)
         self.assertEqual(inbox.room_tools_refusal(self.root), "")
@@ -381,24 +382,35 @@ class CollaboratorTurnsGetNoRoomTools(ConnectBase):
         self.assertEqual((forwarded, why), (False, inbox.ROOM_TOOLS_OWNER_ONLY),
                          "the same session, the same granted tool: refused while the collaborator's task is in flight")
 
-        # Its task answered (the file archived, the claim settled): the owner's turns call the tools again.
+        # Its task answered (the claim settled): the owner's turn, still in flight, calls the tools again.
         lc = inbox._lifecycle(self.root)
-        rec = lc.claims.load("task-c")
-        lc.claims.save(dict(rec, phase=lifecycle.SETTLED))
+        lc.claims.save(dict(lc.claims.load("task-c"), phase=lifecycle.SETTLED))
         self.assertEqual(self.call(), (True, ""))
+        # And once the owner's own task is answered, nothing authorizes a call any more.
+        lc.claims.save(dict(lc.claims.load("task-o"), phase=lifecycle.PUBLISHED))
+        self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_NO_OWNER))
+
+    def test_a_collaborator_alone_is_refused_as_a_collaborator_not_as_no_owner(self):
+        rc, out = self.claim("task-c", "team", "collaborator: true\n")
+        self.assertEqual((rc, out.get("admission")), (0, "collaborator"), out)
+        self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_OWNER_ONLY))
 
     def test_a_restricted_senders_isolated_turn_does_not_close_the_owners_tools(self):
         stub = write_isolated_stub(self.home)
         self.configure(CLAUDE=str(stub), MCP_PROXY_COMMAND=PROXY, TOKEN_ENV_FILE=token_file(self.home), AGENT_ID=AGENT)
         rc, out = self.claim("task-g", "guest")
         self.assertEqual(rc, 1, out)
-        self.assertEqual(self.call(), (True, ""), "it never runs in the session")
+        self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_NO_OWNER), "a restricted sender authorizes nothing")
+        rc, out = self.claim("task-o", "owner")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.call(), (True, ""), "and its isolated turn never closes the owner's own")
 
     def test_what_cannot_be_checked_refuses(self):
         rc, out = self.claim("task-c", "team", "collaborator: true\n")
         self.assertEqual(rc, 0, out)
         (self.inbox / "task-c.txt").unlink()
-        self.assertEqual(inbox.room_tools_refusal(self.root), "", "a task file already gone is an answered task")
+        self.assertEqual(inbox.room_tools_refusal(self.root), inbox.ROOM_TOOLS_NO_OWNER,
+                         "a task file already gone is an answered task: not a collaborator's turn, and no owner's")
         (self.inbox / "task-c.txt").mkdir()
         self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_UNREAD))
         (self.inbox / "task-c.txt").rmdir()
@@ -411,6 +423,8 @@ class CollaboratorTurnsGetNoRoomTools(ConnectBase):
             with contextlib.redirect_stdout(out):
                 rc = cli.main(["inbox", "--root", self.root, "room-tools"])
             return rc, json.loads(out.getvalue())
+        self.assertEqual(verb(), (0, {"allowed": False, "why": inbox.ROOM_TOOLS_NO_OWNER}))
+        self.claim("task-o", "owner")
         self.assertEqual(verb(), (0, {"allowed": True, "why": ""}))
         self.claim("task-c", "team", "collaborator: true\n")
         self.assertEqual(verb(), (0, {"allowed": False, "why": inbox.ROOM_TOOLS_OWNER_ONLY}))

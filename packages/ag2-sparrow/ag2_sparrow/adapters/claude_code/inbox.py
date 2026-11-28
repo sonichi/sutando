@@ -682,22 +682,24 @@ def inflight(root) -> dict:
 
 ROOM_TOOLS_OWNER_ONLY = ("the AG2 Space tools are the owner's: a collaborator's task is in flight in this session, so "
                          "no room tool is called until it is answered")
+ROOM_TOOLS_NO_OWNER = "no task of the owner's is in flight in this session, so no room tool is called"
 ROOM_TOOLS_NO_SESSION = "no live session holds this root, so no room tool is called"
 ROOM_TOOLS_UNREAD = "a claimed task could not be read, so no room tool is called"
 
 
 def room_tools_refusal(root) -> str:
-    """Why a room-tool call is refused right now, '' when it may go on. The owner and attested collaborators share
-    the one session, so its tools cannot be granted per sender: while any collaborator's task of the live
-    generation is claimed and not yet published or settled, no call is forwarded (the name shim's turn gate runs
-    `inbox room-tools` before every `tools/call`). A claim or task that cannot be read refuses; a task file
-    already gone is an answered task. Read under claims.lock, changing nothing."""
+    """Why a room-tool call is refused right now, '' when it may go on (the name shim's turn gate runs
+    `inbox room-tools` before every `tools/call`). A call needs the owner's own authorization, read from the
+    claims: a task of the owner's (its attested tier) claimed by the live generation and not yet published or
+    settled. Finding no collaborator is not that: with no owner task in flight, every call is refused. The
+    session is shared, so a collaborator's task in flight refuses too, whatever else is. A claim or task that
+    cannot be read refuses; a task file already gone is an answered task. Read under claims.lock, changing nothing."""
     lc = _lifecycle(root)
     try:
         generation = _generation(root)
     except Refused:
         return ROOM_TOOLS_NO_SESSION
-    live = (generation["pid"], generation.get("start"))
+    live, owner = (generation["pid"], generation.get("start")), False
     with records.flocked(records.claims_lock_path(root)):
         for task_id in lc.claims.ids():
             try:
@@ -714,9 +716,11 @@ def room_tools_refusal(root) -> str:
                 continue
             except OSError:
                 return ROOM_TOOLS_UNREAD
-            if task_io.turn_policy(headers, True, True).kind == task_io.COLLABORATOR:
+            kind = task_io.turn_policy(headers, True, True).kind
+            if kind == task_io.COLLABORATOR:
                 return ROOM_TOOLS_OWNER_ONLY
-    return ""
+            owner = owner or kind == task_io.OWNER
+    return "" if owner else ROOM_TOOLS_NO_OWNER
 
 
 def room_tools(root) -> dict:
