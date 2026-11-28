@@ -8,7 +8,10 @@ request first and echoes the decision; `[[stall]]` never completes until
 limit (a used-up rate-limit window, an `error` notification, the turn's codexErrorInfo); `[[limit-bare]]` the
 same with no rate-limit window; `[[limit-words]]` fails it on another error whose words speak of a usage limit;
 `[[noaccess]]` fails a turn that names no model as one the account cannot run; `[[fail]]` fails it on another error. A refused turn ends with no item, unless `[[worked]]` is there too: then a
-reasoning item and part of a reply come first.
+reasoning item and part of a reply come first. A prompt that opens with the shared thread's lead paragraph
+(`[shared thread] This turn is from room R, sent by S (access_tier=T, ...`) is echoed from the line after that
+paragraph, with ` room=R from=S tier=T` added, so a test sees which room and sender each turn named.
+`[[history]]` adds ` history=[...]`: the thread's earlier turns, after a `carried:<id>` item when it was resumed.
 
 `thread/resume` fails for a thread id starting `stale-`, never answers for `hang-`, and fails for `nomcp-` only
 when its config adds `mcp_servers` (a runtime refusing that override at resume). `[[toolcall]]` records an
@@ -26,6 +29,7 @@ once a turn is sent, and on every thread start or resume while `stub-touch-on-th
 """
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -171,7 +175,10 @@ for line in sys.stdin:
             continue
         if meth == "thread/resume" and tid.startswith("hang-"):
             continue   # never answers: the client's timeout must fall back
+        # A thread resumed from disk holds the conversation saved there: one "carried:<id>" item stands for it.
+        seed = ["carried:" + tid] if meth == "thread/resume" else []
         THREADS[tid] = {"cwd": p.get("cwd", "/"), "params": p, "emptied": THREADS.get(tid, {}).get("emptied"),
+                        "history": THREADS.get(tid, {}).get("history", seed),
                         "items": THREADS.get(tid, {}).get("items", [])}
         send({"jsonrpc": "2.0", "id": rid, "result": {"thread": thread_obj(tid), "model": p.get("model") or "stub-model",
                                                       "modelProvider": "stub", "cwd": THREADS[tid]["cwd"],
@@ -192,11 +199,15 @@ for line in sys.stdin:
         text = next((i.get("text", "") for i in p.get("input", []) if i.get("type") == "text"), "")
         if "[[touch-login]]" in text:
             home_file("auth.json", " ")          # the login switched after this turn was sent
+        lead = re.match(r"\[shared thread\] This turn is from room (\S+), sent by (.+?) \(access_tier=(\w+)", text)
+        said = text.split("\n\n", 1)[1] if lead and "\n\n" in text else text
         tp = THREADS[tid]["params"]
         # The echo names the thread's settings, so a test can pin sandbox and lifetime; the cwd is the
         # turn's own when the turn carries one (the turn/start override), else the thread's.
-        reply = "STUB echo: " + (text.strip().split("\n")[0][:80]) + " [sandbox=%s ephemeral=%s cwd=%s]" % (
+        reply = "STUB echo: " + (said.strip().split("\n")[0][:80]) + " [sandbox=%s ephemeral=%s cwd=%s]" % (
             tp.get("sandbox"), tp.get("ephemeral"), p.get("cwd", tp.get("cwd")))
+        if lead:
+            reply += " room=%s from=%s tier=%s" % lead.groups()
         if p.get("model"):
             reply += " model=%s" % p["model"]
         if "[[askmodel]]" in text:
@@ -207,7 +218,9 @@ for line in sys.stdin:
             THREADS[tid]["items"].append({"type": "mcpToolCall", "server": "ag2-space", "tool": "room_list",
                                           "result": "TOOL-RESULT-" + turn_id[:8]})
         if "[[history]]" in text:
-            reply += " thread=%s history=%s" % (tid, json.dumps(THREADS[tid]["items"], sort_keys=True))
+            reply += " thread=%s history=%s items=%s" % (tid, json.dumps(THREADS[tid]["history"]),
+                                                         json.dumps(THREADS[tid]["items"], sort_keys=True))
+        THREADS[tid]["history"].append(said.strip().split("\n")[0][:80])
         if "[[config]]" in text:      # what the thread was started with, for a test to pin its overrides
             reply += " config=" + json.dumps(tp.get("config"), sort_keys=True)
         if "[[empty]]" in text:

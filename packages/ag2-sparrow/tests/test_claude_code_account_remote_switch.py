@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""claude-local's account card: "Use <address>" for each account the app saved, a tap's 0600 switch request,
+"""claude-local's account card: one "Account" menu of the accounts the app saved, a tap's 0600 switch request,
 and the app's answer (or silence) shown in place of the card. Stub CLI and a fake app only."""
 from __future__ import annotations
 
@@ -27,6 +27,21 @@ from ag2_sparrow.adapters.claude_code import account as accounts, account_card a
 AGENT = "@bot:s.space"
 A, B, SARAH = "ann@example.com", "bob@example.com", "sarah@example.com"
 CARD = ac.account_switch.CARD
+ADD = ac.ADD_LABEL
+
+
+def menu(card):
+    """The card's "Account" menu as [(label, reply, command, disabled)]; [] for none."""
+    rows = [r for g in card.get("groups") or [] for r in g["rows"] if r["title"] == "Account"]
+    if not rows:
+        return []
+    act, = rows[0]["actions"]
+    assert act["kind"] == "menu"
+    return [(i["label"], i["reply"], i.get("command", ""), i.get("disabled", False)) for i in act["items"]]
+
+
+def labels(card):
+    return [i[0] for i in menu(card)]
 
 
 class Remote(Base):
@@ -106,27 +121,85 @@ class Remote(Base):
 
 
 class Offer(Remote):
-    def test_the_card_offers_each_other_saved_account_by_address_sorted_and_not_the_one_in_use(self):
-        card = self.posted()
-        self.assertEqual([b["label"] for b in card["buttons"]], ["Use " + A, "Use " + B, "Switch account"])
-        self.assertEqual(card["buttons"][0]["command"], "card:account:agent:" + ac.saved_key(A))
-        self.assertEqual(card["buttons"][0]["reply"], "Use " + A, "the plan suffix is never shown")
+    def test_with_only_the_account_in_use_saved_the_card_says_none_and_offers_none(self):
+        # Review of #6905: the words and the buttons come from one reading, taken after the account in use.
+        self.index(self.appdata, {ac.saved_key(SARAH): SARAH})
+        self.posted()
+        rc, out = self.tap("task-s1", "Switch account")
+        self.assertIn("(account-none-here)", out["refused"])
+        card = self.queued()[-1]["card"]
+        self.assertIn(ac.NONE_HERE, card["text"])
+        self.assertNotIn(ac.PICK, card["text"])
+        self.assertEqual(labels(card), ["✓ " + SARAH, ADD], "only the one in use and Add account")
+        self.assertEqual([b["label"] for b in card["buttons"]], ["Switch account"])
 
-    def test_at_most_five_accounts_are_offered_and_all_when_the_account_in_use_is_unknown(self):
+    def test_switch_account_from_the_phone_offers_the_saved_accounts_in_place(self):
+        # Owner 11-27 (claude-code-2 on her phone): "Switch account" only said to open the computer, though
+        # this Mac had other accounts saved for it. With accounts to offer, the card shows them in place.
+        self.posted()
+        rc, out = self.tap("task-s", "Switch account")
+        self.assertIn("(account-picks)", out["refused"])
+        queued, = self.queued()
+        self.assertEqual(queued.get("edit"), "$acct", "in place of the card tapped")
+        card = queued["card"]
+        self.assertEqual([b["label"] for b in card["buttons"]], ["Switch account"])
+        self.assertEqual(labels(card), ["✓ " + SARAH, A, B, ADD])
+        self.assertIn(ac.PICK, card["text"])
+        self.assertNotIn("Open this on the computer", card["text"])
+        self.assertNotIn(ac.account_switch.elsewhere(ac.NAME), card["text"])
+        self.assertFalse(self.request().exists(), "nothing is switched until an account is tapped")
+
+    def test_the_card_has_one_account_menu_the_one_in_use_checked_the_others_sorted_and_add_account(self):
+        # Owner 11-27: one dropdown, as the desktop shows it, in place of a row of "Use <address>" buttons.
+        card = self.posted()
+        self.assertEqual([b["label"] for b in card["buttons"]], ["Switch account"], "no Use buttons")
+        row, = [r for g in card["groups"] for r in g["rows"]]
+        self.assertEqual((row["title"], row["actions"][0]["label"]), ("Account", SARAH))
+        self.assertEqual(menu(card), [
+            ("✓ " + SARAH, "✓ " + SARAH, "", True),
+            (A, "Use " + A, "card:account:agent:" + ac.saved_key(A), False),
+            (B, "Use " + B, "card:account:agent:" + ac.saved_key(B), False),
+            (ADD, ADD, "card:account:agent:add", False)])
+        self.assertIsNone(ac.connector_cards._core()[0].problem(card))
+        _, issued = connector_cards._core()
+        offers = issued.offered(card)
+        self.assertEqual(offers["Use " + A], "card:account:agent:" + ac.saved_key(A), "menu items are offered")
+        self.assertEqual(offers[ADD], "card:account:agent:add")
+
+    def test_a_tap_on_a_menu_account_switches_as_the_use_button_did(self):
+        self.posted()
+        rc, out = self.tap("task-m", "Use " + B)
+        self.assertIn("(account-switching)", out["refused"])
+        self.assertEqual(json.loads(self.request().read_text())["key"], ac.saved_key(B))
+        queued = self.queued()[-1]
+        self.assertEqual((queued.get("edit"), queued["card"]["text"]), ("$acct", "Switching to %s…" % B))
+
+    def test_add_account_in_the_menu_says_where_to_sign_in_in_place(self):
+        self.posted()
+        rc, out = self.tap("task-add", ADD)
+        self.assertIn("(account-add)", out["refused"])
+        queued = self.queued()[-1]
+        self.assertEqual(queued.get("edit"), "$acct")
+        self.assertIn(ac.ADD, queued["card"]["text"])
+        self.assertFalse(self.request().exists())
+
+    def test_at_most_six_accounts_are_offered_and_all_when_the_account_in_use_is_unknown(self):
         many = {ac.saved_key("u%d@example.com" % i): "u%d@example.com" % i for i in range(8)}
         self.index(self.appdata, many)
         self.answer = {"loggedIn": False}
         card = self.posted()
-        self.assertEqual([b["label"] for b in card["buttons"]][:-1], ["Use u%d@example.com" % i for i in range(5)])
+        self.assertEqual(labels(card), ["u%d@example.com" % i for i in range(6)] + [ADD])
 
     def test_no_buttons_when_a_switch_here_would_be_refused(self):
         for over in ({"CLAUDE_CONFIG_DIR": ""}, {"CLAUDE_CONFIG_DIR": str(self.home / ".claude-sutando")}):
             self.configure(BRIDGE_STATE_DIR=str(self.bridge), AGENT_ID=AGENT, **over)
             card = self.posted()
             self.assertEqual([b["label"] for b in card["buttons"]], ["Switch account"], over)
+            self.assertEqual(menu(card), [], over)
         with mock.patch.dict(ac.os.environ, {accounts.PROXY_VAR: "http://localhost:7846"}):
             self.configure(BRIDGE_STATE_DIR=str(self.bridge), AGENT_ID=AGENT, CLAUDE_CONFIG_DIR=str(self.config))
-            self.assertEqual([b["label"] for b in self.posted()["buttons"]], ["Switch account"])
+            card = self.posted()
+            self.assertEqual(([b["label"] for b in card["buttons"]], menu(card)), (["Switch account"], []))
 
     def test_where_the_app_keeps_its_data(self):
         cfg = {"AGENT_ID": AGENT, "CLAUDE_CONFIG_DIR": str(self.config)}
@@ -279,7 +352,7 @@ class Tap(Remote):
         with mock.patch("ag2_sparrow.adapters.claude_code.cli.other_agents_dirs", side_effect=RuntimeError("x")):
             self.assertEqual(self.use_directly(CLAUDE_CONFIG_DIR=str(self.config)), "account-refused")
             self.assertEqual(self.queued()[-1]["card"]["text"], "Could not switch: " + ac.OTHERS_UNKNOWN)
-            self.assertNotIn("Use " + A, [b["label"] for b in self.posted("$x")["buttons"]], "fail closed: no buttons")
+            self.assertEqual(menu(self.posted("$x")), [], "fail closed: no menu")
         self.assertFalse(self.request().exists())
         from ag2_sparrow.adapters.claude_code import cli as cc
         with mock.patch.object(cc.os, "scandir", side_effect=OSError("x")), self.assertRaises(OSError):
@@ -295,7 +368,7 @@ class Tap(Remote):
             peer = root / "peers" / name
             peer.parent.mkdir(parents=True, exist_ok=True)
             make(peer)
-            self.assertEqual([b["label"] for b in self.posted("$p" + name)["buttons"]], ["Switch account"], name)
+            self.assertEqual(menu(self.posted("$p" + name)), [], name)
             self.assertEqual(self.use_directly("$u" + name, CLAUDE_CONFIG_DIR=str(self.config)), "account-refused", name)
             self.assertEqual(self.queued()[-1]["card"]["text"], "Could not switch: " + ac.OTHERS_UNKNOWN)
             self.assertFalse(self.request().exists())
@@ -318,7 +391,7 @@ class Tap(Remote):
         with self.assertRaises(PermissionError):
             cc.other_agents_dirs(cc.LOCAL, strict=True)
         self.assertEqual(cc.other_agents_dirs(cc.LOCAL), [str(self.home / "elsewhere")], "lenient: what it can")
-        self.assertEqual([b["label"] for b in self.posted("$h")["buttons"]], ["Switch account"])
+        self.assertEqual(menu(self.posted("$h")), [])
         self.assertEqual(self.use_directly("$hu", CLAUDE_CONFIG_DIR=str(self.config)), "account-refused")
         self.assertEqual(self.queued()[-1]["card"]["text"], "Could not switch: " + ac.OTHERS_UNKNOWN)
         self.assertFalse(self.request().exists())
@@ -414,6 +487,47 @@ class Tap(Remote):
         with mock.patch.object(rm, "_popen", side_effect=OSError("no fork")):
             self.assertEqual(self.use_directly(CLAUDE_CONFIG_DIR=str(self.config)), "account-switching")
         self.assertIn("won't confirm here", self.queued()[-1]["card"]["text"])
+
+
+class OwnJob(Remote):
+    """Owner 11-27: every "Switch account" was refused as "shares its Claude config dir with another agent". An
+    agent's own job keeps its config under agents/<key>/, and that config was read as another agent's."""
+
+    def own(self, agent, config_dir):
+        """`agent` installed as its own job, on `config_dir`: the config that job runs with."""
+        from ag2_sparrow.adapters.claude_code import cli as cc
+        path = cc.cm.config_path(cc.cm.for_key(cc.LOCAL, cc.cm.agent_key(agent)))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(cli.render_config(dict(self.base, AGENT_ID=agent, CLAUDE_CONFIG_DIR=str(config_dir))))
+        return cli.read_config(path)
+
+    def setUp(self):
+        super().setUp()
+        self.base = self.cfg()
+        cli.config_path().unlink()      # no single-agent job: every agent here has its own
+
+    def test_an_agent_installed_as_its_own_job_switches_in_its_own_folder(self):
+        cfg = self.own(AGENT, self.config)
+        self.assertEqual(ac.config_dir_for_switch(cfg), str(self.config), "its own config is not another agent's")
+        # Another agent on a folder of its own changes nothing.
+        elsewhere = self.home / "another-agents-claude"
+        elsewhere.mkdir()
+        self.own("@other:s.space", elsewhere)
+        self.assertEqual(ac.config_dir_for_switch(cfg), str(self.config))
+
+    def test_two_agents_that_really_share_one_folder_are_refused(self):
+        cfg = self.own(AGENT, self.config)
+        self.own("@other:s.space", self.config)
+        with self.assertRaises(accounts.Refused) as refused:
+            ac.config_dir_for_switch(cfg)
+        self.assertEqual(str(refused.exception), accounts.ANOTHER_AGENTS)
+
+    def test_an_agent_served_by_two_jobs_is_refused_as_not_known(self):
+        cfg = self.own(AGENT, self.config)
+        cli.config_path().write_text(cli.render_config(self.base))      # the older single job names it too
+        with self.assertRaises(accounts.Refused) as refused:
+            ac.config_dir_for_switch(cfg)
+        self.assertEqual(str(refused.exception), ac.OTHERS_UNKNOWN, "which config is its own cannot be told")
 
 
 class Watch(Remote):

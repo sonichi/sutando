@@ -534,6 +534,24 @@ class Install(Base):
         self.assertEqual(rc, 0, err)
         self.assertEqual(cm.read_config(cli.config_path())["RESUME_THREAD"], thread, "matched and kept lowercase")
 
+    def test_an_install_that_serves_anyone_but_the_owner_is_told_it_gets_no_tools(self):
+        engine = self.home / "Application Support" / "engine"   # a space in the path, as the desktop's
+        engine.mkdir(parents=True)
+        node = engine / "node"
+        node.write_text("#!/bin/sh\n")
+        node.chmod(0o755)
+        proxy = shlex.join([str(node), str(engine / "ag2-mcp-proxy.mjs")])
+        runner = self.runner()
+        for flags in ((), ("--no-allow-collaborator",), ("--allow-collaborator", "--no-allow-non-owner"),
+                      ("--sandbox", "workspace-write")):
+            rc, out, err = self.install_with(runner, False, "--mcp-proxy-command", proxy, *flags)
+            self.assertEqual(rc, 0, out + err)
+            self.assertIn("NOTE mcp: turns get no AG2 Space tools while anyone but the owner is served", out, flags)
+        rc, out, err = self.install_with(runner, False, "--mcp-proxy-command", proxy, "--no-allow-collaborator",
+                                         "--no-allow-non-owner")
+        self.assertEqual(rc, 0, out + err)
+        self.assertNotIn("while anyone but the owner is served", out)
+
     def test_mcp_proxy_command_is_checked_recorded_listed_and_handed_on_with_the_token_file(self):
         engine = self.home / "Application Support" / "engine"   # a space in the path, as the desktop's
         engine.mkdir(parents=True)
@@ -1088,7 +1106,7 @@ class VerifyUninstall(Base):
             rc, out, err = self.main("uninstall")
         self.assertEqual(rc, 0, err)
         self.assertFalse(unit.exists() or cli.config_path().exists())
-        self.assertIn(f"kept: {self.relay} (Sparrow's token) and the Codex login (CODEX_HOME) and the work root with state/threads", out)
+        self.assertIn(f"kept: {self.relay} (Sparrow's token) and the Codex login (CODEX_HOME) and the work root with state/thread, the shared thread's id", out)
         self.assertEqual(self.relay.read_text(), f"REMOTE_TASK_TOKEN={TOKEN}\n")
         self.assertTrue(self.codex_home.is_dir() and (self.work / "tasks").is_dir())
         self.assertEqual(task_io.lock_held(str(self.work)), "free")
@@ -1906,6 +1924,41 @@ class ConnectCode(UndoSeams, Base):
             for p in late:
                 unhold(p)
         self.assertEqual(len(late), 1)
+
+    def test_the_collaborator_opt_out_survives_repair_and_reinstall_until_turned_back_on(self):
+        seed_seat(cb.bridge_home(self.root), BEARER)
+        seat, fake = ("--token-env-file", cb.seat_file(self.root), "--codex-home", str(self.codex_home)), self.fake()
+
+        def recorded(*argv):
+            rc, out, err = self._main_with(fake, "install", *argv)
+            self.assertEqual(rc, 0, out + err)
+            cfg = cm.read_config(cli.config_path(LA))
+            flagged = "--no-allow-collaborator" in cli.connector_argv(cfg, str(self.root), 7)
+            self.assertEqual(flagged, cfg["ALLOW_COLLABORATOR"] == "0")
+            return cfg["ALLOW_COLLABORATOR"]
+        self.assertEqual(recorded(*seat), "1", "shared by default")
+        self.assertEqual(recorded(*seat, "--no-allow-collaborator"), "0")
+        # The desktop's move after an update (install --agent [--replace-install]), and a reinstall with the
+        # agent's own token, as its setup and a printed repair line run it: neither names the flag.
+        self.assertEqual(recorded("--agent", AGENT, "--replace-install"), "0", "the selector repair keeps it")
+        self.assertEqual(recorded(*seat), "0", "a full reinstall keeps it")
+        self.assertEqual(recorded(*seat, "--allow-collaborator"), "1", "only the explicit flag turns it back on")
+        self.assertEqual(recorded("--agent", AGENT), "1")
+
+    def test_install_help_lists_the_collaborator_flags(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+            cli.main(["install", "--help"])
+        for flag in ("--allow-collaborator", "--no-allow-collaborator"):
+            self.assertIn(flag, out.getvalue())
+        self.assertEqual(cb.session_flags(argparse.Namespace(parser=self.parsed_install(), collaborator="0")),
+                         ["--no-allow-collaborator"], "a repair line carries the one flag set, with no value")
+
+    def parsed_install(self):
+        with mock.patch.object(cli, "install", side_effect=lambda a: got.append(a.parser) or 0):
+            got = []
+            cli.main(["install", "--work", str(self.root)])
+        return got[0]
 
     def test_a_failed_install_after_the_seat_says_the_seat_recovers_the_spent_code(self):
         a = self.home / "agent-a"

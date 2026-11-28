@@ -5,6 +5,7 @@ server. Run:
     python3 packages/ag2-sparrow/tests/test_codex_connector.py
 """
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -117,7 +118,14 @@ def run_owner_echo(work):
 
 
 def saved_threads(work):
+    """The per-room thread files of earlier versions: none is written any more."""
     return sorted(p.name for p in (Path(work) / "state" / "threads").iterdir())
+
+
+def shared_thread(work):
+    """The shared thread's id as kept in state/thread; None when there is none."""
+    path = Path(work) / "state" / cc.SHARED_THREAD
+    return path.read_text().splitlines()[0] if path.exists() else None
 
 
 class NonOwnerNoteTest(unittest.TestCase):
@@ -247,21 +255,27 @@ class TierPolicyTest(unittest.TestCase):
             self.assertIn("[sandbox=None ephemeral=True cwd=", result(d, "task-chat-g"))
             self.assertIn("[sandbox=danger-full-access ephemeral=False cwd=", result(d, "task-chat-o"))
             self.assertEqual([m["tier"] for m in metrics(d)], ["guest", "owner"])
-            self.assertEqual(saved_threads(d), [cc.channel_key("local-chat")], "only the owner thread is saved")
+            self.assertEqual(shared_thread(d), metrics(d)[1]["thread"], "only the owner's shared thread is saved")
+            self.assertEqual(saved_threads(d), [], "no per-room thread file")
 
-    def test_owner_threads_are_keyed_per_channel(self):
+    def test_owner_turns_in_every_room_share_one_thread_kept_owner_readable(self):
         with tempfile.TemporaryDirectory() as d:
             now = time.time()
             write_task(d, "task-chat-a", "in room A", channel="!a:ag2.space", mtime=now - 30)
-            write_task(d, "task-chat-b", "in room B", channel="!b:ag2.space", mtime=now - 20)
+            write_task(d, "task-chat-b", "in room B", channel="!b:ag2.space", kind="dm", mtime=now - 20)
             write_task(d, "task-chat-c", "room A again", channel="!a:ag2.space", mtime=now - 10)
             self.assertEqual(run_connector(d, once=3), 0)
             ids = [m["thread"] for m in metrics(d)]
-            self.assertNotEqual(ids[0], ids[1], "rooms do not share a thread")
-            self.assertEqual(ids[0], ids[2], "a room keeps its thread")
-            self.assertEqual(saved_threads(d), sorted(cc.channel_key(c) for c in ("!a:ag2.space", "!b:ag2.space")))
-            saved = (Path(d) / "state" / "threads" / cc.channel_key("!a:ag2.space")).read_text().splitlines()
-            self.assertEqual(saved, [ids[0], "!a:ag2.space", cc.SHARED], "the id, the readable channel, its class")
+            self.assertEqual(len(set(ids)), 1, "every room's owner turn is on the one shared thread")
+            kept = Path(d) / "state" / cc.SHARED_THREAD
+            self.assertEqual(kept.read_text(), ids[0] + "\n")
+            self.assertEqual(kept.stat().st_mode & 0o777, 0o600, "as the seat keeps state/thread: owner-readable")
+            self.assertEqual(saved_threads(d), [], "no per-room thread file")
+            # Each reply goes to its own task's result, and each prompt named its own room and sender.
+            for tid, room in (("task-chat-a", "!a:ag2.space"), ("task-chat-b", "!b:ag2.space"),
+                              ("task-chat-c", "!a:ag2.space")):
+                self.assertIn("STUB echo: Sutando task %s " % tid, result(d, tid))
+                self.assertIn("room=%s from=your owner tier=owner" % room, result(d, tid))
 
     def test_a_guest_never_reuses_any_thread(self):
         with tempfile.TemporaryDirectory() as d:
@@ -273,7 +287,7 @@ class TierPolicyTest(unittest.TestCase):
             self.assertEqual(run_connector(d, once=4, extra=["--allow-non-owner"]), 0)
             ids = [m["thread"] for m in metrics(d)]
             self.assertEqual(len(set(ids)), 4, "no thread id is shared between the owner and non-owner tasks")
-            self.assertEqual(saved_threads(d), [cc.channel_key("!a:ag2.space")])
+            self.assertEqual((saved_threads(d), shared_thread(d)), ([], ids[0]))
             for tid in ("task-chat-g1", "task-chat-g2", "task-chat-t"):
                 self.assertIn("ephemeral=True", result(d, tid))
 
@@ -285,34 +299,57 @@ class TierPolicyTest(unittest.TestCase):
             self.assertEqual(spy.call_args.args[1]["access_tier"], "guest")
             self.assertEqual(spy.call_args.args[4], cc.NON_OWNER_NOTE)
 
-    def test_channel_key_is_a_digest_that_cannot_escape_or_collide(self):
-        keys = {c: cc.channel_key(c) for c in ("..", ".", "!a:b.org", "_a_b.org", "x" * 200, "x" * 200 + "y")}
-        for c, k in keys.items():
-            self.assertRegex(k, r"^[0-9a-f]{64}$", c)
-        self.assertEqual(len(set(keys.values())), len(keys), "distinct channels, distinct files")
-        self.assertEqual(cc.channel_key(None), "default")
-        self.assertEqual(cc.channel_key(""), "default")
+    def test_any_room_id_is_only_text_in_the_prompt(self):
         with tempfile.TemporaryDirectory() as d:
             write_task(d, "task-chat-1", "dotdot room", channel="..")
             self.assertEqual(run_connector(d, once=1), 0)
-            self.assertEqual(saved_threads(d), [cc.channel_key("..")])
             self.assertEqual(metrics(d)[0]["status"], "completed")
+            self.assertIn("room=.. from=your owner", result(d, "task-chat-1"))
+            self.assertEqual(sorted(p.name for p in (Path(d) / "state").iterdir() if "thread" in p.name),
+                             [cc.SHARED_THREAD, "threads"], "no file is named after a room")
 
-    def test_thread_id_binds_to_exactly_one_channel(self):
-        self.assertEqual(cc.bound_thread_id("!a:x=T1", "!a:x"), "T1")
-        self.assertIsNone(cc.bound_thread_id("!a:x=T1", "!b:x"))
-        self.assertIsNone(cc.bound_thread_id("T1", "!a:x"), "an unbound id applies to nobody")
-        self.assertEqual(cc.bound_thread_id("=T1", None), "T1", "the empty channel is the default thread")
+    def test_thread_id_seeds_the_shared_thread_only_while_none_is_saved(self):
+        self.assertEqual(cc.thread_seed("T1"), "T1")
+        self.assertIsNone(cc.thread_seed(" "))
+        self.assertIsNone(cc.thread_seed(None))
         with tempfile.TemporaryDirectory() as d:
             now = time.time()
             write_task(d, "task-chat-a", "room A", channel="!a:x", mtime=now - 20)
             write_task(d, "task-chat-b", "room B", channel="!b:x", mtime=now - 10)
-            self.assertEqual(run_connector(d, once=2, extra=["--thread-id", "!a:x=bound-0001"]), 0)
-            ids = [m["thread"] for m in metrics(d)]
-            self.assertEqual(ids[0], "bound-0001", "room A resumed the bound thread")
-            self.assertNotEqual(ids[1], "bound-0001", "room B did not inherit it")
+            self.assertEqual(run_connector(d, once=2, extra=["--thread-id", "bound-0001"]), 0)
+            self.assertEqual([m["thread"] for m in metrics(d)], ["bound-0001", "bound-0001"], "both rooms share it")
+            write_task(d, "task-chat-c", "after a restart", channel="!c:x")
+            self.assertEqual(run_connector(d, once=1, extra=["--thread-id", "other-0002"]), 0)
+            self.assertEqual(metrics(d)[-1]["thread"], "bound-0001", "the saved shared thread wins over a seed")
 
-    def test_resume_thread_carries_the_owners_conversation_into_the_dm_once(self):
+    def test_an_older_channel_bound_thread_id_never_becomes_the_shared_thread(self):
+        # Upgrade: an install from when `--thread-id CHANNEL_ID=THREAD` gave the owner's DM its own thread.
+        # A collaborator's room shares the new thread, so that DM's conversation must not seed it.
+        with tempfile.TemporaryDirectory() as d:
+            now = time.time()
+            (Path(d) / "state" / "threads").mkdir(parents=True)
+            old = Path(d) / "state" / "threads" / "dm-file"
+            old.write_text("owner-dm-0001\n")
+            collab = "task-1792100000009"
+            write_text(d, collab, gateway_mid_task(collab, "hello", tier="team", collaborator=True), now - 20)
+            write_task(d, "task-chat-o", "owner", channel="!dm:x", kind="dm", mtime=now - 10)
+            with mock.patch.object(cc, "log", wraps=cc.log) as spy, \
+                    mock.patch.object(cc, "wrap_untrusted", wraps=cc.wrap_untrusted) as wrap:
+                self.assertEqual(run_connector(d, once=2, extra=["--thread-id", "!dm:x=owner-dm-0001"]), 0)
+            self.assertEqual([m["task"] for m in metrics(d)], [collab, "task-chat-o"], "the collaborator went first")
+            self.assertEqual([(c.args[1]["access_tier"], c.args[1]["collaborator"]) for c in wrap.call_args_list],
+                             [("team", "true"), ("owner", "false")], "an attested collaborator, then the owner")
+            self.assertIn("tier=team", result(d, collab))
+            threads = [m["thread"] for m in metrics(d)]
+            self.assertNotIn("owner-dm-0001", threads)
+            self.assertEqual(len(set(threads)), 1, "both rooms are on one new shared thread")
+            self.assertEqual((Path(d) / "state" / cc.SHARED_THREAD).read_text().strip(), threads[0])
+            self.assertEqual(old.read_text(), "owner-dm-0001\n", "the older per-room file is left as it was")
+            said = " ".join(" ".join(map(str, c.args)) for c in spy.call_args_list)
+            self.assertIn("!dm:x names one channel's thread", said)
+            self.assertNotIn("owner-dm-0001", said, "the log names the channel, not the thread")
+
+    def test_resume_thread_goes_to_the_owner_only_slot_and_never_the_shared_thread(self):
         with tempfile.TemporaryDirectory() as d:
             now = time.time()
             write_task(d, "task-chat-r", "in a room", channel="!r:x", kind="room", mtime=now - 40)
@@ -320,19 +357,77 @@ class TierPolicyTest(unittest.TestCase):
             write_task(d, "task-chat-d2", "DM again", channel="!dm:x", kind="dm", mtime=now - 20)
             write_task(d, "task-chat-g", "guest in a DM", channel="!g:x", kind="dm", tier="guest", mtime=now - 10)
             extra = ["--resume-thread", "owner-thread-0001", "--allow-non-owner"]
-            self.assertEqual(run_connector(d, once=4, extra=extra), 0)
+            with mock.patch.object(cc, "wrap_untrusted", wraps=cc.wrap_untrusted):
+                self.assertEqual(run_connector(d, once=4, extra=extra), 0)
             ids = {m["task"]: m["thread"] for m in metrics(d)}
-            self.assertNotEqual(ids["task-chat-r"], "owner-thread-0001", "a room starts its own thread")
-            self.assertEqual(ids["task-chat-d1"], "owner-thread-0001", "the owner's DM continues it")
-            self.assertEqual(ids["task-chat-d2"], "owner-thread-0001", "and keeps it")
+            self.assertNotEqual(ids["task-chat-r"], "owner-thread-0001", "a room turn is on the fresh shared thread")
+            self.assertEqual(ids["task-chat-d1"], "owner-thread-0001", "the owner's DM continues the carried one")
+            self.assertEqual(ids["task-chat-d2"], "owner-thread-0001")
             self.assertNotEqual(ids["task-chat-g"], "owner-thread-0001", "a guest never gets it")
-            marker = Path(d) / "state" / cc.RESUME_MARKER
-            self.assertEqual(marker.read_text().strip(), "owner-thread-0001")
-            # A restart with the same id resumes the DM's saved thread; it is not taken again.
-            (Path(d) / "state" / "threads" / cc.channel_key("!dm:x")).write_text("later-0002\n!dm:x\n")
+            self.assertNotIn("[shared thread]", result(d, "task-chat-d1").split(" [sandbox")[0])
+            self.assertNotIn(" room=", result(d, "task-chat-d1"), "no shared-thread lead on the owner-only thread")
+            state = Path(d) / "state"
+            self.assertEqual((state / cc.RESUME_MARKER).read_text().strip(), "owner-thread-0001")
+            self.assertEqual((state / cc.OWNER_THREAD).read_text().strip(), "owner-thread-0001")
+            self.assertEqual(oct((state / cc.OWNER_THREAD).stat().st_mode & 0o777), "0o600")
+            self.assertEqual(shared_thread(d), ids["task-chat-r"])
+            # A restart with the same id: the owner's DM resumes the owner-only slot; it is not taken again.
+            (state / cc.OWNER_THREAD).write_text("later-0002\n")
             write_task(d, "task-chat-d3", "after a restart", channel="!dm:x", kind="dm")
             self.assertEqual(run_connector(d, once=1, extra=extra), 0)
             self.assertEqual(metrics(d)[-1]["thread"], "later-0002")
+            # A new id given at a reinstall is carried into the owner-only slot; the shared thread stays.
+            write_task(d, "task-chat-d4", "after a reinstall", channel="!dm:x", kind="dm")
+            self.assertEqual(run_connector(d, once=1, extra=["--resume-thread", "owner-thread-0003"]), 0)
+            self.assertEqual(metrics(d)[-1]["thread"], "owner-thread-0003")
+            self.assertEqual(((state / cc.OWNER_THREAD).read_text().strip(), shared_thread(d)),
+                             ("owner-thread-0003", ids["task-chat-r"]))
+
+    def test_collaborator_and_room_turns_run_on_a_fresh_shared_thread_without_the_carried_items(self):
+        with tempfile.TemporaryDirectory() as d:
+            now = time.time()
+            write_task(d, "task-chat-d", "[[history]] secret owner talk", channel="!dm:x", kind="dm", mtime=now - 30)
+            write_task(d, "task-chat-r", "[[history]] owner in a room", channel="!r:x", kind="room", mtime=now - 20)
+            tid = "task-1792100000021"
+            write_text(d, tid, gateway_mid_task(tid, "[[history]] hello", tier="team", collaborator=True), now - 10)
+            self.assertEqual(run_connector(d, once=3, extra=["--resume-thread", "owner-conv"]), 0)
+            ids = {m["task"]: m["thread"] for m in metrics(d)}
+            self.assertEqual(ids["task-chat-d"], "owner-conv")
+            self.assertEqual(ids["task-chat-r"], ids[tid], "the room and the collaborator share one thread")
+            self.assertNotEqual(ids[tid], "owner-conv")
+            self.assertIn('history=["carried:owner-conv"]', result(d, "task-chat-d"), "the DM has the carried items")
+            self.assertIn("history=[]", result(d, "task-chat-r"), "the shared thread starts fresh")
+            out = result(d, tid)
+            self.assertIn('history=["Sutando task task-chat-r ', out, "only the room turn before it")
+            self.assertNotIn("carried", out)
+            self.assertNotIn("secret", out)
+            self.assertIn("tier=team", out)
+
+    def test_a_saved_shared_thread_that_is_the_carried_conversation_is_replaced(self):
+        # Upgrade from a build that carried --resume-thread into state/thread: that id stays the owner's slot only.
+        for preset in ("owner-conv", "taken-conv", "legacy-conv"):
+            with self.subTest(preset=preset), tempfile.TemporaryDirectory() as d:
+                state = Path(d) / "state"
+                (state / "threads").mkdir(parents=True)
+                (state / cc.SHARED_THREAD).write_text(preset + "\n")
+                (state / cc.RESUME_MARKER).write_text("taken-conv\n")
+                (state / "threads" / "dm-file").write_text("legacy-conv\n!dm:x\nowner-only\n")
+                (state / "threads" / "room-file").write_text("room-conv\n!r:x\nshared\n")
+                now = time.time()
+                tid = "task-1792100000023"
+                write_text(d, tid, gateway_mid_task(tid, "hello", tier="team", collaborator=True), now - 20)
+                write_task(d, "task-chat-d", "owner DM", channel="!dm:x", kind="dm", mtime=now - 10)
+                extra = ["--resume-thread", "owner-conv"] if preset == "owner-conv" else []
+                with mock.patch.object(cc, "log", wraps=cc.log) as spy:
+                    self.assertEqual(run_connector(d, once=2, extra=extra), 0)
+                ids = {m["task"]: m["thread"] for m in metrics(d)}
+                self.assertNotIn(ids[tid], ("owner-conv", "taken-conv", "legacy-conv"))
+                self.assertEqual(shared_thread(d), ids[tid], "a fresh shared thread replaces it")
+                self.assertEqual(ids["task-chat-d"], "owner-conv" if extra else "taken-conv", "kept for the owner's DM")
+                self.assertEqual((state / cc.OWNER_THREAD).read_text().strip(), ids["task-chat-d"])
+                said = " ".join(" ".join(map(str, c.args)) for c in spy.call_args_list)
+                self.assertIn("the shared thread %s is an owner-only conversation" % preset, said)
+                self.assertNotIn("room-conv", said, "a shared room thread of an earlier version is not owner-only")
 
     def test_a_resume_thread_that_cannot_resume_falls_back_and_is_not_retried(self):
         with tempfile.TemporaryDirectory() as d:
@@ -372,7 +467,8 @@ class TierPolicyTest(unittest.TestCase):
             self.assertEqual(spy.call_args.args[4], cc.NON_OWNER_NOTE)
             self.assertIn("The sender is not your owner. " + cc.NON_OWNER_NOTE, cc.wrap_untrusted(*spy.call_args.args))
             self.assertIn("[sandbox=danger-full-access ephemeral=False cwd=%s]" % os.path.abspath(d), result(d, tid))
-            self.assertEqual(saved_threads(d), [cc.channel_key("!room:ag2.space")], "the room's kept thread")
+            self.assertIn("room=!room:ag2.space from=@bob:ag2.space tier=team", result(d, tid))
+            self.assertEqual((saved_threads(d), shared_thread(d)), ([], metrics(d)[0]["thread"]), "the shared thread")
             self.assertNotIn("[dm-only]", result(d, tid))
 
     def test_a_collaborator_never_continues_the_owners_carried_dm_conversation(self):
@@ -384,74 +480,31 @@ class TierPolicyTest(unittest.TestCase):
             self.assertNotIn("owner-conv", result(d, tid))
             self.assertFalse((Path(d) / "state" / cc.RESUME_MARKER).exists(), "left for the owner's DM")
 
-    def test_a_collaborator_never_joins_a_thread_bound_to_the_owner_even_after_a_restart(self):
-        room = "!room:ag2.space"
-        bind = ["--thread-id", room + "=owner-bound-0001"]
+    def test_a_collaborator_in_another_room_shares_the_owners_thread_across_a_restart(self):
         with tempfile.TemporaryDirectory() as d:
-            write_task(d, "task-chat-o", "owner in the room", channel=room)
-            self.assertEqual(run_connector(d, once=1, extra=bind), 0)
-            for n, extra in ((1, bind), (2, [])):   # a restart, then one without the binding flag
-                tid = "task-179210000001%d" % n
-                write_text(d, tid, gateway_mid_task(tid, "hello", tier="team", collaborator=True))
-                self.assertEqual(run_connector(d, once=1, extra=extra), 0)
-                self.assertNotEqual(metrics(d)[-1]["thread"], "owner-bound-0001", extra)
-                self.assertNotIn("ephemeral=True", result(d, tid))
-            ids = [m["thread"] for m in metrics(d)]
-            self.assertEqual(ids[0], "owner-bound-0001")
-            self.assertEqual(ids[1], ids[2], "the collaborator's shared thread is kept across the restart")
-            self.assertEqual(saved_threads(d), sorted([cc.channel_key(room), cc.channel_key(room) + cc.SHARED_SUFFIX]))
-            write_task(d, "task-chat-o2", "owner again", channel=room)
-            self.assertEqual(run_connector(d, once=1, extra=bind), 0)
-            self.assertEqual(metrics(d)[-1]["thread"], "owner-bound-0001", "the owner keeps the bound thread")
-
-    def test_a_collaborator_in_a_channel_that_carried_the_owners_conversation_gets_its_own_thread(self):
-        room = "!room:ag2.space"
-        for legacy in (False, True):
-            with self.subTest(legacy_thread_file=legacy), tempfile.TemporaryDirectory() as d:
-                write_task(d, "task-chat-d", "owner in the DM", channel=room, kind="dm")
-                self.assertEqual(run_connector(d, once=1, extra=["--resume-thread", "owner-conv"]), 0)
-                saved = Path(d) / "state" / "threads" / cc.channel_key(room)
-                self.assertEqual(saved.read_text().splitlines(), ["owner-conv", room, cc.OWNER_ONLY])
-                if legacy:   # written before the owner-only line existed
-                    saved.write_text("owner-conv\n%s\n" % room)
-                tid = "task-1792100000021"
-                write_text(d, tid, gateway_mid_task(tid, "hello", tier="team", collaborator=True))
-                self.assertEqual(run_connector(d, once=1, extra=["--resume-thread", "owner-conv"]), 0)
-                self.assertNotEqual(metrics(d)[-1]["thread"], "owner-conv")
-                self.assertNotIn("owner-conv", result(d, tid))
-
-    def test_a_collaborator_joins_the_owners_room_thread_only_when_its_record_says_shared(self):
-        room = "!room:ag2.space"
-        with tempfile.TemporaryDirectory() as d:
-            write_task(d, "task-chat-o", "owner in the room", channel=room)
+            write_task(d, "task-chat-o", "owner in room A", channel="!a:ag2.space")
             self.assertEqual(run_connector(d, once=1), 0)
             tid = "task-1792100000031"
             write_text(d, tid, gateway_mid_task(tid, "hello", tier="team", collaborator=True))
             self.assertEqual(run_connector(d, once=1), 0)
             ids = [m["thread"] for m in metrics(d)]
-            self.assertEqual(ids[0], ids[1], "a shared room thread is shared with a collaborator")
-            self.assertEqual(saved_threads(d), [cc.channel_key(room)])
+            self.assertEqual(ids[0], ids[1], "the collaborator's turn in another room is on the owner's thread")
+            self.assertIn("ephemeral=None", result(d, tid), "resumed after the restart, not started again")
 
-    def test_a_pre_upgrade_thread_record_of_unknown_provenance_is_kept_from_a_collaborator(self):
+    def test_per_room_thread_records_of_earlier_versions_are_left_in_place_unused(self):
         room = "!room:ag2.space"
         with tempfile.TemporaryDirectory() as d:
-            # The older two-line format, e.g. left by a --thread-id binding no longer in the launch flags.
             threads = Path(d) / "state" / "threads"
             threads.mkdir(parents=True)
-            (threads / cc.channel_key(room)).write_text("owner-bound-legacy\n%s\n" % room)
-            for n in (1, 2):   # and again after a restart
-                tid = "task-179210000004%d" % n
-                write_text(d, tid, gateway_mid_task(tid, "hello", tier="team", collaborator=True))
-                self.assertEqual(run_connector(d, once=1), 0)
-                self.assertNotEqual(metrics(d)[-1]["thread"], "owner-bound-legacy")
-            self.assertEqual(metrics(d)[0]["thread"], metrics(d)[1]["thread"])
-            self.assertEqual((threads / cc.channel_key(room)).read_text(), "owner-bound-legacy\n%s\n" % room,
-                             "the unknown record is left as it was")
+            old = threads / hashlib.sha256(room.encode()).hexdigest()
+            old.write_text("room-thread-legacy\n%s\nshared\n" % room)
             write_task(d, "task-chat-o", "owner in the room", channel=room)
-            self.assertEqual(run_connector(d, once=1), 0)
-            self.assertEqual(metrics(d)[-1]["thread"], "owner-bound-legacy", "the owner still resumes it")
-            self.assertEqual((threads / cc.channel_key(room)).read_text().splitlines()[2:], [],
-                             "resuming does not classify it")
+            tid = "task-1792100000041"
+            write_text(d, tid, gateway_mid_task(tid, "hello", tier="team", collaborator=True))
+            self.assertEqual(run_connector(d, once=2), 0)
+            self.assertNotIn("room-thread-legacy", [m["thread"] for m in metrics(d)])
+            self.assertEqual(len({m["thread"] for m in metrics(d)}), 1)
+            self.assertEqual(old.read_text(), "room-thread-legacy\n%s\nshared\n" % room, "left as it was")
 
     def test_the_gate_decides_once_per_task_and_the_mapping_uses_that_decision(self):
         tid = "task-1792100000051"
@@ -468,6 +521,101 @@ class TierPolicyTest(unittest.TestCase):
             self.assertEqual(run_connector(d, once=1, extra=["--allow-non-owner"]), 0)
             self.assertIn("ephemeral=True", result(d, tid))
             self.assertEqual(saved_threads(d), [])
+
+
+class SharedThreadTest(unittest.TestCase):
+    """The owner's and attested collaborators' turns, from every room, run on one shared thread (state/thread), as
+    local Claude Code keeps one session; each prompt opens with its room and sender."""
+
+    def test_an_app_server_restart_resumes_the_shared_thread(self):
+        with tempfile.TemporaryDirectory() as d:
+            now = time.time()
+            write_task(d, "task-chat-1", "before", channel="!a:x", mtime=now - 30)
+            write_task(d, "task-chat-2", "[[die]] server goes away", channel="!b:x", mtime=now - 20)
+            write_task(d, "task-chat-3", "after the crash", channel="!c:x", mtime=now - 10)
+            with mock.patch.object(cc, "log", wraps=cc.log) as spy:
+                self.assertEqual(run_connector(d, once=3), 0)
+            first = metrics(d)[0]["thread"]
+            self.assertEqual([m["thread"] for m in metrics(d)], [first] * 3, "the same thread on every server")
+            self.assertIn("ephemeral=None", result(d, "task-chat-3"), "resumed on the new server, not started")
+            logged = [" ".join(map(str, c.args)) for c in spy.call_args_list]
+            self.assertIn("resumed the shared thread %s" % first, logged)
+            self.assertEqual(shared_thread(d), first)
+
+    def test_a_shared_thread_that_cannot_be_resumed_is_replaced_by_a_new_one_and_logged(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "state").mkdir()
+            (Path(d) / "state" / cc.SHARED_THREAD).write_text("stale-0009\n")
+            now = time.time()
+            write_task(d, "task-chat-1", "one", channel="!a:x", mtime=now - 20)
+            write_task(d, "task-chat-2", "two", channel="!b:x", mtime=now - 10)
+            with mock.patch.object(cc, "log", wraps=cc.log) as spy:
+                self.assertEqual(run_connector(d, once=2), 0)
+            ids = [m["thread"] for m in metrics(d)]
+            self.assertNotEqual(ids[0], "stale-0009")
+            self.assertEqual(ids[0], ids[1], "the new shared thread is kept, not a second failing resume")
+            self.assertEqual(shared_thread(d), ids[0])
+            self.assertIn("ephemeral=False", result(d, "task-chat-1"), "a durable thread, started")
+            self.assertTrue(any("thread/resume failed for the shared thread stale-0009; starting a new shared thread"
+                                in " ".join(map(str, c.args)) for c in spy.call_args_list))
+
+    def test_a_guest_between_owner_turns_gets_its_own_ephemeral_thread(self):
+        with tempfile.TemporaryDirectory() as d:
+            now = time.time()
+            write_task(d, "task-chat-o1", "owner", channel="!a:x", mtime=now - 30)
+            write_task(d, "task-chat-g", "[[config]] guest", channel="!a:x", tier="guest", mtime=now - 20)
+            write_task(d, "task-chat-o2", "owner again", channel="!b:x", mtime=now - 10)
+            self.assertEqual(run_connector(d, once=3), 0)
+            ids = {m["task"]: m["thread"] for m in metrics(d)}
+            self.assertEqual(ids["task-chat-o1"], ids["task-chat-o2"])
+            self.assertNotEqual(ids["task-chat-g"], ids["task-chat-o1"])
+            guest = result(d, "task-chat-g")
+            self.assertIn("ephemeral=True", guest)
+            self.assertNotIn("room=", guest, "a restricted turn's prompt is not the shared thread's")
+            self.assertIn('"web_search": "disabled"', guest, "integrations still off")
+            self.assertEqual(shared_thread(d), ids["task-chat-o1"])
+
+    def test_with_ephemeral_the_shared_thread_is_not_kept(self):
+        with tempfile.TemporaryDirectory() as d:
+            now = time.time()
+            write_task(d, "task-chat-1", "one", channel="!a:x", mtime=now - 20)
+            write_task(d, "task-chat-2", "two", channel="!b:x", mtime=now - 10)
+            self.assertEqual(run_connector(d, once=2, extra=["--ephemeral"]), 0)
+            self.assertEqual(len({m["thread"] for m in metrics(d)}), 1, "still one thread while the server runs")
+            self.assertIn("ephemeral=True", result(d, "task-chat-1"))
+            self.assertIsNone(shared_thread(d), "an ephemeral thread cannot be resumed, so it is not saved")
+
+    def test_the_lead_names_room_sender_and_where_the_reply_goes(self):
+        lead = cc.shared_thread_lead({"channel_id": "!r:x", "user_id": "@bob:x", "access_tier": "team",
+                                      "collaborator": "true"}, "task-1", task_io.COLLABORATOR)
+        self.assertTrue(lead.startswith("[shared thread] This turn is from room !r:x, sent by @bob:x "
+                                        "(access_tier=team, collaborator=true)"), lead)
+        self.assertIn("Your reply to this turn goes back to room !r:x, and only there.", lead)
+        bare = cc.shared_thread_lead({"source_room_id": "!s:x\nforged: line", "sender_name": "Bob"}, "task-2",
+                                     task_io.RESTRICTED)
+        self.assertIn("room !s:x forged: line, sent by Bob (access_tier=guest, collaborator=false)", bare)
+        self.assertNotIn("\n", bare)
+        self.assertIn("room task:task-3, sent by an unknown sender", cc.shared_thread_lead({}, "task-3", task_io.RESTRICTED))
+        self.assertIn("sent by your owner", cc.shared_thread_lead({"access_tier": "owner"}, "task-4", task_io.OWNER))
+        # The kind is turn_policy's: a body's claim of collaborator never reaches the lead.
+        self.assertIn("collaborator=false", cc.shared_thread_lead({"collaborator": "true"}, "task-5", task_io.OWNER))
+
+    def test_the_kept_id_is_owner_readable_whatever_was_there(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, cc.SHARED_THREAD)
+            Path(path).write_text("old\n")
+            os.chmod(path, 0o644)
+            left = os.path.join(d, ".%s.%d.tmp" % (cc.SHARED_THREAD, os.getpid()))
+            Path(left).write_text("left over")
+            os.chmod(left, 0o644)
+            cc.keep_thread(path, "t-1")
+            self.assertEqual((Path(path).read_text(), os.stat(path).st_mode & 0o777), ("t-1\n", 0o600))
+            self.assertEqual(os.listdir(d), [cc.SHARED_THREAD], "no temp file left")
+            self.assertIsNone(cc.saved_shared_thread(os.path.join(d, "missing")))
+            with mock.patch.object(cc.os, "replace", side_effect=OSError("disk")):
+                with self.assertRaises(OSError):
+                    cc.keep_thread(path, "t-2")
+            self.assertEqual((Path(path).read_text(), os.listdir(d)), ("t-1\n", [cc.SHARED_THREAD]))
 
 
 class AdmissionGateTest(unittest.TestCase):
@@ -549,7 +697,8 @@ class AdmissionGateTest(unittest.TestCase):
             self.assertIn("[sandbox=read-only ephemeral=False cwd=%s]" % os.path.abspath(d), result(d, tid))
             self.assertEqual(result(d, "task-chat-g"), task_io.NON_OWNER_REFUSED)
             self.assertEqual([m["tier"] for m in metrics(d)], ["owner", "team"], "the refusal is no turn, so no row")
-            self.assertEqual(sorted(saved_threads(d)), sorted([cc.channel_key("local-chat"), cc.channel_key("!room:ag2.space")]))
+            self.assertEqual(saved_threads(d), [])
+            self.assertEqual(metrics(d)[0]["thread"], metrics(d)[1]["thread"], "owner and collaborator share one thread")
             self.assertIn("turn -> task-chat-o", err)
             self.assertIn("turn -> %s" % tid, err)
             self.assertNotIn("turn -> task-chat-g", err)
@@ -567,6 +716,65 @@ class AdmissionGateTest(unittest.TestCase):
                 self.assertNotIn("refused", err)
                 self.assertEqual(saved_threads(d), [])
 
+
+
+class CollaboratorOptOutTest(unittest.TestCase):
+    """--no-allow-collaborator (install's opt-out): an attested collaborator is served exactly as a guest, on its
+    own ephemeral read-only thread with integrations off, never on the shared thread or the owner's conversation."""
+
+    def run_spied(self, work, once, extra=()):
+        with mock.patch.object(cc.Connector, "run_task", autospec=True, side_effect=cc.Connector.run_task) as ran, \
+                mock.patch.object(cc, "wrap_untrusted", wraps=cc.wrap_untrusted) as wrap:
+            self.assertEqual(run_connector(work, once=once, extra=extra), 0)
+        return ran, wrap
+
+    def test_an_opted_out_collaborator_gets_a_restricted_ephemeral_thread_and_the_shared_one_is_untouched(self):
+        tid = "task-1792100000061"
+        with tempfile.TemporaryDirectory() as d:
+            write_task(d, "task-chat-d", "owner in the DM", channel="!dm:x", kind="dm", mtime=time.time() - 10)
+            write_task(d, "task-chat-r", "owner in a room", channel="!r:x", kind="room")
+            self.assertEqual(run_connector(d, once=2, extra=["--resume-thread", "owner-conv"]), 0)
+            kept = (Path(d) / "state" / cc.SHARED_THREAD).read_text()
+            write_text(d, tid, gateway_mid_task(tid, "[[config]] hello", tier="team", collaborator=True).replace(
+                "task_layout: mid", "channel_kind: dm\ntask_layout: mid"))
+            ran, wrap = self.run_spied(d, 1, ["--no-allow-collaborator", "--resume-thread", "owner-conv",
+                                              "--sandbox", "danger-full-access"])
+            caps = ran.call_args.args[3]
+            self.assertEqual(caps, task_io.RESTRICTED_CAPABILITIES, "exactly a guest's turn")
+            self.assertEqual((caps.session, caps.writes, caps.integrations, caps.framing, caps.owner_dm),
+                             ("ephemeral", False, False, "non_owner", False))
+            out = result(d, tid)
+            self.assertIn("[sandbox=None ephemeral=True cwd=", out)
+            self.assertNotIn("cwd=%s]" % os.path.abspath(d), out, "never the owner's work root")
+            cfg = json.loads(out.split(" config=", 1)[1])
+            self.assertEqual((cfg["mcp_servers"], cfg["web_search"]), ({"owner-mcp": {"enabled": False}}, "disabled"))
+            thread = metrics(d)[-1]["thread"]
+            self.assertNotIn(thread, (shared_thread(d), "owner-conv"), "its own thread, not the shared one")
+            self.assertEqual((Path(d) / "state" / cc.SHARED_THREAD).read_text(), kept, "state/thread untouched")
+            prompt = cc.wrap_untrusted(*wrap.call_args.args, **wrap.call_args.kwargs)
+            self.assertIn("The sender is not your owner. " + cc.NON_OWNER_NOTE, prompt)
+            self.assertNotIn("[shared thread]", ran.call_args.args[2], "no shared-thread lead")
+
+    def test_opted_out_and_no_non_owner_refuses_it_as_a_guest_and_default_shares(self):
+        tid = "task-1792100000062"
+        with tempfile.TemporaryDirectory() as d:
+            write_text(d, tid, gateway_mid_task(tid, "hello", tier="team", collaborator=True))
+            run_connector(d, once=1, extra=["--no-allow-collaborator", "--no-allow-non-owner"])
+            self.assertEqual(result(d, tid), task_io.NON_OWNER_REFUSED)
+            self.assertIsNone(shared_thread(d))
+        with tempfile.TemporaryDirectory() as d:
+            write_text(d, tid, gateway_mid_task(tid, "hello", tier="team", collaborator=True))
+            self.assertEqual(run_connector(d, once=1, extra=["--allow-collaborator"]), 0)
+            self.assertEqual(shared_thread(d), metrics(d)[0]["thread"], "the default: the shared thread")
+        parse = lambda *f: cc.build_parser().parse_args(["--work", "w", *f]).allow_collaborator  # noqa: E731
+        self.assertEqual((parse(), parse("--no-allow-collaborator"), parse("--allow-collaborator")), (True, False, True))
+
+    def test_served_policy_only_moves_a_withheld_collaborator(self):
+        collab, guest = {"access_tier": "team", "collaborator": "true"}, {"access_tier": "guest", "collaborator": "false"}
+        self.assertEqual(cc.served_policy(collab).kind, task_io.COLLABORATOR)
+        self.assertEqual(cc.served_policy(collab, True, False), task_io.turn_policy(guest, True))
+        self.assertEqual(cc.served_policy(collab, False, False).unlock, task_io.ALLOW_NON_OWNER_FLAG)
+        self.assertEqual(cc.served_policy({"access_tier": "owner"}, False, False).kind, task_io.OWNER)
 
 
 class NoIntegrationsTest(unittest.TestCase):
@@ -653,8 +861,8 @@ class EndToEndStubTest(unittest.TestCase):
             recs = metrics(d)
             self.assertEqual([m["task"] for m in recs], ["task-chat-c", "task-chat-b", "task-chat-a"])
             self.assertEqual({m["status"] for m in recs}, {"completed"})
-            self.assertEqual(len({m["thread"] for m in recs}), 1, "one owner channel, one thread")
-            self.assertEqual((Path(d) / "state" / "threads" / cc.channel_key("local-chat")).read_text().split()[0], recs[0]["thread"])
+            self.assertEqual(len({m["thread"] for m in recs}), 1, "one shared thread")
+            self.assertEqual(shared_thread(d), recs[0]["thread"])
             self.assertEqual((Path(d) / "state" / "done").read_text().split(),
                              ["task-chat-c", "task-chat-b", "task-chat-a"])
 
@@ -669,7 +877,7 @@ class EndToEndStubTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             write_task(d, "task-chat-1", "one")
             run_connector(d, once=1)
-            tid = (Path(d) / "state" / "threads" / cc.channel_key("local-chat")).read_text().split()[0]
+            tid = shared_thread(d)
             # A drain claimed the result (renamed it away) but the task file is still there.
             os.remove(Path(d) / "results" / "task-chat-1.txt")
             write_task(d, "task-chat-2", "two")
@@ -682,7 +890,7 @@ class EndToEndStubTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             write_task(d, "task-chat-1", "one")
             with mock.patch.object(cc, "log", wraps=cc.log) as spy:
-                self.assertEqual(run_connector(d, once=1, extra=["--thread-id", "local-chat=stale-0001"]), 0)
+                self.assertEqual(run_connector(d, once=1, extra=["--thread-id", "stale-0001"]), 0)
             self.assertEqual(metrics(d)[0]["status"], "completed")
             self.assertNotEqual(metrics(d)[0]["thread"], "stale-0001")
             self.assertTrue(any("thread/resume failed" in " ".join(map(str, c.args)) for c in spy.call_args_list))
@@ -691,7 +899,7 @@ class EndToEndStubTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             write_task(d, "task-chat-1", "one")
             with mock.patch.object(cc, "log", wraps=cc.log) as spy:
-                rc = run_connector(d, once=1, extra=["--thread-id", "local-chat=hang-0001", "--turn-timeout", "1"])
+                rc = run_connector(d, once=1, extra=["--thread-id", "hang-0001", "--turn-timeout", "1"])
             self.assertEqual(rc, 0)
             self.assertEqual(metrics(d)[0]["status"], "completed")
             self.assertTrue(any("thread/resume failed" in " ".join(map(str, c.args)) for c in spy.call_args_list))
@@ -830,6 +1038,18 @@ class ModelCardTest(CardWorld, unittest.TestCase):
         ((_, same),) = self.posted("$card5")
         self.assertEqual((same["text"], metrics(self.work)[-1]["card"]),
                          ("I'm already using Stub Large. Nothing changed.", "model-same"))
+
+    def test_a_pick_applies_to_the_shared_thread_in_every_room(self):
+        self.serve("task-0", "before")
+        thread = metrics(self.work)[-1]["thread"]
+        self.pick("Stub Large")
+        self.posted("$card2")
+        in_room = self.serve("task-3", "hello", channel="!room:s.space", kind="room")
+        self.assertIn("model=gpt-6-sol", in_room)
+        self.assertIn("room=!room:s.space", in_room)
+        self.assertIn("model=gpt-6-sol", self.serve("task-4", "again"))
+        turns = [m for m in metrics(self.work) if "thread" in m]
+        self.assertEqual([m["thread"] for m in turns], [thread] * 3, "one thread before and after the pick")
 
     def test_a_model_past_the_buttons_is_picked_by_name_and_an_unknown_name_is_refused(self):
         self.assertEqual(self.serve("task-1", "/model stub 7"), "[no-send] the model card answers\n")
@@ -1283,7 +1503,10 @@ class AccountCardTest(CardWorld, unittest.TestCase):
         self.home.mkdir()
         (self.home / "stub-account").write_text("alice@example.com")
         self.opened = []
+        # The browser sign-in on this computer ("Switch account" with SWITCH_ANYWHERE off); the phone's
+        # device-code one is tests/test_codex_device_login.py's.
         for patch in (mock.patch.dict(os.environ, {"CODEX_HOME": str(self.home)}),
+                      mock.patch.object(cc, "SWITCH_ANYWHERE", False),
                       mock.patch.object(cc, "open_page", side_effect=lambda url: self.opened.append(url) or True)):
             patch.start()
             self.addCleanup(patch.stop)
@@ -2399,7 +2622,7 @@ class EdgePathTest(unittest.TestCase):
             self.assertIn(str(outside), prompt, "a path that was not staged is left as text; the profile refuses it")
             c.drop_scratch()
             owner = {"access_tier": "owner", "channel_id": "c", "attachments": guest["attachments"]}
-            c.open_owner_thread = lambda *a, **k: None
+            c.open_shared_thread = lambda *a, **k: None
             c.run_task(owner, said, cc.turn_policy(owner, True).capabilities)
             self.assertEqual(seen[-1][0], said, "an owner's turn reads the files where they are")
 

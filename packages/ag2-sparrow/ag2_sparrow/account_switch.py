@@ -22,6 +22,8 @@ import uuid
 from . import card_ask, card_desk, connector_cards
 
 FILE, CARD = "account.json", "account-switch"
+# "Switch account" by the browser on this computer, where `switch_anywhere` makes Switch the device-code one.
+HERE, HERE_LABEL = "here", "Sign in on this computer"
 # A card with no "Switch account" button is not the account card: recorded under its id it would retire
 # that card (one live card per id and room) while the owner still sees its button.
 NOTE = "account-switch-status"
@@ -106,6 +108,8 @@ class AccountSwitch:
         # `remote`: a connector's sign-in the owner finishes on another device ("Add account", "Sign out"),
         # set by that connector after it makes the card; None offers neither.
         self.remote = None
+        # `switch_anywhere`: "Switch account" starts `remote`'s sign-in too, never the browser on this computer.
+        self.switch_anywhere = False
         self.state_dir, self.bridge_state, self.name, self.runtime = state_dir, bridge_state, name, runtime
         # `lapsed()`: the runtime itself refused this login (unauthorized even after a restart), not merely read
         # no account; asked again on every card, so an earlier answer is never carried into a later one.
@@ -174,6 +178,10 @@ class AccountSwitch:
             if self.remote is not None:
                 buttons.append(agent_card.button("Add account", "reply", reply="Add account",
                                                  command=agent_card.reply("account", "agent", "add")))
+            if self.remote is not None and self.switch_anywhere:
+                # The browser sign-in, asked for by name: on this computer only, and the way when device code fails.
+                buttons.append(agent_card.button(HERE_LABEL, "reply", reply=HERE_LABEL,
+                                                 command=agent_card.reply("account", "agent", HERE)))
         if url:
             buttons.append(agent_card.button("Open sign-in page", "url", url=url))
         built = agent_card.build(CARD if ask else NOTE, state, title="Account", body="Account of %s" % self.name,
@@ -218,6 +226,12 @@ class AccountSwitch:
         is checked, and its card built, before anything is opened or kept: a page that is not a plain
         https address is given up at once, so a retry cannot open a browser again and again."""
         room, tapped = str(sent.get("channel_id") or ""), card_desk.tapped_event(sent)
+        # A tap does not say its device, and a browser sign-in finishes only here (owner 11-27: the phone's tap
+        # opened the Mac's browser): `switch_anywhere` switches with the sign-in finished on any device.
+        if self.remote is not None and self.switch_anywhere and verb == "switch":
+            verb = "add"
+        elif verb == HERE:
+            verb = "switch"     # the browser sign-in on this computer, by name
         if self.remote is not None and verb in ("add", "use", "discard", "signout"):
             return self.remote.tapped(verb, sent, result_file)
         if verb != "switch":

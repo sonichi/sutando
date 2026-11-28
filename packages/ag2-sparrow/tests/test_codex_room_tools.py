@@ -1,6 +1,7 @@
-"""codex-local's AG2 Space room tools: only the owner's DM thread, kept owner-only, gets `mcp_servers.ag2-space`,
-the desktop's stdio proxy under the name shim acting as the agent (mcp_stdio, shared with the Antigravity
-connector). A thread a collaborator's turn can run on (a room's shared thread, a legacy or unknown one) never does.
+"""codex-local's AG2 Space room tools: only the owner-only thread (state/owner-thread, the owner's DM turns
+alone) gets `mcp_servers.ag2-space`, the desktop's stdio proxy under the name shim acting as the agent (mcp_stdio,
+shared with the Antigravity connector), and only on an install that serves nobody but the owner. The shared
+thread never does. No real token is read: the token file here holds a made-up secret and the exchange is a stand-in.
 
 No network, no real `codex` and no real token exchange: the connector runs against `stub_app_server.py`, whose
 `[[config]]` echo shows the config a thread was started or resumed with, and the exchange child is a stand-in
@@ -49,7 +50,7 @@ def config_of(text):
 
 def history_of(text):
     """(the thread a turn ran on, the items the stub recorded on it) from a `[[history]]` echo."""
-    m = re.search(r" thread=(\S+) history=(\[.*?\])(?: config=|\s*$)", text)
+    m = re.search(r" thread=(\S+) history=\[.*?\] items=(\[.*?\])(?: config=|\s*$)", text)
     return m.group(1), json.loads(m.group(2))
 
 
@@ -82,9 +83,12 @@ class World:
         self.runs.append((argv, kw["env"]))
         return mock.Mock(returncode=0, stdout=json.dumps(self.desc), stderr="")
 
-    def serve(self, once, *extra, proxy=PROXY, token=True):
+    def serve(self, once, *extra, proxy=PROXY, token=True, collaborators=False, non_owner=False):
+        """`collaborators`, `non_owner`: serve them (the install defaults); either turns the tools off for all."""
         flags = (["--token-env-file", self.token_file, "--agent-id", AGENT] if token else []) + \
-            (["--mcp-proxy-command", proxy] if proxy else []) + list(extra)
+            (["--mcp-proxy-command", proxy] if proxy else []) + \
+            ([] if collaborators else ["--no-allow-collaborator"]) + \
+            ([] if non_owner else ["--no-allow-non-owner"]) + list(extra)
         entry = lambda *a, **kw: REAL_ENTRY(*a, run=self.exchange, **kw)  # noqa: E731
         spy = lambda conn, prompt, *a, **kw: self.run_turn(conn, prompt, *a, **kw)  # noqa: E731
         with mock.patch.object(mcp_stdio, "stdio_entry", entry), mock.patch.object(cc.Connector, "run_turn", spy), \
@@ -114,7 +118,17 @@ class World:
 
 
 class RoomToolsTest(World, unittest.TestCase):
-    def test_an_owner_thread_gets_the_agents_own_ag2_space_server_with_the_granted_tools(self):
+    def save_owner(self, thread):
+        """An owner-only conversation to continue: what makes the owner's DM turns run apart from everyone else's."""
+        state = self.work / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / cc.OWNER_THREAD).write_text(thread + "\n")
+
+    def owner_thread(self):
+        return (self.work / "state" / cc.OWNER_THREAD).read_text().split()[0]
+
+    def test_the_owner_only_thread_gets_the_agents_own_ag2_space_server_with_the_granted_tools(self):
+        self.save_owner("own-0001")
         write_task(self.work, "task-chat-o", "[[config]] owner", **DM)
         err = self.serve(1)
         text = result(self.work, "task-chat-o")
@@ -134,41 +148,49 @@ class RoomToolsTest(World, unittest.TestCase):
         self.assertEqual(set(env) - set(mcp_stdio.MINT_ENV_KEEP), {"AG2_DEVICE_ENV"},
                          "the exchange gets the token file's path, never the token")
         self.assertIn("ag2-space MCP tools offered on this thread", err)
+        self.assertIn("resumed the owner-only thread own-0001 with the ag2-space MCP tools", err)
         self.assertIn(mcp_stdio.ROOM_TOOLS_HINT, self.prompts[0], "the turn is told what the tools are for")
         self.assertEqual(self.grants[0]["launch"], mcp_stdio.launch_of(cfg), "and runs under a grant for it")
-        saved = (self.work / "state" / "threads" / cc.channel_key(DM["channel"])).read_text().splitlines()
-        self.assertEqual(saved[2], cc.OWNER_ONLY, "a new DM thread is kept owner-only")
+        self.assertEqual(self.owner_thread(), "own-0001")
+        self.assertFalse((self.work / "state" / cc.SHARED_THREAD).exists(), "it never becomes the shared thread")
 
-    def test_an_owner_turn_on_a_shared_thread_runs_without_the_tools_the_grant_or_the_hint(self):
+    def test_the_conversation_resume_thread_names_is_carried_into_the_owner_only_thread_with_the_tools(self):
+        write_task(self.work, "task-chat-o", "[[history]] [[config]] owner", **DM)
+        self.serve(1, "--resume-thread", "conv-0001")
+        text = result(self.work, "task-chat-o")
+        cfg = config_of(text)
+        self.assertEqual(cfg, self.expected_server(cfg))
+        self.assertEqual(history_of(text)[0], "conv-0001")
+        self.assertEqual(self.owner_thread(), "conv-0001")
+
+    def test_an_owner_turn_on_the_shared_thread_runs_without_the_tools_the_grant_or_the_hint(self):
         now = time.time()
         write_task(self.work, "task-chat-r", "[[config]] owner in a room", channel="!r:s.space", mtime=now - 20)
-        self.save_thread("dmshared-0001", DM["channel"], cc.SHARED)    # a DM thread a collaborator may join
-        write_task(self.work, "task-chat-d", "[[history]] [[config]] owner in that DM", mtime=now - 10, **DM)
+        # No owner-only conversation to continue: the owner's DM runs on the shared thread, as everyone's does.
+        write_task(self.work, "task-chat-d", "[[history]] [[config]] owner in the DM", mtime=now - 10, **DM)
         self.serve(2)
         for t in ("task-chat-r", "task-chat-d"):
-            cfg = config_of(result(self.work, t))
-            self.assertNotIn("ag2-space", json.dumps(cfg), t)
-        self.assertEqual(history_of(result(self.work, "task-chat-d"))[0], "dmshared-0001", "resumed, no tools")
+            self.assertNotIn("ag2-space", json.dumps(config_of(result(self.work, t))), t)
+        shared = (self.work / "state" / cc.SHARED_THREAD).read_text().split()[0]
+        self.assertEqual(history_of(result(self.work, "task-chat-d"))[0], shared, "both ran on the shared thread")
         self.assertEqual(self.grants, [None, None])
         for prompt in self.prompts:
             self.assertNotIn(mcp_stdio.ROOM_TOOLS_HINT, prompt)
         self.assertEqual(self.runs, [], "no token exchange for a thread that gets no tools")
-        saved = (self.work / "state" / "threads" / cc.channel_key("!r:s.space")).read_text().splitlines()
-        self.assertEqual(saved[2], cc.SHARED, "an owner's room thread stays shared")
+        self.assertFalse((self.work / "state" / cc.OWNER_THREAD).exists())
 
-    def test_a_dm_thread_file_with_no_verifiable_class_gets_no_tools(self):
-        for third in (None, "owner_only", ""):      # missing, garbled, empty class line
-            with self.subTest(class_line=third):
-                self.save_thread("legacy-0001", DM["channel"], third)
-                tid = "task-chat-l%d" % len(self.prompts)
-                write_task(self.work, tid, "[[config]] owner", **DM)
-                self.serve(1)
-                self.assertNotIn("ag2-space", json.dumps(config_of(result(self.work, tid))))
-                self.assertIsNone(self.grants[-1])
-                self.assertNotIn(mcp_stdio.ROOM_TOOLS_HINT, self.prompts[-1])
+    def test_an_owner_room_turn_beside_an_owner_only_thread_stays_on_the_shared_thread_without_the_tools(self):
+        self.save_owner("own-0001")
+        write_task(self.work, "task-chat-r", "[[history]] [[config]] owner in a room", channel="!r:s.space")
+        self.serve(1)
+        text = result(self.work, "task-chat-r")
+        self.assertNotIn("ag2-space", json.dumps(config_of(text)))
+        self.assertNotEqual(history_of(text)[0], "own-0001")
+        self.assertEqual(self.grants, [None])
         self.assertEqual(self.runs, [])
 
-    def test_a_collaborators_next_turn_cannot_see_the_owners_tool_result(self):
+    def test_a_collaborators_next_turn_is_refused_and_sees_nothing_of_the_owners_tool_result(self):
+        self.save_owner("own-0001")
         now = time.time()
         write_task(self.work, "task-chat-o", "[[toolcall]] [[history]] [[config]] owner", mtime=now - 20, **DM)
         tid = "task-1792100000009"      # the gateway's collaborator turn, in the same channel
@@ -177,16 +199,15 @@ class RoomToolsTest(World, unittest.TestCase):
         self.serve(2)
         owner_text, collab_text = result(self.work, "task-chat-o"), result(self.work, tid)
         owner_thread, owner_items = history_of(owner_text)
+        self.assertEqual(owner_thread, "own-0001")
         self.assertIn("ag2-space", config_of(owner_text)["mcp_servers"])
         self.assertEqual([i["type"] for i in owner_items], ["mcpToolCall"])
-        collab_thread, collab_items = history_of(collab_text)
-        self.assertNotEqual(collab_thread, owner_thread, "the collaborator runs on its own thread")
-        self.assertEqual(collab_items, [], "with no tool call or result in its history")
-        self.assertNotIn("TOOL-RESULT", collab_text)
-        self.assertNotIn("ag2-space", json.dumps(config_of(collab_text)))
-        self.assertIsNone(self.grants[1])
+        self.assertEqual(collab_text, task_io.NON_OWNER_REFUSED, "no turn is run for it at all")
+        self.assertEqual(len(self.prompts), 1, "only the owner's turn reached Codex")
+        self.assertFalse((Path(self.state()) / mcp_stdio.GRANT_NAME).exists())
 
-    def test_no_collaborator_team_or_guest_thread_gets_the_tools(self):
+    def test_no_collaborator_team_or_guest_turn_is_run_beside_the_tools(self):
+        self.save_owner("own-0001")
         tid = "task-1792100000009"
         now = time.time()
         write_text(self.work, tid, gateway_mid_task(tid, "[[config]] collab", tier="team", collaborator=True),
@@ -194,89 +215,76 @@ class RoomToolsTest(World, unittest.TestCase):
         write_task(self.work, "task-chat-t", "[[config]] plain team", tier="team", channel="!t:s.space", mtime=now - 20)
         write_task(self.work, "task-chat-g", "[[config]] guest", tier="guest", channel="!g:s.space", mtime=now - 10)
         self.serve(3)
-        self.assertIsNone(config_of(result(self.work, tid)), "the collaborator's thread: no config override at all")
-        for t in ("task-chat-t", "task-chat-g"):
-            cfg = config_of(result(self.work, t))
-            self.assertEqual(cfg["mcp_servers"], {"owner-mcp": {"enabled": False}}, t)
-            self.assertNotIn("ag2-space", json.dumps(cfg), t)
-        self.assertEqual(self.runs, [], "no exchange for a thread a collaborator or guest runs on")
+        for t in (tid, "task-chat-t", "task-chat-g"):
+            self.assertNotIn("config=", result(self.work, t), t)
+        self.assertEqual((self.prompts, self.grants, self.runs), ([], [], []), "no turn, no grant, no exchange")
 
-    def test_a_restricted_turn_after_an_owner_turn_in_the_same_room_runs_on_its_own_thread_without_it(self):
+    def test_a_guest_after_an_owner_turn_in_the_same_room_is_refused(self):
+        self.save_owner("own-0001")
         now = time.time()
         write_task(self.work, "task-chat-o", "[[config]] owner", mtime=now - 20, **DM)
         write_task(self.work, "task-chat-g", "[[config]] guest", tier="guest", channel=DM["channel"], mtime=now - 10)
         self.serve(2)
         self.assertIn("ag2-space", config_of(result(self.work, "task-chat-o"))["mcp_servers"])
-        self.assertNotIn("ag2-space", config_of(result(self.work, "task-chat-g"))["mcp_servers"])
-        self.assertIn("ephemeral=True", result(self.work, "task-chat-g"))
-        self.assertNotIn(mcp_stdio.ROOM_TOOLS_HINT, self.prompts[1], "no tools hint either")
+        self.assertNotIn("config=", result(self.work, "task-chat-g"))
+        self.assertEqual(len(self.prompts), 1)
 
-    def test_a_resumed_thread_is_resumed_with_the_server(self):
+    def test_the_owner_only_thread_is_resumed_with_the_server_on_each_run(self):
+        self.save_owner("own-0001")
         write_task(self.work, "task-chat-1", "[[config]] one", **DM)
         self.serve(1)
-        thread = (self.work / "state" / "threads" / cc.channel_key(DM["channel"])).read_text().split()[0]
         write_task(self.work, "task-chat-2", "[[config]] two", **DM)
         self.serve(1)
         cfg = config_of(result(self.work, "task-chat-2"))
         self.assertEqual(cfg, self.expected_server(cfg))
-        saved = self.work / "state" / "threads" / cc.channel_key(DM["channel"])
-        self.assertEqual(saved.read_text().split()[0], thread)
+        self.assertEqual(self.owner_thread(), "own-0001")
         self.assertEqual(len(self.runs), 2, "one exchange per thread opened on a server, none per turn on a live one")
 
-    def save_thread(self, thread, channel=DM["channel"], cls=cc.OWNER_ONLY):
-        threads = self.work / "state" / "threads"
-        threads.mkdir(parents=True, exist_ok=True)
-        (threads / cc.channel_key(channel)).write_text(
-            "%s\n%s\n" % (thread, channel) + ("%s\n" % cls if cls is not None else ""))
-
     def test_a_resume_refused_with_the_tools_keeps_the_same_conversation_without_them(self):
-        self.save_thread("nomcp-0001")      # the stub refuses this resume only when the config adds mcp_servers
+        self.save_owner("nomcp-0001")      # the stub refuses this resume only when the config adds mcp_servers
         write_task(self.work, "task-chat-1", "[[config]] owner", **DM)
         err = self.serve(1)
         self.assertTrue(result(self.work, "task-chat-1").rstrip().endswith(" config=null"), "runs without the tools")
-        saved = (self.work / "state" / "threads" / cc.channel_key(DM["channel"])).read_text().split()[0]
-        self.assertEqual(saved, "nomcp-0001", "the same conversation is kept, never replaced")
+        self.assertEqual(self.owner_thread(), "nomcp-0001", "the same conversation is kept, never replaced")
         self.assertIn("resuming the same thread without them", err)
-        self.assertNotIn("starting a new thread", err)
+        self.assertNotIn("starting a new owner-only thread", err)
         self.assertEqual(self.grants, [None], "a thread without the tools gets no grant")
+        self.assertNotIn(mcp_stdio.ROOM_TOOLS_HINT, self.prompts[0])
 
-    def test_a_resume_refused_with_and_without_the_tools_falls_back_to_a_new_thread(self):
-        self.save_thread("stale-0001")
+    def test_a_resume_refused_with_and_without_the_tools_falls_back_to_a_new_owner_only_thread(self):
+        self.save_owner("stale-0001")
         write_task(self.work, "task-chat-1", "[[config]] owner", **DM)
         err = self.serve(1)
         cfg = config_of(result(self.work, "task-chat-1"))
         self.assertEqual(cfg, self.expected_server(cfg), "the new thread gets the tools")
-        saved = (self.work / "state" / "threads" / cc.channel_key(DM["channel"])).read_text().split()[0]
-        self.assertNotEqual(saved, "stale-0001")
+        self.assertNotEqual(self.owner_thread(), "stale-0001")
         self.assertIn("resuming the same thread without them", err)
-        self.assertIn("thread/resume failed, starting a new thread", err)
+        self.assertIn("starting a new owner-only thread", err)
+        self.assertFalse((self.work / "state" / cc.SHARED_THREAD).exists(), "still apart from the shared thread")
 
-    def test_each_turn_runs_under_its_own_grant_naming_its_threads_launch_retired_when_it_ends(self):
-        tid = "task-1792100000009"
+    def test_each_owner_turn_runs_under_its_own_grant_naming_its_threads_launch_retired_when_it_ends(self):
+        self.save_owner("own-0001")
         now = time.time()
         write_task(self.work, "task-chat-o", "[[config]] owner", mtime=now - 30, **DM)
-        write_text(self.work, tid, gateway_mid_task(tid, "[[config]] collab", tier="team", collaborator=True),
-                   mtime=now - 20)
-        write_task(self.work, "task-chat-g", "[[config]] guest", tier="guest", channel="!g:s.space", mtime=now - 10)
-        self.serve(3, "--allow-non-owner")
-        owner, collab, guest = self.grants
+        write_task(self.work, "task-chat-r", "[[config]] owner in a room", channel="!r:s.space", mtime=now - 20)
+        self.serve(2)
+        owner, room = self.grants
         launch = mcp_stdio.launch_of(config_of(result(self.work, "task-chat-o")))
         self.assertEqual((owner["launch"], owner["tier"], set(owner["tools"])), (launch, "owner", mcp_auth.OWNER_TOOLS))
-        self.assertIsNone(collab, "a collaborator's turn gets no grant until its rooms and actions are enforced")
         self.assertGreater(owner["expires"], now)
-        self.assertIsNone(guest, "a restricted turn runs with no grant")
-        grant = Path(self.state()) / mcp_stdio.GRANT_NAME
-        self.assertFalse(grant.exists(), "no grant outlives its turn")
+        self.assertIsNone(room, "the owner's turn on the shared thread runs with no grant")
+        self.assertFalse((Path(self.state()) / mcp_stdio.GRANT_NAME).exists(), "no grant outlives its turn")
 
     def test_a_grant_left_by_a_run_that_died_is_retired_at_start(self):
         Path(self.state()).mkdir(parents=True)
         mcp_stdio.write_grant(self.state(), "old-launch", "owner", mcp_auth.OWNER_TOOLS, 3600)
         write_task(self.work, "task-chat-g", "[[config]] guest", tier="guest")
-        self.serve(1, "--allow-non-owner")
+        self.serve(1, non_owner=True)
         self.assertEqual(self.grants, [None])
         self.assertFalse((Path(self.state()) / mcp_stdio.GRANT_NAME).exists())
 
-    def test_without_the_proxy_command_or_the_token_file_an_owner_thread_gets_nothing(self):
+    def test_without_the_proxy_command_or_the_token_file_the_owner_only_thread_gets_nothing(self):
+        self.save_owner("own-0001")
         write_task(self.work, "task-chat-1", "[[config]] no proxy", **DM)
         self.serve(1, proxy=None)
         self.assertTrue(result(self.work, "task-chat-1").rstrip().endswith(" config=null"))
@@ -285,13 +293,48 @@ class RoomToolsTest(World, unittest.TestCase):
         self.assertTrue(result(self.work, "task-chat-2").rstrip().endswith(" config=null"))
         self.assertIn("no --token-env-file", err)
         self.assertEqual(self.runs, [])
+        self.assertEqual(self.grants, [None, None])
+
+    def test_an_install_that_serves_anyone_but_the_owner_gets_no_tools_whatever_the_sandbox(self):
+        n = 0
+        for served in ({"collaborators": True}, {"non_owner": True}, {"collaborators": True, "non_owner": True}):
+            for sandbox in ("read-only", "workspace-write", "danger-full-access"):
+                with self.subTest(served=served, sandbox=sandbox):
+                    self.save_owner("own-0001")
+                    n, tid = n + 1, "task-chat-w%d" % n
+                    write_task(self.work, tid, "[[config]] owner", **DM)
+                    err = self.serve(1, "--sandbox", sandbox, **served)
+                    self.assertTrue(result(self.work, tid).rstrip().endswith(" config=null"), "no tools")
+                    who = "a collaborator's turn" if served.get("collaborators") else "a non-owner's turn"
+                    self.assertIn("ag2-space MCP tools not offered: %s could read" % who, err)
+                    self.assertIsNone(self.grants[-1])
+                    self.assertNotIn(mcp_stdio.ROOM_TOOLS_HINT, self.prompts[-1])
+        self.assertEqual(self.runs, [], "no token exchange either: the agent's token file is never opened")
+        self.assertFalse((Path(self.state()) / mcp_stdio.SHIM_NAME).exists(), "and no launcher is written")
+        self.assertFalse((Path(self.state()) / mcp_stdio.DESCRIPTOR_NAME).exists())
+
+    def test_with_only_the_owner_served_a_writable_owner_sandbox_keeps_the_tools(self):
+        self.save_owner("own-0001")
+        write_task(self.work, "task-chat-o", "[[config]] owner", **DM)
+        self.serve(1, "--sandbox", "workspace-write")
+        cfg = config_of(result(self.work, "task-chat-o"))
+        self.assertEqual(cfg, self.expected_server(cfg))
+        self.assertEqual(self.grants[0]["launch"], mcp_stdio.launch_of(cfg))
+
+    def test_with_only_the_owner_served_but_no_owner_only_conversation_there_are_no_tools(self):
+        write_task(self.work, "task-chat-o", "[[config]] owner", **DM)
+        self.serve(1)
+        self.assertTrue(result(self.work, "task-chat-o").rstrip().endswith(" config=null"))
+        self.assertEqual((self.grants, self.runs), ([None], []), "the DM ran on the shared thread")
 
     def test_a_failed_exchange_runs_the_turn_without_the_tools(self):
+        self.save_owner("own-0001")
         self.desc = dict(self.desc, env_file="/other/agent.env")    # not the agent's own token file
         write_task(self.work, "task-chat-1", "[[config]] owner", **DM)
         err = self.serve(1)
         self.assertTrue(result(self.work, "task-chat-1").rstrip().endswith(" config=null"))
         self.assertIn("ag2-space MCP tools not offered: the token exchange printed no proxy descriptor", err)
+        self.assertEqual(self.owner_thread(), "own-0001")
 
 
 class RoomToolsUnitTest(World, unittest.TestCase):
@@ -309,7 +352,8 @@ class RoomToolsUnitTest(World, unittest.TestCase):
                     raise got
                 return got
         args = cc.build_parser().parse_args(["--work", str(self.work), "--token-env-file", self.token_file,
-                                             "--agent-id", AGENT, "--mcp-proxy-command", PROXY, *flags])
+                                             "--agent-id", AGENT, "--mcp-proxy-command", PROXY,
+                                             "--no-allow-collaborator", "--no-allow-non-owner", *flags])
         args.state = str(self.work / "state")
         os.makedirs(args.state, exist_ok=True)
         c = cc.Connector(FakeRpc, args, note="n",
@@ -378,23 +422,59 @@ class RoomToolsUnitTest(World, unittest.TestCase):
         with self.assertRaises(RuntimeError), contextlib.redirect_stderr(io.StringIO()):
             c.start_thread(task_io.OWNER_CAPABILITIES, False, self.tools)
 
-    tools = {"mcp_servers": {"ag2-space": {"env": {shim.LAUNCH_ENV: "l1"}}}}
+    def test_unless_both_are_known_to_be_kept_out_nothing_is_offered_or_even_asked(self):
+        owner, missing = task_io.OWNER_CAPABILITIES, object()
+        values = (False, True, None, "0", 0, "", missing)   # only exactly False keeps that kind of turn out
+        for collab in values:
+            for non_owner in values:
+                c, calls = self.connector({"config/read": {"config": {"mcp_servers": {}}}})
+                for name, value in (("allow_collaborator", collab), ("allow_non_owner", non_owner)):
+                    if value is missing:
+                        delattr(c.args, name)
+                    else:
+                        setattr(c.args, name, value)
+                with contextlib.redirect_stderr(io.StringIO()) as err:
+                    got = c.room_tools(owner, "/w")
+                if collab is False and non_owner is False:
+                    self.assertTrue(got)
+                    self.runs.clear()
+                    continue
+                self.assertEqual(got, {}, (collab, non_owner))
+                self.assertIn("could read the agent's credentials", err.getvalue())
+                self.assertEqual((calls, self.runs), ([], []), "refused before anything is asked or exchanged")
 
-    def test_a_collaborator_turn_that_would_land_on_a_thread_with_the_tools_gets_its_own(self):
+    tools = {"mcp_servers": {"ag2-space": {"env": {shim.LAUNCH_ENV: "l1"}}}}
+    READ = {"config": {"mcp_servers": {}}}
+
+    def test_a_resume_that_times_out_with_the_tools_continues_the_same_conversation_without_them(self):
+        def resume(params):
+            return TimeoutError("thread/resume: no answer") if "config" in params else {"thread": {"id": "own-1"}}
+        (Path(self.work) / "state").mkdir(parents=True, exist_ok=True)
+        (Path(self.work) / "state" / cc.OWNER_THREAD).write_text("own-1\n")
+        c, calls = self.connector({"config/read": self.READ, "thread/resume": resume})
+        dm = {"channel_id": "!dm:s.space", "channel_kind": "dm", "access_tier": "owner"}
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            c.open_for(dm, cc.capabilities(dm))
+        self.assertEqual(c.thread_id, "own-1", "the same conversation, not a new thread")
+        self.assertEqual([(m, "config" in p) for m, p in calls if m.startswith("thread/")],
+                         [("thread/resume", True), ("thread/resume", False)])
+        self.assertIn("timed out", err.getvalue())
+        self.assertEqual(c.launches, {}, "and it runs without the tools")
+        self.assertFalse(c.grant_room_tools(task_io.OWNER_CAPABILITIES, "owner"), "so no turn on it is granted them")
+        self.assertEqual((Path(self.work) / "state" / cc.OWNER_THREAD).read_text().split()[0], "own-1")
+
+    def test_the_shared_thread_is_never_opened_with_the_tools_whoever_asks(self):
         room = "!room:ag2.space"
-        threads = Path(self.work) / "state" / "threads"
-        threads.mkdir(parents=True, exist_ok=True)
-        (threads / cc.channel_key(room)).write_text("th-tools\n%s\n%s\n" % (room, cc.SHARED))
-        c, calls = self.connector({"thread/start": {"thread": {"id": "th-collab"}},
-                                   "thread/resume": {"thread": {"id": "th-tools"}}})
-        c.live[cc.channel_key(room)] = c.thread_id = "th-tools"
-        c.bind_launch(self.tools)       # however it came about, that thread runs with the tools
+        c, calls = self.connector({"config/read": self.READ, "thread/start": {"thread": {"id": "th-shared"}}})
         with contextlib.redirect_stderr(io.StringIO()):
+            c.open_for({"channel_id": room, "access_tier": "owner"}, task_io.OWNER_CAPABILITIES)
+            self.assertFalse(c.grant_room_tools(task_io.OWNER_CAPABILITIES, "owner"), "even the owner's turn on it")
             c.open_for({"channel_id": room, "access_tier": "team"}, task_io.COLLABORATOR_CAPABILITIES)
-        self.assertEqual(c.thread_id, "th-collab")
+        self.assertEqual(c.thread_id, "th-shared")
         [(method, params)] = calls
-        self.assertEqual(method, "thread/start")
+        self.assertEqual(method, "thread/start", "no config/read, no exchange: the tools are never built for it")
         self.assertNotIn("ag2-space", json.dumps(params))
+        self.assertEqual((c.launches, self.runs), ({}, []))
         self.assertFalse(c.grant_room_tools(task_io.COLLABORATOR_CAPABILITIES, "collaborator"))
 
 
