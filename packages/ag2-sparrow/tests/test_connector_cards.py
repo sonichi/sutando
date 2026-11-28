@@ -225,9 +225,90 @@ class ConnectorCards(unittest.TestCase):
         self.assertEqual(cc.Poster(self.state, post, log=self.logs.append, clock=lambda: 1000.0).sweep(), 1)
         self.assertEqual(cc.moved_to(self.state, "$card1"), "$answer1")
         self.assertIn("agent-card: the tapped card was not pointed to its answer (OSError)", self.logs)
-        refused = cc.Poster(self.state, lambda p: {"ok": False}, log=self.logs.append, clock=lambda: 1000.0)
-        self.assertEqual(refused.send_below({"dedupe_key": "agent-card:x", "room_id": ROOM}, "$card1", answer[1]),
-                         ({"ok": False}, ""), "no answer posted: nothing to point to")
+        # No answer posted: nothing to point to, nothing moved, and the card stays queued.
+        qid = cc.queue(self.state, ROOM, *answer, edit="$other", below=True)
+        self.sent.clear()
+        self.assertEqual(self.poster({"ok": False}).sweep(), 0)
+        self.assertEqual([p["op"] for p in self.sent], ["message"])
+        self.assertEqual((cc.moved_to(self.state, "$other"), cc.outcome(self.state, qid)), ("$other", ""))
+
+    def below_answer(self):
+        """The menu posted and recorded as $card1, and an answer with a button queued under a tap on it."""
+        ac, _ = cc._core()
+        self.posted()
+        answer = ac.build("model-switch-status", "pending", title="Model", body="Switching", text="Switching to Opus.",
+                          buttons=[ac.button("Undo", "reply", reply="Undo", command=ac.reply("model", "agent", "undo"))])
+        return cc.queue(self.state, ROOM, *answer, edit="$card1", below=True)
+
+    def undo_tap(self):
+        ac, _ = cc._core()
+        tap = headers("Undo", event="$answer1", card_click=json.dumps({"card_id": "model-switch-status", "action": "Undo"}))
+        return cc.click(tap, "Undo", self.root).verdict
+
+    def test_a_tap_on_the_answer_acts_while_the_tapped_card_is_still_being_pointed_to_it(self):
+        ac, _ = cc._core()
+        self.below_answer()
+        during = {}
+
+        def post(payload):
+            self.sent.append(payload)
+            if payload["op"] == "edit":
+                # The pointer edit is on its way (it may be slow): the owner already sees the answer and taps it.
+                cc.absorb(self.state, self.root)
+                during.update(tap=self.undo_tap(), moved=cc.moved_to(self.state, "$card1"),
+                              old=cc.click(headers("Switch to Opus"), "Switch to Opus", self.root).verdict)
+            return {"ok": True, "event_id": "$answer1"}
+        self.assertEqual(cc.Poster(self.state, post, log=self.logs.append, clock=lambda: 1000.0).sweep(), 1)
+        self.assertEqual([p["op"] for p in self.sent[-2:]], ["message", "edit"])
+        self.assertEqual(during, {"tap": ac.COMMAND, "moved": "$answer1", "old": ac.FORGED})
+
+    def test_a_sweep_stopped_while_recording_an_answer_below_is_finished_by_the_next(self):
+        ac, _ = cc._core()
+
+        class Stopped(BaseException):
+            """The process ending mid-sweep: nothing in the sweep catches it."""
+
+        def run(stop_at):
+            """One sweep stopped at `stop_at`, then a new process's sweep; whether the stop was reached."""
+            self.setUp()
+            qid = self.below_answer()
+            self.sent.clear()
+            real_write, real_dirs, writes, hit = cc._write, cc._private_dirs, [0], []
+
+            def write(path, record):
+                writes[0] += 1
+                if stop_at == ("write", writes[0]):
+                    hit.append(1)
+                    raise Stopped()
+                real_write(path, record)
+
+            def dirs(folder):
+                if stop_at == "before-moved" and folder.name == cc.MOVED[-1]:
+                    hit.append(1)
+                    raise Stopped()      # the answer's event is known; where the tapped card went is not saved yet
+                real_dirs(folder)
+            with mock.patch.object(cc, "_write", write), mock.patch.object(cc, "_private_dirs", dirs):
+                try:
+                    self.poster({"ok": True, "event_id": "$answer1"}).sweep()
+                except Stopped:
+                    pass
+            self.poster({"ok": True, "event_id": "$answer1"}).sweep()
+            self.poster({"ok": True, "event_id": "$answer1"}).sweep()
+            cc.absorb(self.state, self.root)
+            self.assertEqual(cc.moved_to(self.state, "$card1"), "$answer1", stop_at)
+            self.assertEqual(cc.outcome(self.state, qid), "posted", stop_at)
+            self.assertEqual(self.undo_tap(), ac.COMMAND, stop_at)
+            self.assertEqual(cc.click(headers("Switch to Opus"), "Switch to Opus", self.root).verdict, ac.FORGED, stop_at)
+            # One answer, under one key, and the tapped card pointed to it; never an edit of the answer by itself.
+            self.assertEqual({(p["op"], p.get("event_id"), p["dedupe_key"]) for p in self.sent},
+                             {("message", None, "agent-card:" + qid), ("edit", "$card1", "agent-card-moved:" + qid)}, stop_at)
+            self.assertEqual(list(self.state.joinpath(*cc.OUTBOX).glob("*.json")), [], stop_at)
+            return bool(hit)
+        self.assertTrue(run("before-moved"))
+        stops = 0
+        while run(("write", stops + 1)):
+            stops += 1
+        self.assertGreaterEqual(stops, 4, "the attempt mark, the note of the answer and both records")
 
     def test_an_edit_the_server_refuses_is_posted_as_a_new_card_and_a_network_failure_is_retried(self):
         ac, _ = cc._core()
