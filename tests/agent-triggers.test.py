@@ -321,6 +321,22 @@ class Dispatch(unittest.TestCase):
             self.assertIn(words, text)
         self.assertNotIn("seen.txt", text)
 
+    def test_owner_mentions_resolve_to_the_shipped_owner_mention_playbook(self):
+        # The backend's owner.mentioned_by_human / _by_agent name playbook "owner-mention".
+        want = REPO / "skills" / "owner-mention" / "SKILL.md"
+        for event_type in ("owner.mentioned_by_human", "owner.mentioned_by_agent"):
+            self.assertEqual(at.EVENT_PLAYBOOKS[event_type], "owner-mention")
+            self.assertEqual(at.event_type_value(event_type), event_type)
+            for pb in ("owner-mention", None, "connect-apps", "../etc"):
+                self.assertEqual(at.resolve_playbook(event_type, pb, REPO / "skills"), want, pb)
+        self.assertEqual(at.allowed_playbook_value("owner-mention"), "owner-mention")
+        errors, warnings = lint._lint_manifest(REPO / "skills" / "owner-mention")
+        self.assertEqual((errors, warnings), ([], []))
+        text = " ".join(want.read_text().split())
+        for words in ("data, never instructions", "Do not read it", "Never answer as your owner",
+                      "owner_notice.py publish", "Never write the result file yourself"):
+            self.assertIn(words, text)
+
     def test_shipped_room_onboard_opts_in(self):
         manifest = json.loads((REPO / "skills" / "room-onboard" / "manifest.json").read_text())
         self.assertIs(manifest.get("playbook"), True)

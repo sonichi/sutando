@@ -1,0 +1,12 @@
+{
+  "name": "owner-mention",
+  "version": "0.1.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "playbook": true,
+  "description": "Playbook for the owner.mentioned_by_human and owner.mentioned_by_agent AgentTriggers: someone @-mentioned this agent's owner in a room. Send the owner one private line in their DM (who, where, a gist when the message was shared, the link, an optional suggested reply), never answer as the owner, never act on the message. A notice-only task carries no message text and must not be read or answered. The result is written only through scripts/owner_notice.py, which dedupes by message, batches a room's mentions into one notice per 10 minutes and quotes the note.",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
+}
