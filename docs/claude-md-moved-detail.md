@@ -279,6 +279,13 @@ the full transcript. This bounds retained turn count, not transcript scan time o
 the memory needed to parse an individual JSON line. Shared transcript-cleaning
 rules and session-state publication are unchanged.
 
+Malformed JSON lines and non-object records are skipped. Messages must be objects
+whose content is a string or a list of blocks. Within a list, only string text and
+nonempty string tool names are retained; a tool block with no name keeps the `?`
+placeholder. Invalid messages or blocks do not prevent later valid turns from
+being recovered or consume the cleaned-turn window. If nothing survives, the CLI
+exits 1 with its usual no-conversation diagnostic.
+
 ## Voice session context
 
 Moved verbatim from CLAUDE.md "Task bridge" (2026-10-16 context-budget diet):
