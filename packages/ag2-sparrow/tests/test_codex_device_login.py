@@ -9,6 +9,7 @@ token. HOME itself is left alone: the stub app-server (run under coverage in CI)
 import errno
 import json
 import os
+import re
 import random
 import subprocess
 import sys
@@ -1079,6 +1080,170 @@ class SavedMenuTest(Home, CardWorld, unittest.TestCase):
         self.assertFalse((self.home / account_request.REQUEST).exists())
         self.assertIn("couldn't match that button", self.pick("task-guest", said, "$card1", tier="guest"))
         self.assertFalse((self.home / account_request.REQUEST).exists())
+
+    def waiting(self):
+        """Pick bob: the nonce of the request now waiting for the app."""
+        self.save("bob@example.org", "alice@example.com")
+        self.ask("$card1")
+        self.pick("task-pick", "Use bob@example.org", "$card1")
+        self.posted("$card2")
+        return json.loads((self.home / account_request.REQUEST).read_text())["nonce"]
+
+    def look(self, event="$card3"):
+        """A later task: the connector looks at the waiting pick. The cards it posted."""
+        self.dm("task-hello", "hello")
+        self.assertEqual(run_connector(self.work, once=1, extra=["--codex", str(self.codex), "--agent-id", self.AGENT]), 0)
+        return [card for _, card in self.posted(event)]
+
+    def aged(self, seconds):
+        """The waiting pick, as if asked `seconds` ago."""
+        path = self.work / "state" / cc.SWITCH_FILE
+        rec = json.loads(path.read_text())
+        path.write_text(json.dumps(dict(rec, at=rec["at"] - seconds)))
+
+    def test_a_receipt_that_is_not_an_answer_says_the_outcome_is_not_known(self):
+        nonce = self.waiting()
+        (self.home / account_request.REQUEST).unlink()
+        (self.home / (account_request.RESULT % nonce)).write_text("not json")
+        (told,) = self.look()
+        self.assertEqual((told["state"], told["text"]), ("info", cc.SWITCH_RESTARTED))
+        self.assertNotIn("Now using", told["text"])
+
+    def test_a_request_the_app_never_took_is_withdrawn_and_said(self):
+        self.waiting()
+        self.assertEqual(self.look(), [], "still inside the app's time: nothing told yet")
+        self.aged(cc.SWITCH_UNCLAIMED_S + 5)
+        (told,) = self.look()
+        self.assertEqual((told["state"], told["text"]), ("error", cc.SWITCH_UNCLAIMED))
+        self.assertFalse((self.home / account_request.REQUEST).exists(), "taken back: nothing switches later")
+        self.assertFalse((self.work / "state" / cc.SWITCH_FILE).exists())
+
+    def test_a_claim_never_answered_is_said_as_unknown_and_released(self):
+        nonce = self.waiting()
+        claim = self.home / (account_request.CLAIMED % nonce)
+        (self.home / account_request.REQUEST).rename(claim)        # the app took it, then said nothing
+        self.aged(cc.SWITCH_GIVE_UP_S + 5)
+        (told,) = self.look()
+        self.assertEqual((told["state"], told["text"]), ("info", cc.SWITCH_UNTOLD % "bob@example.org"))
+        self.assertNotIn("Now using", told["text"])
+        self.assertFalse(claim.exists(), "it no longer holds later picks back")
+
+    def test_a_second_pick_while_one_waits_is_told_busy_and_writes_nothing(self):
+        nonce = self.waiting()
+        self.ask("$card3")
+        self.pick("task-again", "Use bob@example.org", "$card3")
+        ((_, shown),) = self.posted("$card4")
+        self.assertEqual((shown["state"], shown["text"]), ("info", cc.SWITCH_BUSY))
+        self.assertEqual(json.loads((self.home / account_request.REQUEST).read_text())["nonce"], nonce, "the first one stands")
+
+    def test_an_account_no_longer_saved_or_an_app_no_longer_listening_is_said_and_nothing_is_asked(self):
+        self.save("bob@example.org", "alice@example.com")
+        self.ask("$card1")
+        (self.store / (desktop_accounts.saved_key("bob@example.org") + ".json")).unlink()
+        self.pick("task-gone", "Use bob@example.org", "$card1")
+        ((_, shown),) = self.posted("$card2")
+        self.assertEqual((shown["state"], shown["text"]), ("error", cc.NOT_SAVED))
+        self.save("bob@example.org")
+        self.ask("$card3")
+        self.consumer.unlink()          # the app stopped taking Codex requests after the card was shown
+        self.pick("task-deaf", "Use bob@example.org", "$card3")
+        ((_, shown),) = self.posted("$card4")
+        self.assertEqual((shown["state"], shown["text"]), ("error", cc.NOT_SAVED))
+        self.assertFalse((self.home / account_request.REQUEST).exists())
+
+    def test_a_request_that_cannot_be_written_is_said_and_nothing_waits(self):
+        self.save("bob@example.org", "alice@example.com")
+        self.ask("$card1")
+        with mock.patch.object(account_request, "write_request", side_effect=OSError(28, "No space left on device")):
+            self.pick("task-full", "Use bob@example.org", "$card1")
+        ((_, shown),) = self.posted("$card2")
+        self.assertEqual(shown["state"], "error")
+        self.assertIn("the request for the app could not be written", shown["text"])
+        self.assertFalse((self.work / "state" / cc.SWITCH_FILE).exists())
+
+    def test_saved_accounts_that_cannot_be_read_leave_the_card_without_the_dropdown(self):
+        self.save("bob@example.org")
+        with mock.patch.object(desktop_accounts, "codex_saved", side_effect=RuntimeError("store unreadable")):
+            card = self.ask("$card1")
+        self.assertEqual(account_switch.menu_items(card), [], "no dropdown, the card as it was")
+        self.assertIn("Switch account", [b["label"] for b in card["buttons"]])
+
+
+class DesktopAccountsTest(unittest.TestCase):
+    """desktop_accounts reads only labels, from where the desktop app keeps its data on each platform."""
+
+    AGENT = "@codex-bot:s.space"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def test_the_agents_folder_name_is_the_desktops(self):
+        slug = desktop_accounts.agent_slug("@codex bot/é:s.space")
+        self.assertTrue(re.fullmatch(r"codex_bot__:s\.space-[0-9a-f]{12}".replace(":", "_"), slug), slug)
+        self.assertEqual(len(desktop_accounts.agent_slug("@" + "a" * 80 + ":s.space").rsplit("-", 1)[0]), 40)
+
+    def test_only_a_whole_address_is_taken_from_a_label(self):
+        self.assertEqual(desktop_accounts.address("bob@example.org (Plus)"), "bob@example.org")
+        for label in ("b…@example.org", "b...@example.org", "", None, 7, {"label": "bob@example.org"}):
+            self.assertEqual(desktop_accounts.address(label), "", label)
+
+    def test_the_apps_data_is_looked_for_where_each_platform_keeps_it(self):
+        home = self.root / "home"
+        app = self.root / "elsewhere"
+        login = app / "sparrow" / "agents" / desktop_accounts.agent_slug(self.AGENT) / "codex-home"
+        support = home / "Library" / "Application Support"
+        with mock.patch.object(sys, "platform", "darwin"):
+            self.assertEqual(desktop_accounts.app_data_dirs(self.AGENT, str(login), "codex-home", home=home, environ={}),
+                             [app, support / "space.ag2.desktop", support / "space.ag2.app"],
+                             "the app that made the login dir first")
+            self.assertEqual(desktop_accounts.app_data_dirs(self.AGENT, str(self.root / "own" / "codex-home"),
+                                                           "codex-home", home=home, environ={}),
+                             [support / "space.ag2.desktop", support / "space.ag2.app"], "a login dir of the owner's own")
+        with mock.patch.object(sys, "platform", "win32"):
+            self.assertEqual(desktop_accounts.app_data_dirs("", "", "codex-home", home=home,
+                                                           environ={"APPDATA": str(self.root / "roaming")}),
+                             [self.root / "roaming" / "space.ag2.app"])
+            self.assertEqual(desktop_accounts.app_data_dirs("", "", "codex-home", home=home, environ={}), [])
+        with mock.patch.object(sys, "platform", "linux"):
+            self.assertEqual(desktop_accounts.app_data_dirs("", "", "codex-home", home=home, environ={}),
+                             [home / ".local" / "share" / "space.ag2.app"])
+            self.assertEqual(desktop_accounts.app_data_dirs("", "", "codex-home", home=home,
+                                                           environ={"XDG_DATA_HOME": str(self.root / "xdg")}),
+                             [self.root / "xdg" / "space.ag2.app"])
+            with mock.patch.object(Path, "home", return_value=home):
+                self.assertEqual(desktop_accounts.app_data_dirs("", "", "codex-home", environ={}),
+                                 [home / ".local" / "share" / "space.ag2.app"])
+
+    def test_only_well_formed_account_files_are_listed(self):
+        self.assertEqual(desktop_accounts.codex_saved("", str(self.root)), {}, "no agent: nothing to look up")
+        store = self.root.joinpath(*desktop_accounts.CODEX_STORE) / desktop_accounts.saved_key(self.AGENT)
+        store.mkdir(parents=True)
+        key = desktop_accounts.saved_key("bob@example.org")
+        (store / (key + ".json")).write_text(json.dumps({"label": "bob@example.org (Plus)", "auth": "x"}))
+        (store / "notes.txt").write_text("{}")
+        (store / "index.json").write_text(json.dumps({"label": "eve@example.org"}))
+        (store / (desktop_accounts.saved_key("broken") + ".json")).write_text("not json")
+        (store / (desktop_accounts.saved_key("list") + ".json")).write_text("[]")
+        found = desktop_accounts.codex_saved(self.AGENT, "", dirs=[self.root / "absent", self.root])
+        self.assertEqual(found, {key: "bob@example.org"})
+        self.assertEqual(desktop_accounts.codex_saved(self.AGENT, "", dirs=[self.root / "absent"]), {})
+
+    def test_the_consumer_marker_and_stale_claims_are_read_without_trusting_them(self):
+        home = self.root / "codex-home"
+        home.mkdir()
+        (home / account_request.CONSUMER).write_text("not json")
+        self.assertFalse(account_request.consumer_takes(home, "codex"))
+        claim = home / (account_request.CLAIMED % "0f3c5a9e-5b1d-4c2e-9a7b-1234567890ab")
+        claim.write_text("{}")
+        old = time.time() - 700
+        os.utime(claim, (old, old))
+        with mock.patch.object(account_request.os, "unlink", side_effect=PermissionError(13, "denied")):
+            self.assertEqual(account_request.retire_claims(home, 600), 0, "a claim that cannot be removed is not counted")
+        self.assertEqual(account_request.retire_claims(home, 600), 1)
+        self.assertEqual(account_switch.menu_items({"groups": [{"rows": [{"title": "Other", "actions": []}]}]}), [])
+        self.assertEqual(account_switch.menu_items(None), [])
 
 
 if __name__ == "__main__":
