@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tmux-send-line.sh <session> <line> [--socket PATH] [--runtime claude|codex] [--refuse-if-pending] [--skip-if-queued WORD] [--require-limit] [--dry-run]
+# tmux-send-line.sh <session> <line> [--socket PATH] [--runtime claude|codex] [--refuse-if-pending] [--skip-if-queued WORD] [--require-limit] [--expected-pid PID] [--dry-run]
 # The ONE sender for a line typed into a Sutando core pane: has-session, read
 # the current prompt line, apply the queued-input policy, then send-keys -l + Enter.
 # Exit: 0 sent · 3 no session · 4 no tmux · 5 pending text · 6 WORD already queued · 7 inspection failed (refused)
@@ -7,10 +7,10 @@
 # · 75 another sender busy · 124 send timed out and revoked · 125 send may have applied (fenced).
 set -u -o pipefail
 SESSION="${1:?session}"; LINE="${2:?line}"; shift 2; RUNTIME=claude
-SOCK="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"; REFUSE=""; SKIPWORD=""; DRY=""; NEEDLIMIT=""
+SOCK="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"; REFUSE=""; SKIPWORD=""; DRY=""; NEEDLIMIT=""; EXPECT=()
 while [ $# -gt 0 ]; do case "$1" in
   --socket) SOCK="${2:?}"; shift;; --refuse-if-pending) REFUSE=1;; --skip-if-queued) SKIPWORD="${2:?}"; shift;;
-  --require-limit) NEEDLIMIT=1;;
+  --require-limit) NEEDLIMIT=1;; --expected-pid) EXPECT=(--expected-pid "${2:?}"); shift;;
   --runtime) RUNTIME="${2:?}"; shift;; --dry-run) DRY=1;; *) echo "tmux-send-line: unknown flag $1" >&2; exit 2;; esac; shift; done
 case "$RUNTIME" in claude|codex) ;; *) echo "tmux-send-line: unknown --runtime '$RUNTIME' (claude|codex)" >&2; exit 2;; esac
 # A launchd-launched caller (the menu-bar app) has a bare PATH; path_helper
@@ -62,7 +62,7 @@ if [ -n "$NEEDLIMIT" ] && ! printf '%s\n' "$CAP" | "$PY" "$REPO/src/delivery/pan
   echo "tmux-send-line: pane no longer waits on the usage limit alone — not sent" >&2; exit 8
 fi
 [ -n "$DRY" ] && { echo "dry-run: would send '$LINE' + Enter to $SESSION on $SOCK (pending: '${PENDING}')"; exit 0; }
-keys() { bash "$REPO/src/tmux-pane-keys.sh" --tmux "$TMUX" --python "$PY" -S "$SOCK" -t "$SESSION" -- "$@"; local rc=$?
+keys() { bash "$REPO/src/tmux-pane-keys.sh" --tmux "$TMUX" --python "$PY" -S "$SOCK" -t "$SESSION" ${EXPECT[@]+"${EXPECT[@]}"} -- "$@"; local rc=$?
   [ "$rc" = 0 ] && return 0; echo "tmux-send-line: send-keys failed" >&2
   case "$rc" in 75|124|125) exit "$rc" ;; *) exit 1 ;; esac; }
 keys -l "$LINE"

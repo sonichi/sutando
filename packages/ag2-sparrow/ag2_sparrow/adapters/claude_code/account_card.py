@@ -8,9 +8,10 @@ that runs the agent, the owner switches account right in the card (the app runs 
 chat). "Switch account", for a client without those controls, starts nothing here and says where to open
 the card, in place of the card tapped, which keeps the controls for when it is opened there. English only.
 
-The card also offers a "Use <address>" button for each account the desktop app already saved for this
-agent on this computer (its non-secret `index.json`, key -> label; only labels are read), so the owner can
-switch from a phone. A tap on one asks the app to switch (`account_remote`, one switch at a time) and
+The card also has one "Account" dropdown, as the desktop shows it: the account in use (checked, not
+tappable), each other account the desktop app already saved for this agent on this computer (its
+non-secret `index.json`, key -> label; only labels are read), and "Add account…", so the owner can
+switch from a phone. A tap on a saved account (its reply "Use <address>") asks the app to switch (`account_remote`, one switch at a time) and
 shows "Switching to <address>…" in place of the card; how it ended is told in that same card. The
 session's restart on the new account is signin_watch's, not this card's.
 
@@ -28,7 +29,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-from ... import account_switch, card_desk, connect_bridge as cb, connector_cards, claude_local_records as records
+from ... import (account_switch, card_desk, connect_bridge as cb, connect_common as cm, connector_cards,
+                 claude_local_records as records)
 from ...acp_host import quoted
 from ...bounded_file_read import read_regular
 from . import account as accounts, account_remote as remote
@@ -37,13 +39,22 @@ NAME = "Claude Code"
 RUNTIME = "claude"
 STATUS_WAIT_S = 10.0     # asked inside the claim: an answer the card cannot wait for reads as unknown
 ASKS = ("/account", "/login")
-WHERE = account_switch.elsewhere(NAME) + " The sign-in code goes into the card there, never into this chat."
+# A "Switch account" tap with none to offer: no other account is saved for this agent yet.
+NONE_HERE = ("No other account is available to switch to here. An account another agent has needs one sign-in "
+             "for this agent on the computer that runs %s." % NAME)
+# A "Switch account" tap with saved accounts to offer: they are in the card's "Account" menu.
+PICK = ("Pick an account in the Account menu below to switch to it. Another account needs one sign-in on the "
+        "computer that runs %s." % NAME)
+# "Add account…" in the menu: a new account is one sign-in, in the card's account controls on that computer.
+ADD_LABEL = "Add account…"
+ADD = ("Adding an account takes one sign-in for this agent on the computer that runs %s, in this card's account "
+       "controls there." % NAME)
 _run = subprocess.run       # Claude Code's own `auth status`, the one command this card runs
 
 # The desktop app's saved accounts for this agent, and the request/answer files it watches in the config dir.
 STORE = ("accounts", "claude-local")
 INDEX, INDEX_MAX = "index.json", 64 << 10
-USE_BUTTONS = 5          # with "Switch account", the six buttons a card may carry
+USE_BUTTONS = 6          # with the one in use and "Add account…", the menu's eight items
 KEY_RE = re.compile(r"[0-9a-f]{16}")
 NOT_SAVED = "That account is no longer saved on this computer. Send /account for a new card."
 OTHERS_UNKNOWN = ("I could not check whether another agent shares this agent's Claude config dir, so nothing "
@@ -173,13 +184,26 @@ def same_dir(mine, other) -> bool:
     return (here.st_dev, here.st_ino) == (there.st_dev, there.st_ino)
 
 
+def own_job(cfg: dict):
+    """The job `cfg` is the config of: the one serving its agent (the agent's own under agents/<key>/, or an
+    earlier install's single job), so its config is never read as another agent's. ValueError when that
+    cannot be told (two jobs serve the agent, or the job records another)."""
+    from .shape import LOCAL
+    agent = cfg.get("AGENT_ID") or ""
+    if not agent:
+        return LOCAL
+    job, problem = cm.agent_job(LOCAL, agent)
+    if job is None:
+        raise ValueError(problem)
+    return job
+
+
 def config_dir_for_switch(cfg: dict) -> str:
     """The agent's own config dir; accounts.Refused when it has none, or it is not this agent's alone, or the
     credential proxy decides the account (the rules of a sign-in, `account.own_dir`)."""
     try:
         from .cli import other_agents_dirs
-        from .shape import LOCAL
-        dirs = other_agents_dirs(LOCAL, strict=True)
+        dirs = other_agents_dirs(own_job(cfg), strict=True)
     except Exception as e:  # noqa: BLE001 - fail closed: a dir shared with another agent cannot be ruled out
         raise accounts.Refused(OTHERS_UNKNOWN) from e
     mine = accounts.own_dir(cfg, dirs)
@@ -191,8 +215,8 @@ def config_dir_for_switch(cfg: dict) -> str:
 
 
 class AccountCard(account_switch.AccountSwitch):
-    """The account card, its "Switch account" pointing to the app instead of starting a sign-in here, and a
-    "Use <address>" button for each other account the app saved for this agent."""
+    """The account card, its "Switch account" pointing to the app instead of starting a sign-in here, and an
+    "Account" menu of the accounts the app saved for this agent plus "Add account…"."""
 
     def __init__(self, root, cfg: dict, publish, log, ask: str = "/account", run=None, popen=None):
         self.root, self.cfg, self.popen = root, cfg, popen
@@ -209,19 +233,28 @@ class AccountCard(account_switch.AccountSwitch):
         finally:
             self.seen = SEEN.pop(str(self.cfg.get("CLAUDE_CONFIG_DIR") or ""), {})
 
+    def refusal(self) -> str:
+        """Why a switch here would be refused ('' when it would not)."""
+        if self.seen.get("proxy"):
+            return accounts.PROXIED
+        try:
+            config_dir_for_switch(self.cfg)
+        except accounts.Refused as e:
+            return str(e)
+        return ""
+
     def offers(self) -> dict:
         """{key: address} the card offers: the saved accounts but the one in use, none when a switch here
         would be refused, sorted by address, at most USE_BUTTONS."""
-        if self.seen.get("proxy"):
-            return {}
-        try:
-            config_dir_for_switch(self.cfg)
-        except accounts.Refused:
+        if self.refusal():
             return {}
         found = others(dict(self.cfg, email=self.seen.get("email") or ""))
         return dict(sorted(found.items(), key=lambda kv: kv[1].lower())[:USE_BUTTONS])
 
-    def card(self, state: str, text: str, url: str = "", ask: bool = False, signed_out: bool = False):
+    def card(self, state: str, text: str, url: str = "", ask: bool = False, signed_out: bool = False,
+             offered=None):
+        """The shared card plus the "Account" menu of `offered` (default: `offers()` read now), so a caller that
+        worded the card from one reading of the offers shows the very same items. No menu where a switch is refused."""
         body, card = super().card(state, text, url, ask, signed_out)
         if not ask:
             return body, card
@@ -229,24 +262,51 @@ class AccountCard(account_switch.AccountSwitch):
             remote.settle_late(self.root, self.log)     # a switch told late is told before the new card
         except OSError as e:
             self.log("late switches not settled:", "%s: %s" % (type(e).__name__, str(e)[:200]))
+        offered = self.offers() if offered is None else offered
+        if not offered and self.refusal():
+            return body, card
         agent_card, _ = connector_cards._core()
-        uses = []
-        for key, email in self.offers().items():
-            words = ("Use " + email)[:agent_card.LIMITS["label"]]
-            uses.append(agent_card.button(words, "reply", style="secondary", reply=words,
-                                          command=agent_card.reply(self.KIND, "agent", key)))
-        if uses:
-            card = dict(card, buttons=uses + list(card.get("buttons") or []))
-        return body, card
+        cap = agent_card.LIMITS["label"]
+        using = "" if self.seen.get("proxy") else str(self.seen.get("email") or "")
+        # The reply stays "Use <address>" with the same command as the old buttons, so a tap acts as before.
+        items = [agent_card.button(("✓ " + using)[:cap], "reply", reply=("✓ " + using)[:cap], disabled=True)] \
+            if using else []
+        items += [agent_card.button(email[:cap], "reply", reply=("Use " + email)[:cap],
+                                    command=agent_card.reply(self.KIND, "agent", key)) for key, email in offered.items()]
+        items.append(agent_card.button(ADD_LABEL, "reply", reply=ADD_LABEL,
+                                       command=agent_card.reply(self.KIND, "agent", "add")))
+        menu = agent_card.button((using or "Choose an account")[:cap], "menu", items=items)
+        out = dict(card, groups=list(card.get("groups") or []) + [{"rows": [agent_card.row("Account", actions=[menu])]}])
+        found = agent_card.problem(out)
+        if found:
+            self.log("account menu left out:", found)
+            return body, card
+        return body, out
+
+    def none_here(self) -> str:
+        """Why nothing is offered: a switch here refused (its reason), or no other account to switch to."""
+        why = self.refusal()
+        return "No account can be switched here: %s." % why if why else NONE_HERE
 
     def tapped(self, verb, sent, result_file) -> str:
         """"Switch account": where to switch it, shown in place of the card tapped and still carrying the
         controls, so opened on the agent's computer it is the account card again. Nothing is started here.
-        A saved account's key: ask the app to switch to it (`use`)."""
-        if verb == "switch":
-            self.say(sent.get("channel_id"), account_switch.with_controls(self.card("info", WHERE), RUNTIME),
+        "Add account…": where a new account is signed in, likewise. A saved account's key: ask the app to
+        switch to it (`use`)."""
+        if verb == "add":
+            text, refused = self.status()
+            self.say(sent.get("channel_id"), self.card("pending", "%s %s" % (text, ADD), ask=True, signed_out=refused),
                      result_file, card_desk.tapped_event(sent))
-            return "account-where"
+            return "account-add"
+        if verb == "switch":
+            # From the phone (owner 11-27): never "open this on the computer". Accounts switchable here are offered
+            # in place; only an account another agent keeps needs a sign-in here, said as such.
+            text, refused = self.status()
+            offered = self.offers()             # after status(): the account in use decides what is offered
+            self.say(sent.get("channel_id"), self.card("pending", "%s %s" % (text, PICK if offered else self.none_here()),
+                                                       ask=True, signed_out=refused, offered=offered),
+                     result_file, card_desk.tapped_event(sent))
+            return "account-picks" if offered else "account-none-here"
         if KEY_RE.fullmatch(str(verb or "")):
             return self.use(verb, sent, result_file)
         self.publish(result_file, self.quoted(account_switch.EXPIRED_NO_CARD) + "\n")
@@ -259,7 +319,7 @@ class AccountCard(account_switch.AccountSwitch):
         return bool(entry) and agent_card.reply(self.KIND, "agent", key) in entry["offers"].values()
 
     def use(self, key, sent, result_file) -> str:
-        """The owner tapped "Use <address>" on a card that offered it: write the app's switch request, show
+        """The owner picked "Use <address>" in the menu of a card that offered it: write the app's switch request, show
         "Switching to <address>…" in place of the card, and leave the answer to its watcher (`account_remote`)."""
         room, tapped = str(sent.get("channel_id") or ""), card_desk.tapped_event(sent)
         if not self.offered(tapped, key):

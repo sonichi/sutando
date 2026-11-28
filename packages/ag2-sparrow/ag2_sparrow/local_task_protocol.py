@@ -257,6 +257,16 @@ KNOWN_HEADER_KEYS = (
     # The broker's handle for the window the owner messaged from; the agent passes it to the
     # ui_* MCP tools. Bridge-written above task:, so the guard defangs a forged body copy.
     "ui_origin",
+    # Who the message @-mentions and whether that includes this agent, as the broker says.
+    "mentions", "mentions_you",
+    # A thread message's root sender and whether this agent has posted in that thread.
+    "thread_starter", "you_in_thread",
+    # The sender of the message this one replies to, and whether that sender is this agent.
+    "replied_to", "replied_to_you",
+    # Broker attestation that this agent was woken only by its owner's mention or reply.
+    "addressed_via",
+    # The room roster the gateway writes: a capped mxid list and the true joined total.
+    "room_members", "room_member_count",
 )
 _KNOWN_KEY_SET = frozenset(KNOWN_HEADER_KEYS)
 # Only the task-mid writer may declare its layout; a task-last file carrying it

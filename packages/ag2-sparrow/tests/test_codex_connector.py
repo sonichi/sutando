@@ -1272,7 +1272,10 @@ class AccountCardTest(CardWorld, unittest.TestCase):
         self.home.mkdir()
         (self.home / "stub-account").write_text("alice@example.com")
         self.opened = []
+        # The browser sign-in on this computer ("Switch account" with SWITCH_ANYWHERE off); the phone's
+        # device-code one is tests/test_codex_device_login.py's.
         for patch in (mock.patch.dict(os.environ, {"CODEX_HOME": str(self.home)}),
+                      mock.patch.object(cc, "SWITCH_ANYWHERE", False),
                       mock.patch.object(cc, "open_page", side_effect=lambda url: self.opened.append(url) or True)):
             patch.start()
             self.addCleanup(patch.stop)
