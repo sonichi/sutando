@@ -319,10 +319,16 @@ class TierPolicyTest(unittest.TestCase):
             (Path(d) / "state" / "threads").mkdir(parents=True)
             old = Path(d) / "state" / "threads" / "dm-file"
             old.write_text("owner-dm-0001\n")
-            write_task(d, "task-chat-c", "collaborator", channel="!room:x", kind="room", mtime=now - 20)
+            collab = "task-1792100000009"
+            write_text(d, collab, gateway_mid_task(collab, "hello", tier="team", collaborator=True), now - 20)
             write_task(d, "task-chat-o", "owner", channel="!dm:x", kind="dm", mtime=now - 10)
-            with mock.patch.object(cc, "log", wraps=cc.log) as spy:
+            with mock.patch.object(cc, "log", wraps=cc.log) as spy, \
+                    mock.patch.object(cc, "wrap_untrusted", wraps=cc.wrap_untrusted) as wrap:
                 self.assertEqual(run_connector(d, once=2, extra=["--thread-id", "!dm:x=owner-dm-0001"]), 0)
+            self.assertEqual([m["task"] for m in metrics(d)], [collab, "task-chat-o"], "the collaborator went first")
+            self.assertEqual([(c.args[1]["access_tier"], c.args[1]["collaborator"]) for c in wrap.call_args_list],
+                             [("team", "true"), ("owner", "false")], "an attested collaborator, then the owner")
+            self.assertIn("tier=team", result(d, collab))
             threads = [m["thread"] for m in metrics(d)]
             self.assertNotIn("owner-dm-0001", threads)
             self.assertEqual(len(set(threads)), 1, "both rooms are on one new shared thread")
