@@ -54,7 +54,9 @@ A Claude core's saved sign-ins are the desktop's Keychain copies (`<app support>
 lists them), which only the desktop can put in place, so its card offers only "Add account…".
 
 - **The choices are two rows** any client draws (the desktop, the web, a phone), each a `menu` row action
-  of `reply` items (agent_panel v1; no client needs v2 for it), and they are not repeated as buttons:
+  of `reply` items (agent_panel v1; no client needs v2 for it). Saved accounts are not repeated as buttons; "Add another
+  account" is also a button, for a client that draws no row menus. On the quota card (`--retry`) the
+  "Account" row says "Not signed in" only for a refused login, never from the probe at the limit:
   - "Account" (its value the account in use): the account in use, marked " (current)" and disabled; each
     other saved account (`card:account:core:<key>`, words "Use <account>"); "Add account…"
     (`card:account:core:add`). At most 8 items: the others by label as many as fit, and the card's text

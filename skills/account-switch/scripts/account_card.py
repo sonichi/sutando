@@ -486,9 +486,12 @@ def runtime_items(rt: str) -> list:
             for key, name in RUNTIMES]
 
 
-def choice_rows(cur: dict, others: list, names: dict, signed_out: bool = False) -> list:
-    """The card's one group: the "Account" row (the account in use as its value) and the "Runs on" row."""
-    who = "Not signed in" if signed_out or cur["signed_in"] is False else (cur["shown"] or "Unknown")
+def choice_rows(cur: dict, others: list, names: dict, signed_out: bool = False, retry: bool = False) -> list:
+    """The card's one group: the "Account" row (the account in use as its value) and the "Runs on" row.
+    `retry` (the quota card): a probe at the limit may read a signed-in core as signed out, so the row
+    says "Not signed in" only for a refused login (`signed_out`), never from that probe."""
+    unsigned = signed_out or (cur["signed_in"] is False and not retry)
+    who = "Not signed in" if unsigned else (cur["shown"] or "Unknown")
     on = dict(RUNTIMES)[cur["runtime"]]
     return [{"rows": [
         ac.row(ACCOUNT_ROW, subtitle=who, actions=[ac.button(MENU_LABEL, "menu",
@@ -503,12 +506,14 @@ def menu_card(cur: dict, others: list, signed_out: bool = False, lead: str = "",
     `lead`, when given, opens the card's words and its fallback line. `signed_out`: the core's login was
     refused, so the card drops the account in use and, with no `lead`, opens with SIGNED_OUT. `retry`
     (the quota card) adds a Retry button whose words are the owner's own "retry now", which the Claude
-    core's limit hold acts on; a Codex core has no such hold, so its card carries none. The choices are
-    not repeated as buttons: every client that draws this card draws its rows."""
+    core's limit hold acts on; a Codex core has no such hold, so its card carries none. Saved accounts
+    are menu items only; "Add another account" is also a button, for a client that draws no row menus."""
     names = names if names is not None else shown_names(others)
     buttons = []
     if retry and cur["runtime"] != "codex":
         buttons.append(ac.button("Retry", "reply", style="secondary", reply=RETRY_WORDS))
+    buttons.append(ac.button(ADD_WORDS, "reply", style="primary", reply=ADD_WORDS,
+                             command=ac.reply(KIND, TARGET, ADD)))
     if signed_out:
         lead = lead or SIGNED_OUT
     if cur["runtime"] == "codex":
@@ -529,7 +534,7 @@ def menu_card(cur: dict, others: list, signed_out: bool = False, lead: str = "",
     # Out of usage or signed out, the core waits on the owner: `pending`, as the app's needs-you bar lists it.
     stuck = signed_out or retry
     body, card = ac.build(CARD_ID, "pending" if stuck else "info", title="Account", avatar_=ac.avatar(initial="A"),
-                          text=words, groups=choice_rows(cur, others, names, signed_out), buttons=buttons,
+                          text=words, groups=choice_rows(cur, others, names, signed_out, retry), buttons=buttons,
                           note=note, note_tone="dim",
                           body=" ".join(w for w in (lead, using, 'Reply "switch account" for options.') if w))
     # The marker by which the desktop app on the core's computer draws the core's own account controls;

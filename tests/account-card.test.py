@@ -331,6 +331,47 @@ class CodexCard(Base):
         self.assertEqual(acc.menu_card({"runtime": "codex", "signed_in": False, "shown": "", "key": ""}, [],
                                        signed_out=True)[1]["state"], "pending")
 
+    def test_the_quota_cards_account_row_never_says_not_signed_in_from_the_probe(self):
+        lead = "The core has reached its usage limit (resets 3:05 PM), so I can't answer until then."
+
+        def who(cur, **kw):
+            row = acc.menu_card(cur, [], lead=lead, **kw)[1]["groups"][0]["rows"][0]
+            self.assertEqual(row["title"], "Account")
+            return row["subtitle"]
+        for runtime in ("claude", "codex"):
+            unread = {"runtime": runtime, "signed_in": False, "shown": "", "key": ""}
+            self.assertEqual(who(unread, retry=True), "Unknown", runtime)
+            self.assertEqual(who({**unread, "signed_in": None}, retry=True), "Unknown", runtime)
+            named = {"runtime": runtime, "signed_in": True, "shown": "alice@example.com", "key": ""}
+            self.assertEqual(who(named, retry=True), "alice@example.com", runtime)
+            # A refused login is authoritative, at the limit too; so is the probe on the owner's own menu.
+            self.assertEqual(who(unread, retry=True, signed_out=True), "Not signed in", runtime)
+            self.assertEqual(who(unread), "Not signed in", runtime)
+        # The posted quota card, end to end: a Claude probe that reads "not logged in" at the limit.
+        self.RUNTIME, self.claude_json = "claude", {"loggedIn": False}
+        rc, _ = self.run_(["post", "--owner-dm", "--retry", "--lead", lead])
+        self.assertEqual(rc, 0)
+        self.assertNotIn("Not signed in", json.dumps(self.fake.cards()[-1]))
+
+    def test_add_another_account_is_a_button_too_for_a_client_that_draws_no_menus(self):
+        import issued_cards
+        self.signed_in(A)
+        self.keep(B)
+        for extra in ([], ["--signed-out"], ["--retry", "--lead", "At the limit."]):
+            rc, _ = self.run_(["post", "--room", DM, *extra])
+            card = self.fake.cards()[-1]
+            self.assertEqual(rc, 0, extra)
+            self.assertIsNone(ac.problem(card))
+            add = [b for b in card["buttons"] if b["label"] == "Add another account"]
+            self.assertEqual([(b["kind"], b["reply"], b["command"]) for b in add],
+                             [("reply", "Add another account", "card:account:core:add")], extra)
+            # Same words and command as the menu's item, so the tap is one the card's record offers.
+            self.assertEqual(issued_cards.offered(card)["Add another account"], "card:account:core:add")
+            self.assertNotIn("Use ", " ".join(b["label"] for b in card["buttons"]))
+        self.RUNTIME = "claude"
+        rc, _ = self.run_(["post", "--room", DM, "--retry", "--lead", "At the limit."])
+        self.assertEqual([b["label"] for b in self.fake.cards()[-1]["buttons"]], ["Retry", "Add another account"])
+
     def test_the_quota_notice_with_no_owner_dm_posts_nothing(self):
         self.signed_in(A)
         with mock.patch.object(acc, "_owner_dm", lambda ws, core: ""):
@@ -495,6 +536,13 @@ class Taps(Base):
         self.assertIn("never in this chat", out["say"])
         self.assertEqual(self.launch.calls, [])
         self.assertEqual(self.fake.cards()[-1]["id"], acc.NOTE_ID)
+
+    def test_the_add_button_acts_with_no_menu_involved(self):
+        button = [b for b in self.fake.cards()[0]["buttons"] if b["command"] == "card:account:core:add"][0]
+        rc, out = self.tap(button["reply"])
+        self.assertEqual((rc, out["status"]), (0, "say"))
+        self.assertIn("Settings → Connections", out["say"])
+        self.assertEqual(self.launch.calls, [])
 
     def test_add_answers_each_tap_once_however_often_it_is_retried(self):
         for msg in ("$tap1", "$tap1", "$tap2"):
@@ -730,7 +778,8 @@ class ChoiceRows(Base):
     def assert_shape(self, card: dict, who: str, on: str) -> None:
         self.assertEqual(card["v"], 1, "menus in rows are v1 for every client that draws cards")
         self.assertEqual(self.rows(card), [("Account", who, ["menu"]), ("Runs on", on, ["menu"])])
-        self.assertNotIn("buttons", card, "the choices are not repeated as buttons")
+        self.assertEqual([b["label"] for b in card["buttons"]], ["Add another account"],
+                         "saved accounts are menu items only")
         self.assertEqual(card["account_controls"]["core"], True, "the desktop's marker stays")
 
     def test_codex_with_no_other_saved_account(self):
