@@ -8,7 +8,8 @@ that runs the agent, the owner switches account right in the card (the app runs 
 chat). "Switch account", for a client without those controls, starts nothing here and says where to open
 the card, in place of the card tapped, which keeps the controls for when it is opened there. English only.
 
-The card also has one "Account" dropdown, as the desktop shows it: the account in use (checked, not
+The card also has one "Account" row, in the one shape cards give a setting (`agent_card.choice_row`): the
+account in use as its value, and a "Change" menu of the account in use (marked "(current)", not
 tappable), each other account the desktop app already saved for this agent on this computer (its
 non-secret `index.json`, key -> label; only labels are read), and "Add account…", so the owner can
 switch from a phone. A tap on a saved account (its reply "Use <address>") asks the app to switch (`account_remote`, one switch at a time) and
@@ -269,14 +270,12 @@ class AccountCard(account_switch.AccountSwitch):
         cap = agent_card.LIMITS["label"]
         using = "" if self.seen.get("proxy") else str(self.seen.get("email") or "")
         # The reply stays "Use <address>" with the same command as the old buttons, so a tap acts as before.
-        items = [agent_card.button(("✓ " + using)[:cap], "reply", reply=("✓ " + using)[:cap], disabled=True)] \
-            if using else []
+        items = [agent_card.current_item(using, ("Use " + using)[:cap])] if using else []
         items += [agent_card.button(email[:cap], "reply", reply=("Use " + email)[:cap],
                                     command=agent_card.reply(self.KIND, "agent", key)) for key, email in offered.items()]
         items.append(agent_card.button(ADD_LABEL, "reply", reply=ADD_LABEL,
                                        command=agent_card.reply(self.KIND, "agent", "add")))
-        menu = agent_card.button((using or "Choose an account")[:cap], "menu", items=items)
-        out = dict(card, groups=list(card.get("groups") or []) + [{"rows": [agent_card.row("Account", actions=[menu])]}])
+        out = dict(card, groups=list(card.get("groups") or []) + [{"rows": [agent_card.choice_row("Account", using, items)]}])
         found = agent_card.problem(out)
         if found:
             self.log("account menu left out:", found)
