@@ -15,8 +15,10 @@ a click supplies is an id the card itself offered:
                         if still blocked after VERIFY_S; else a refused turn gets `continue` once idle
     switch_model:<m>    scripts/switch-model.sh <m> --confirm on that session (alias from the list)
     switch_runtime:<r>  core only: src/agent/start-cli.sh --runtime <r> --restart, detached
-    restart_core        core only: src/agent/start-cli.sh --restart, detached (detached_action): it
-                        closes the tmux session this monitor runs in, so it never runs as its child
+    restart_core        core only, detached (detached_action): on a desktop install the app's
+                        sutando-ctl.sh restart-core (its own launcher), else src/agent/start-cli.sh
+                        --restart; it closes the tmux session or window this monitor's core runs in,
+                        so it never runs as its child
     escape_prompt       one Escape key into the pane
     buy_credits, add_account, switch_account:<id>
                         never offered or run here: each needs a confirmed, re-authenticated step (P1)
@@ -52,6 +54,7 @@ from workspace_default import status_read_path
 import detached_action
 import recovery_gate
 import runtime_models
+import sutando_config
 
 REPO = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
 HOLD_SOURCE = "core-hold"
@@ -288,8 +291,10 @@ def _execute(verb: str, arg: Optional[str], req, target: Target, runner: Runner,
                 outcome = _execute(recovery.RESTART_CORE, None, req, target, runner, now, follow_ups, gate)
                 if outcome[0] != "done":
                     core_limit_hold.reinstate(ws, now, by=RETRY_BY, mirror=False)
-                    why = "The core did not restart, so it is still paused. " + NEW_CARD
-                    return outcome[0], why, why, {"state": "paused_limit"}
+                    why = ("The core is still paused. " + outcome[1] if outcome[0] == "refused"
+                           else "The core did not restart, so it is still paused. " + NEW_CARD)
+                    return outcome[0], why, why, {"state": "paused_limit", **{
+                        k: v for k, v in outcome[3].items() if k == VIA_FIELD}}
                 outcome[3][VERIFY_FIELD]["reinstate"] = ""  # the core's own hold returns if it fails
                 return outcome
             else:
@@ -331,9 +336,13 @@ def _execute(verb: str, arg: Optional[str], req, target: Target, runner: Runner,
         if target.seat:
             why = "That acts on the core, not on this worker; nothing was done."
             return "refused", why, why, {}
-        argv = ["bash", str(REPO / "src" / "agent" / "start-cli.sh"), "--restart"]
         if verb == recovery.SWITCH_RUNTIME:
-            argv[2:2] = ["--runtime", arg]
+            argv, via = ["bash", str(REPO / "src" / "agent" / "start-cli.sh"), "--runtime", arg, "--restart"], None
+        else:
+            argv, via = _restart_core_argv(env, runner)
+            if argv is None:
+                why = NO_LOCK_LINE if via == VIA_NO_LOCK else NO_CTL_LINE
+                return "refused", why, why, {VIA_FIELD: via}
         # The launcher's --restart closes the tmux session this monitor runs in: it runs detached,
         # and the monitor that comes back with the core reads its outcome (verify_step).
         key = _detached_key(req)
@@ -342,11 +351,15 @@ def _execute(verb: str, arg: Optional[str], req, target: Target, runner: Runner,
             why = "The restart could not be started; nothing was changed. " + NEW_CARD
             return "failed", why, why, {}
         check = {"detached": key, "what": f"the core under {arg}" if arg else "the core"}
+        if via:
+            check[VIA_FIELD] = via
         if verb == recovery.SWITCH_RUNTIME:
             return ("done", None, f"Switching the core to {arg}; checking that it is working again.",
                     {"state": "starting", "runtime": arg, VERIFY_FIELD: check})
-        return ("done", None, "Restarting the core; checking that it is working again.",
-                {"state": "starting", VERIFY_FIELD: check})
+        line = "Restarting the core; checking that it is working again."
+        if via == VIA_FALLBACK:
+            line = f"{line} {STANDALONE_LINE}"
+        return ("done", None, line, {"state": "starting", VERIFY_FIELD: check, VIA_FIELD: via})
     if verb == recovery.REFRESH_OPTIONS:
         # The owner asked: the pane's own menu is read again, and a core idle at its limit has its
         # model picker opened, read and closed once; the card is replaced with what the screen shows.
@@ -374,6 +387,56 @@ FALLBACK_LINE = "Still blocked; restarting this worker. Checking that it is work
 NEW_CARD = "If it is still blocked, a new card follows with what you can do now."
 #: How the detached restarts are started: replaced in tests, never run for real there.
 spawn_detached = subprocess.Popen
+#: Which command restart_core ran, kept on its audit line only (the receipt is unchanged).
+VIA_FIELD = "via"
+VIA_CTL, VIA_START_CLI, VIA_FALLBACK = "ctl", "start-cli", "start-cli-fallback"
+#: The app's bundle without its controller, or with one that takes no launch lock: refused, nothing run.
+VIA_NO_CTL, VIA_NO_LOCK = "ctl-missing", "ctl-no-lock"
+NO_CTL_LINE = ("This core runs inside the desktop app, and the app's restart control is missing here, "
+               "so nothing was restarted. Restart the core from the desktop app.")
+NO_LOCK_LINE = ("This core runs inside the desktop app, and this version of the app cannot restart it "
+                "safely from here, so nothing was restarted. Restart the core from the desktop app.")
+#: Why a restart took start-cli although an app-support dir is configured, kept on the audit line.
+VIA_REASON_FIELD = "via_reason"
+NOT_BUNDLE = "not-bundle"
+STANDALONE_LINE = "This checkout is not the desktop app's own copy, so the standalone restart was used."
+#: The ctl's side-effect-free capability list; `launch-lock` means restart-core takes the app's lock.
+CTL_CAPABILITIES_TIMEOUT_S = 5
+LAUNCH_LOCK_CAPABILITY = "launch-lock"
+#: The desktop app's control script, installed beside the engine checkout it drives.
+DESKTOP_CTL = "sutando-ctl.sh"
+#: Its restart-core exit when another launcher run held the launch lock: nothing was killed or started.
+CTL_LAUNCH_LOCK_BUSY = 12
+BUSY_LINE = ("The core is already being restarted, so nothing was done this time. "
+             "Try again in a minute if it is still blocked.")
+
+
+def _restart_core_argv(env: Dict, runner: Runner):
+    """(argv, via) for restart_core; argv None when nothing may run. In the app's own bundle its
+    restart-core keeps the gateway's session, and start-cli --restart would kill that session."""
+    start_cli = ["bash", str(REPO / "src" / "agent" / "start-cli.sh"), "--restart"]
+    app_support = sutando_config.desktop_app_support(REPO)
+    if app_support is None:
+        return start_cli, VIA_START_CLI
+    repo = REPO.resolve()
+    if repo.parent.name != "engine" or repo.parent.parent != app_support.resolve():
+        return start_cli, VIA_FALLBACK  # a standalone clone the app's controller does not drive
+    ctl = REPO.parent / DESKTOP_CTL
+    if not ctl.is_file():
+        return None, VIA_NO_CTL
+    env["SUTANDO_APP_SUPPORT"] = str(app_support)
+    if not _ctl_has_launch_lock(ctl, env, runner):
+        return None, VIA_NO_LOCK  # an app older than the lock: its restart can overlap the launcher
+    return ["bash", str(ctl), "restart-core"], VIA_CTL
+
+
+def _ctl_has_launch_lock(ctl: Path, env: Dict, runner: Runner) -> bool:
+    try:
+        run = runner(["bash", str(ctl), "capabilities"], capture_output=True, text=True,
+                     timeout=CTL_CAPABILITIES_TIMEOUT_S, env=env, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return run.returncode == 0 and LAUNCH_LOCK_CAPABILITY in (run.stdout or "").split()
 
 
 def _detached_key(req) -> str:
@@ -384,6 +447,7 @@ def _env(target: Target) -> Dict:
     env = dict(os.environ, SUTANDO_TMUX_SOCKET=target.socket, SUTANDO_TMUX_SESSION=target.session)
     env.pop("SUTANDO_CORE_RUNTIME", None)  # the configured runtime, or --runtime, decides
     env.pop("SUTANDO_CORE_SESSION", None)  # the monitor runs outside the core session
+    env.pop("SUTANDO_ENGINE_LAUNCH_LOCK_HELD", None)  # only a launcher run holding the lock may skip it
     return env
 
 
@@ -665,6 +729,8 @@ def _restart_failed(manager, workspace: Path, req_id: str, check: Dict, done, no
         line = "The tap was not recorded in time, so nothing was restarted. " + NEW_CARD
     elif done.reason and done.reason not in ("exit", "could not start"):
         line = done.reason  # the action's own sentence (the pool's, for a worker)
+    elif check.get(VIA_FIELD) == VIA_CTL and done.rc == CTL_LAUNCH_LOCK_BUSY:
+        line = BUSY_LINE + " " + NEW_CARD
     elif done.rc == core_limit_hold.HOLD_EXIT:
         line = "The core is paused for a provider limit, so it was not restarted. " + NEW_CARD
     else:
@@ -692,12 +758,17 @@ def _settle(manager, target: Target, data: Dict, req, outcome: str, reason, line
     incident = incident_for(req) if req is not None else ""
     fields = dict(fields)
     check = fields.pop(VERIFY_FIELD, None)
+    via = fields.pop(VIA_FIELD, None)
     body = recovery.receipt(hitl_id, incident, aid, outcome, reason, now, fields)
     recovery.write_receipt(target.workspace, body)
     entry = {"at": int(now), "hitl_id": hitl_id, "action_id": aid, "outcome": outcome,
              "sender": str(data.get("sender") or ""), "session": target.session, "seat": target.seat or ""}
     if fields.get(PATH_FIELD):
         entry[PATH_FIELD] = fields[PATH_FIELD]
+    if via:
+        entry[VIA_FIELD] = via
+    if via == VIA_FALLBACK:
+        entry[VIA_REASON_FIELD] = NOT_BUNDLE
     audit(target.workspace, entry)
     if outcome == "done" and req is not None and not target.seat:
         check = dict(check or {}, **_resume_check(target.workspace, req))

@@ -144,6 +144,24 @@ session, outcome) and edits the card in place. A tap on `add_account` or `switch
 a card posted before they were withheld) is refused until the confirmed, re-authenticated sign-in
 flow exists; a worker seat's card never runs `switch_model`, `restart_core` or `switch_runtime`.
 
+Restart core runs detached from the monitor. On a desktop install (`$SUTANDO_APP_SUPPORT`, or a
+checkout under the app's `engine/` directory) it runs the app's `sutando-ctl.sh restart-core`,
+installed beside the checkout, which re-runs the app's own launcher: for Claude it replaces only
+the core window, so the gateway keeps its session. In the app's own bundle
+(`<app-support>/engine/<checkout>`) with that script missing, the tap is refused before anything
+runs and the card says to restart the core from the desktop app: `start-cli.sh --restart` would
+kill the gateway's session. Before using the ctl it runs `sutando-ctl.sh capabilities` (5 s): a
+ctl that does not list `launch-lock` (an app older than the engine) is refused the same way, so a
+restart never overlaps the app's own launcher. A standalone clone, even with
+`$SUTANDO_APP_SUPPORT` exported, and any install without the app run
+`src/agent/start-cli.sh --restart`; with an app dir configured the card says the standalone
+restart was used and the audit adds `via_reason: not-bundle`. The audit line's `via` says which:
+`ctl`, `ctl-missing`, `ctl-no-lock`, `start-cli` or `start-cli-fallback`. Switch runtime always
+runs `start-cli.sh --runtime`.
+When the ctl exits 12 (another launcher run held the app's launch lock; nothing was killed or
+started), the receipt is `failed`, the card says the core is already being restarted and to try
+again shortly, any hold it lifted returns, and nothing is retried automatically.
+
 A tap from anyone but the owner runs nothing, leaves the card as it was and posts nothing in the
 room. On a card this store holds, tapped in the room the card was posted in (its requirement's
 `room`, else its projection's), it adds one `state/recovery/audit.jsonl` line, `outcome: refused`
