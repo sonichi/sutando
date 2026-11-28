@@ -135,6 +135,18 @@ class Declarations(_Tmp):
 
 
 
+class DeclaredValues(_Tmp):
+    def test_string_values_of_enabled_manifests_with_the_shipped_copy_first(self):
+        self.skill(self.engine, "a", {"name": "a", FIELD: "a/last.json"}, script=None)
+        self.skill(self.engine, "off", {"name": "off", "enabled": False, FIELD: "x.json"}, script=None)
+        self.skill(self.engine, "num", {"name": "num", FIELD: 3}, script=None)
+        self.skill(self.engine, "bad", "{not json", script=None)
+        self.skill(self.ws / "skills", "a", {"name": "a", FIELD: "shadowed.json"}, script=None)
+        self.skill(self.ws / "skills", "b", {"name": "b", FIELD: "b.json"}, script=None)
+        got = skill_roots.declared_values(FIELD, [self.engine, self.ws / "skills"])
+        self.assertEqual(got, [("a", "a/last.json"), ("b", "b.json")])
+
+
 class ReadManifest(_Tmp):
     def test_only_a_regular_file_within_the_cap_is_read(self):
         d = Path(tempfile.mkdtemp(dir=self.tmp))

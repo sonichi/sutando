@@ -326,6 +326,159 @@ class Dispatch(unittest.TestCase):
         self.assertIs(manifest.get("playbook"), True)
 
 
+
+SETUP_MESSAGE = ("Hi, I am Dana Reyes. I am all set up and saying hello.\n"
+                 "I want to use s.space for Founder, Product Manager.\n"
+                 "Give me a quick tour.\n"
+                 "/tutorial")
+
+
+SKILLS = REPO / "skills"
+
+
+def _skills(tmp, **lines):
+    """A skills tree: one playbook skill per name, declaring the given `playbook_line` (None: none)."""
+    root = Path(tmp) / "skills"
+    for name, line in lines.items():
+        name = name.replace("_", "-")
+        (root / name).mkdir(parents=True)
+        manifest = {"name": name, "playbook": True}
+        if line is not None:
+            manifest["playbook_line"] = line
+        (root / name / "manifest.json").write_text(json.dumps(manifest))
+        (root / name / "SKILL.md").write_text("# x\n")
+    return root
+
+
+class TutorialTrigger(unittest.TestCase):
+    """The owner's DM message with a `/tutorial` line runs the tutorial playbook, and nothing else does.
+    The line comes from skills/tutorial/manifest.json, so these run against the shipped skills tree."""
+
+    def test_the_setup_message_is_tagged(self):
+        self.assertEqual(at.owner_dm_playbook(SETUP_MESSAGE, "owner", "dm", SKILLS), "tutorial")
+
+    def test_tutorial_alone_and_with_spaces_is_tagged(self):
+        for body in ("/tutorial", "  /tutorial  ", "Hi.\r\n/tutorial\r\n", "/tutorial\nthanks"):
+            self.assertEqual(at.owner_dm_playbook(body, "owner", "dm", SKILLS), "tutorial", body)
+
+    def test_a_quoted_or_mid_sentence_tutorial_is_not(self):
+        for body in ("please run /tutorial for me", "> /tutorial", '"/tutorial"', "`/tutorial`",
+                     "/tutorial please", "/tutorials", "/Tutorial", "tutorial", "", None, 7):
+            self.assertIsNone(at.owner_dm_playbook(body, "owner", "dm", SKILLS), repr(body))
+
+    def test_only_the_owner_in_a_dm_qualifies(self):
+        for tier, kind in (("team", "dm"), ("guest", "dm"), ("owner", "room"), ("owner", ""),
+                           ("owner", None), ("", "dm"), (None, None)):
+            self.assertIsNone(at.owner_dm_playbook(SETUP_MESSAGE, tier, kind, SKILLS), (tier, kind))
+
+    def test_a_tagged_task_resolves_to_the_shipped_tutorial_playbook(self):
+        # The contract end to end: the header the bridge writes passes the bridge's sanitizer, survives
+        # the strict header parser above task:, and resolves to skills/tutorial/SKILL.md.
+        tag = at.owner_dm_playbook(SETUP_MESSAGE, "owner", "dm", SKILLS)
+        self.assertEqual(at.playbook_value(tag), "tutorial")
+        text = f"id: task-1\nchannel_id: !dm:example.org\nplaybook: {tag}\ntask: Hi\naccess_tier: owner\n"
+        self.assertEqual(ltp.parse_task_headers(text).headers.get("playbook"), "tutorial")
+        self.assertEqual(at.resolve_playbook("", tag, SKILLS), SKILLS / "tutorial" / "SKILL.md")
+        manifest = json.loads((SKILLS / "tutorial" / "manifest.json").read_text())
+        self.assertIs(manifest.get("playbook"), True)
+        self.assertEqual(manifest.get("playbook_line"), "/tutorial")
+
+    def test_the_cli_resolves_the_tutorial_playbook(self):
+        out = subprocess.run([sys.executable, str(REPO / "src" / "agent_triggers.py"), "resolve",
+                              "--playbook", "tutorial"], capture_output=True, text=True, check=True)
+        self.assertEqual(out.stdout.strip(), str(SKILLS / "tutorial" / "SKILL.md"))
+
+
+class PlaybookLines(unittest.TestCase):
+    """The line a playbook answers to is the skill's own declaration; core names no skill."""
+
+    def test_any_declared_line_tags_its_skill(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = _skills(d, demo_room="/demo-room", tutorial=None)
+            self.assertEqual(at.playbook_lines(root), {"/demo-room": "demo-room"})
+            self.assertEqual(at.owner_dm_playbook("Hi\n/demo-room", "owner", "dm", root), "demo-room")
+            self.assertIsNone(at.owner_dm_playbook("/tutorial", "owner", "dm", root))
+
+    def test_a_line_two_skills_declare_tags_neither(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = _skills(d, a="/go", b="/go", c="/other")
+            self.assertEqual(at.playbook_lines(root), {"/other": "c"})
+            self.assertIsNone(at.owner_dm_playbook("/go", "owner", "dm", root))
+
+    def test_a_line_without_the_playbook_opt_in_or_malformed_is_ignored(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = _skills(d, good="/good", bad_line="go", upper="/Up", spaced="/a b")
+            (root / "noopt").mkdir()
+            (root / "noopt" / "manifest.json").write_text('{"name": "noopt", "playbook_line": "/noopt"}')
+            (root / "junk").mkdir()
+            (root / "junk" / "manifest.json").write_text("{not json")
+            self.assertEqual(at.playbook_lines(root), {"/good": "good"})
+
+    def test_a_manifest_that_is_not_an_object_or_has_a_bad_id_is_ignored(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = _skills(d, good="/good")
+            (root / "list").mkdir()
+            (root / "list" / "manifest.json").write_text('["/list"]')
+            (root / "Bad_Id").mkdir()
+            (root / "Bad_Id" / "manifest.json").write_text('{"playbook": true, "playbook_line": "/bad"}')
+            self.assertEqual(at.playbook_lines(root), {"/good": "good"})
+
+    def test_lint_checks_playbook_line_and_last_run(self):
+        base = {"version": "0.1.0", "owner": "github:x/y", "stability": "experimental"}
+        cases = (
+            ({"playbook": True, "playbook_line": "/go"}, None),
+            ({"playbook": True, "playbook_line": "go"}, "playbook_line must be"),
+            ({"playbook": True, "playbook_line": 7}, "playbook_line must be"),
+            ({"playbook_line": "/go"}, 'playbook_line needs "playbook": true'),
+            ({"last_run": "x/last.json"}, None),
+            ({"last_run": "../x.json"}, "last_run must be"),
+            ({"last_run": "/abs.json"}, "last_run must be"),
+            ({"last_run": "x.txt"}, "last_run must be"),
+            ({"last_run": "a b.json"}, "last_run must be"),
+        )
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        for i, (fields, want) in enumerate(cases):
+            d = Path(tmp.name) / f"lint-pl-{i}"
+            d.mkdir()
+            (d / "manifest.json").write_text(json.dumps({"name": d.name, **base, **fields}))
+            errors, _warnings = lint._lint_manifest(d)
+            if want is None:
+                self.assertEqual(errors, [], fields)
+            else:
+                self.assertTrue(any(want in e for e in errors), (fields, errors))
+
+    def test_no_skills_tree_tags_nothing(self):
+        self.assertEqual(at.playbook_lines(None), {})
+        self.assertIsNone(at.owner_dm_playbook("/tutorial", "owner", "dm", None))
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsNone(at.owner_dm_playbook("/tutorial", "owner", "dm", Path(d) / "missing"))
+
+    def test_a_body_with_no_slash_line_reads_no_manifest(self):
+        class Boom(type(Path())):
+            def glob(self, *_a, **_k):
+                raise AssertionError("manifests read for a body with no slash line")
+        self.assertIsNone(at.owner_dm_playbook("Hi, give me a tour.", "owner", "dm", Boom("/nonexistent")))
+
+    def test_a_skills_tree_that_cannot_be_listed_tags_nothing(self):
+        class Unreadable(type(Path())):
+            def glob(self, *_a, **_k):
+                raise PermissionError("skills tree unreadable")
+        real = at.Path
+        at.Path = Unreadable
+        try:
+            self.assertEqual(at.playbook_lines(SKILLS), {})
+            self.assertIsNone(at.owner_dm_playbook("/tutorial", "owner", "dm", SKILLS))
+        finally:
+            at.Path = real
+
+    def test_core_names_no_playbook_line(self):
+        for copy in (SRC_COPY, VENDORED_COPY):
+            text = Path(copy.__file__).read_text(encoding="utf-8")
+            self.assertNotIn("/tutorial", text, copy)
+            self.assertNotIn("TUTORIAL", text, copy)
+
+
 if __name__ == "__main__":
     ok = True
     for copy in (SRC_COPY, VENDORED_COPY):

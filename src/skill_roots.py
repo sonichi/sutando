@@ -81,6 +81,28 @@ def declared_scripts(field: str, roots, suffixes=None) -> list:
     return out
 
 
+def declared_values(field: str, roots) -> list:
+    """(skill name, value) per enabled manifest under `roots` whose `field` is a non-empty string;
+    the same precedence and skip rules as declared_scripts, with no script to resolve."""
+    dirs = [Path(roots)] if isinstance(roots, (str, Path)) else [Path(d) for d in roots]
+    out: list = []
+    seen: set = set()
+    for d in dirs:
+        for manifest in sorted(d.glob("*/manifest.json")):
+            name = manifest.parent.name
+            if name in seen:
+                continue
+            seen.add(name)
+            try:
+                data = read_manifest(manifest)
+            except Exception:  # noqa: BLE001 — one unreadable manifest skips only itself
+                continue
+            value = data.get(field) if isinstance(data, dict) else None
+            if isinstance(value, str) and value and data.get("enabled") is not False:
+                out.append((name, value))
+    return out
+
+
 def _declaration(manifest: Path, field: str, suffixes) -> Optional[Path]:
     """The script one manifest declares for `field`, when enabled, suffixed and contained; else None."""
     data = read_manifest(manifest)

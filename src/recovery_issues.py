@@ -36,7 +36,8 @@ def _health_cause(check):
     name = check['name']
     if name not in HEALTH_CAUSES:
         name = 'custom-check' if name.startswith('extra:') else (
-            'dynamic-loop' if name.startswith('dynamic-loop:') else 'other-check')
+            'dynamic-loop' if name.startswith('dynamic-loop:') else (
+                'skill-check' if name.startswith('skill:') else 'other-check'))
     status = check['status'] if check['status'] in ('warn', 'down') else 'non-ok'
     return 'health:' + name + ':' + status
 

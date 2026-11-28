@@ -86,6 +86,7 @@ class Issues(unittest.TestCase):
     def test_custom_dynamic_and_unknown_names_do_not_leave_host(self):
         for name, expected in [('extra:private-name', 'custom-check'),
                                ('dynamic-loop:private-name', 'dynamic-loop'),
+                               ('skill:private-name', 'skill-check'),
                                ('private-name', 'other-check')]:
             ri.track_health_issues(self.path, [{'name': name, 'status': 'down'}],
                                    start=True, emit=self.emit)

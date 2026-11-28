@@ -43,6 +43,16 @@
       "type": "boolean",
       "description": "Opts the skill into AgentTrigger playbook dispatch: a task's `playbook` header may name it (src/agent_triggers.py). Absent or false = a playbook header naming it is refused."
     },
+    "playbook_line": {
+      "type": "string",
+      "pattern": "^/[a-z][a-z0-9-]{0,63}$",
+      "description": "With `playbook: true`: an owner DM message with a line that is exactly this (e.g. `/tutorial`) is tagged with this skill as its `playbook` header (src/agent_triggers.py owner_dm_playbook). A line two skills declare tags neither."
+    },
+    "last_run": {
+      "type": "string",
+      "pattern": "^(?!/)(?!(.*/)?\\.\\.(/|$))[^\\s]+\\.json$",
+      "description": "A record the skill rewrites after each run, relative to <workspace>/state/: {\"status\": \"ok\"|\"warn\", \"detail\": \"...\", \"at\": \"<ISO time>\"}. health-check shows it as the `skill:<name>` row (skills/MANIFEST.md)."
+    },
     "audience": {
       "type": "string",
       "enum": ["user", "developer"],

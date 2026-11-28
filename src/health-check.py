@@ -1686,6 +1686,41 @@ def check_decision_card_clicks(workspace_dir: Optional[Path] = None) -> "dict | 
                        "`hitl_click: true` task (CLAUDE.md, Pending decisions)")}
 
 
+SKILL_LAST_RUN_FIELD = "last_run"
+SKILL_LAST_RUN_DETAIL_CAP = 300
+
+
+def check_skill_last_runs(workspace_dir: Optional[Path] = None, roots=None) -> list:
+    """One `skill:<name>` row per installed skill whose manifest declares `last_run`: the record
+    it rewrites under <workspace>/state/ ({"status": "ok"|"warn", "detail", "at"}). No record, or one
+    that is not an object, is no row; an object with no valid status is a warn naming it."""
+    ws = Path(workspace_dir) if workspace_dir else WORKSPACE_DIR
+    state = (ws / "state").resolve()
+    rows = []
+    for name, rel in skill_roots.declared_values(SKILL_LAST_RUN_FIELD,
+                                                 skill_roots.skill_roots(ws) if roots is None else roots):
+        path = (state / rel).resolve()
+        if not rel.endswith(".json") or not path.is_relative_to(state):
+            continue
+        try:
+            rec = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(rec, dict):
+            continue
+        status = rec.get("status")
+        if status in ("ok", "warn"):
+            detail = str(rec.get("detail") or status)
+            when = rec.get("at")
+            if isinstance(when, str) and when:
+                detail = f"{detail} (at {when})"
+        else:
+            status, detail = "warn", f"state/{rel} has no ok/warn status"
+        rows.append({"name": f"skill:{name}", "status": status,
+                     "detail": detail[:SKILL_LAST_RUN_DETAIL_CAP]})
+    return rows
+
+
 def check_task_event_handler(workspace_dir: Optional[Path] = None) -> "dict | None":
     """DOWN when core's watcher would hold every task; mirrors read_handler_config_now's order."""
     from util_paths import task_event_handler_config_path  # noqa: PLC0415
@@ -13737,6 +13772,8 @@ def run_all_checks() -> list[dict]:
     _no_primary = check_connections_primary()
     if _no_primary:
         checks.append(_no_primary)
+
+    checks.extend(check_skill_last_runs())
 
     _mem_index = check_memory_index_integrity()
     if _mem_index:

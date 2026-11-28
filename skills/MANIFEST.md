@@ -47,6 +47,8 @@ Tools that need an instant response (sub-second round-trip) live in `src/inline-
 | `server` | optional | Relative path to a long-running server script. Not auto-started — referenced for ops |
 | `startup` | optional | Relative path to a script that boots the server (manual or via an orchestrator) |
 | `playbook` | optional | `true` lets an AgentTrigger task's `playbook` header name this skill (`src/agent_triggers.py`); without it the header is refused and the event's default playbook runs |
+| `playbook_line` | optional | with `playbook: true`, a slash line (`/<word>`) that runs this playbook when it is a whole line of an owner DM message ([below](#playbook-line-playbook_line)) |
+| `last_run` | optional | a record under `<workspace>/state/` the skill rewrites per run; health-check shows it as `skill:<name>` ([below](#last-run-record-last_run)) |
 | `config` | optional | Each entry is exported into `process.env` at agent startup, but only if the env var is not already set (so a user override wins over a manifest default) |
 
 ## Loader behavior
@@ -202,8 +204,10 @@ refuses their fields on a developer-only skill. Which directories depends on the
   `$SUTANDO_MEMORY_DIR/skills`;
 - `pending_questions_store`, `on_launch`, `on_stop_requested`, `on_session_config` and `on_session_route` (`src/skill_roots.py`):
   `<repo>/skills` and `<workspace>/skills`;
-- `hooks` (`src/skill_hooks.py`), `claude_plugin` (`src/skill-manifest-config.sh`) and
-  `supervised_worker` (`src/sparrowd.py`): `<repo>/skills` only.
+- `last_run` (`src/health-check.py`, through `src/skill_roots.py`): `<repo>/skills` and `<workspace>/skills`;
+- `hooks` (`src/skill_hooks.py`), `claude_plugin` (`src/skill-manifest-config.sh`),
+  `supervised_worker` (`src/sparrowd.py`), `playbook` and `playbook_line` (`src/agent_triggers.py`):
+  `<repo>/skills` only.
 
 ## Launch hook (`on_launch`)
 
@@ -264,6 +268,40 @@ skill. The contract:
   or left to delivery). Any other exit, or none within 10 seconds, offers it to the next handler;
   with none taking it, the task is CANCELLED at once;
 - a handler that takes it must return promptly and do the rest detached.
+
+## Playbook line (`playbook_line`)
+
+`"playbook_line": "/tutorial"`, beside `"playbook": true`, asks for this playbook from chat: an
+owner-tier message in the owner's own DM with a line that is exactly that text (surrounding
+whitespace aside) arrives with the task header `playbook: <skill>`. The remote-gateway bridge
+decides it from the raw body, before the body is folded onto the `task:` line, and keeps a playbook
+the broker already named. Core reaches it only through `agent_triggers.owner_dm_playbook`, which
+takes the skills tree its caller injects (the bridge passes the monorepo's `<repo>/skills`; a
+standalone bridge has none and tags nothing) and names no skill. The contract:
+
+- `/` and one lowercase word (`[a-z][a-z0-9-]*`, at most 64 characters after the slash);
+  `scripts/lint-skill.py` refuses anything else, and a line without `playbook: true`;
+- a line quoted (`> /x`, `"/x"`) or inside a sentence is someone talking about the command, and is
+  not tagged; a room message and any other tier never are;
+- two skills declaring one line are a conflict nobody picks from: neither is tagged;
+- a body with no slash line reads no manifest.
+
+## Last-run record (`last_run`)
+
+`"last_run": "<skill>/last-run.json"` names a JSON record under `<workspace>/state/` that the skill
+rewrites, atomically, at the end of each run:
+
+```json
+{"status": "ok", "detail": "what happened, in one line", "at": "2026-11-21T00:00:00Z"}
+```
+
+`src/health-check.py` resolves the declarers with `skill_roots.declared_values` across
+`<repo>/skills` and `<workspace>/skills` and shows each record as one `skill:<name>` row,
+`ok` or `warn` as the record says, the detail capped at 300 characters with `(at <time>)` added.
+No record yet, or one that is not a JSON object, is no row; an object with no `ok`/`warn` status
+is a `warn` naming the file. A path that leaves `state/` or is not `.json` is never read. Every
+`skill:` row reaches recovery telemetry as the one cause `skill-check`, so an owner's private skill
+name never leaves the host. The skill owns the wording; health-check adds none.
 
 ## Orphan reaper (`orphan_reaper`)
 

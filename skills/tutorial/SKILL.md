@@ -29,6 +29,58 @@ so the page follows the first greeting; the owner can send `/tutorial` again at 
 script below by its path: a core that cannot find skills by name still has it. The line asks for
 this page and nothing else.
 
+### A `playbook: tutorial` task
+
+The bridge tags that message itself, because this skill's `manifest.json` declares
+`"playbook_line": "/tutorial"` (skills/MANIFEST.md): an owner-tier task from the owner's DM whose
+body has a line that is exactly `/tutorial` arrives with the header `playbook: tutorial`.
+A `/tutorial` quoted or inside a sentence, a room message and any other sender are never tagged.
+For a tagged task, do exactly this, in order:
+
+1. **Write your reply to a file; do not send it yourself.** For the setup message it is your
+   first-contact greeting. The message's first line names the owner ("Hi, I am <owner's name> …"):
+   that is who you are greeting, never your own name. Do not write it to the task's result file
+   yet: result files are delivered separately and later, so a reply left there can land after the
+   page's card.
+2. **Always run the page, once**, with the task's own `channel_id` as the room and `user_id` as the
+   owner. Put the task's body in a file and pass it, with the reply's file:
+
+   ```bash
+   python3 skills/tutorial/scripts/tutorial_run.py \
+     --room '<channel_id>' --owner '<user_id>' --body-file <file holding the task body> \
+     --greeting-file <file holding your reply>
+   ```
+
+   It posts your reply in the room first (room-ops `say`), and only when the reply is proven to be
+   in the room does it run `getting_started.py publish` (step 2 below) with that room and owner,
+   and nothing else. The only proof is the event id the send itself returns. An "ok" with no
+   event id proves nothing, and neither does a message seen in the room afterwards, your own
+   included: nothing ties it to this send. The reply and the card leave by the same path, one
+   after the other. The page it publishes is generic, with no roles and no tailored prompts,
+   because a room's Commons page cannot yet be limited to its owner. The setup app's
+   `tutorial-inputs.json` is not a gate. It records the outcome in
+   `<workspace>/state/tutorial/last-run.json`, the manifest's `last_run` record, which
+   health-check shows as the `skill:tutorial` row, and prints one JSON line.
+3. **Close the task by the line's `greeting`.** It is one of three states:
+   - `sent`: the send returned an event id, so your reply is in the room. Write `[REPLIED]` as the
+     task's result, never the reply again. If the line has an `owner_line` (the publish failed,
+     nothing was made or changed, or the page is there but its card did not reach the owner), send
+     it word for word as your only message about the page
+     (`python3 skills/agent-room-ops/room_ops.py say '<channel_id>' '<owner_line>'`).
+     No `owner_line`: the page's card in the DM is the one line about it; post nothing more.
+   - `not_sent`: your reply cannot be in the room: nothing was sent (no reply text, the send was
+     refused before any network call), or the gateway answered the send with a 4xx. The page was
+     not run. Write your reply as the task's result, with the `owner_line` as its last paragraph:
+     one message, nothing sent beside it.
+   - `unknown`: everything else: an ok with no event id, a 5xx, a network error, a timeout, no
+     answer. Your reply may or may not be there, now or a moment later. The page was not run.
+     Write the `owner_line` alone as the task's result, word for word. Do not write `[REPLIED]`,
+     do not look in the room to decide, and do not send your reply again by any path: it may
+     already have landed, and a second copy is worse than the one line.
+
+   Do not explain a failure in chat and do not retry in the same turn; the owner retries with
+   `/tutorial`.
+
 **The greeting comes first.** Send the first-contact reply in the DM before anything here. The page
 is extra: if any step below fails, the greeting stands. Do not edit, retract or repeat it, and do
 not retry the page in the same turn.
@@ -76,9 +128,10 @@ not retry the page in the same turn.
    including when it adopts a page it found by its ownership marker. The one exception is
    finishing a page an earlier run created but did not complete. `--summon` forces a summon, e.g.
    when the owner asks for the tutorial again.
-4. Exit 3 (room-commons not installed) or 4 (a room-commons call failed): leave the greeting as is
-   and say nothing about the page unless the owner asks. A failure that is a Sutando or s.space
-   defect goes to `report-feedback`.
+3. Exit 2 (no room), 3 (room-commons not installed) or 4 (a room-commons call failed): leave the
+   greeting as is, and tell the owner in one plain line that the tour page could not be made and that
+   they can send `/tutorial` to try again (`tutorial_run.py` prints that line as `owner_line`). Never
+   leave a failed page unsaid. A failure that is a Sutando or s.space defect goes to `report-feedback`.
 
 Run it in the owner's own DM (the default, `--audience dm`). Only when the owner asks for the page
 in another room, publish it there with `--audience room`. The room's entry records the audience, and a

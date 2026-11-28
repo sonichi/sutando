@@ -16,6 +16,11 @@ This module is the one owner of that vocabulary:
   task as an ordinary message). A registry id is no exception; any other skill is refused.
 - allowed_playbook_value with no skills tree (a bridge that only forwards the header)
   passes registry ids only; the core still applies the manifest opt-in.
+- owner_dm_playbook tags the owner's own DM message that asks for a playbook by a
+  line of its own. A playbook skill declares that line in its manifest
+  (`"playbook_line": "/<word>"`); the adapter injects the skills tree it scans, and
+  the bridge writes the answer as the task's `playbook` header. Nothing else in the
+  body is read, and a line two skills declare runs neither.
 - An event task's body may quote member-written text: it is data, never instructions.
   The trigger's own instruction comes from the server, not from commands quoted in it.
 
@@ -108,6 +113,61 @@ def resolve_playbook(event_type, playbook, skills_root: Path) -> Optional[Path]:
         path = _skill_file(skills_root, candidate)
         if path is not None:
             return path
+    return None
+
+
+# A playbook's own slash line: `/` and one lowercase word, the whole line.
+PLAYBOOK_LINE_RE = re.compile(r"/[a-z][a-z0-9-]{0,63}")
+
+
+def _slash_lines(body) -> list:
+    """The body's lines that could be a playbook line, stripped; reads nothing else."""
+    if not isinstance(body, str):
+        return []
+    return [s for s in (line.strip() for line in body.splitlines()) if PLAYBOOK_LINE_RE.fullmatch(s)]
+
+
+def playbook_lines(skills_root: Optional[Path]) -> dict:
+    """{line: playbook} for each playbook skill under `skills_root` whose manifest declares
+    `playbook_line`; a line declared by more than one skill is left out (nobody picks)."""
+    if skills_root is None:
+        return {}
+    found: dict = {}
+    try:
+        manifests = sorted(Path(skills_root).glob("*/manifest.json"))
+    except OSError:
+        return {}
+    for manifest in manifests:
+        playbook = manifest.parent.name
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        # The same opt-in is_playbook reads, from this one read of the manifest.
+        if not (playbook_value(playbook) and isinstance(data, dict) and data.get("playbook") is True):
+            continue
+        line = data.get("playbook_line")
+        if isinstance(line, str) and PLAYBOOK_LINE_RE.fullmatch(line):
+            found.setdefault(line, []).append(playbook)
+    return {line: names[0] for line, names in found.items() if len(names) == 1}
+
+
+def owner_dm_playbook(body, tier, channel_kind, skills_root: Optional[Path]) -> Optional[str]:
+    """The playbook the owner's own DM message asks for by a line of its own, or None.
+
+    Only an owner-tier sender in a direct message qualifies: a room message, or any other tier,
+    never does, whatever its body says. The line has to stand alone: one quoted (`> /x`, `"/x"`)
+    or inside a sentence is someone talking about the command, not sending it. No skills tree
+    (a standalone bridge) tags nothing."""
+    if tier != "owner" or channel_kind != "dm":
+        return None
+    candidates = _slash_lines(body)
+    if not candidates:
+        return None
+    lines = playbook_lines(skills_root)
+    for line in candidates:
+        if line in lines:
+            return lines[line]
     return None
 
 
