@@ -28,6 +28,7 @@ AGENT = "@bot:s.space"
 A, B, SARAH = "ann@example.com", "bob@example.com", "sarah@example.com"
 CARD = ac.account_switch.CARD
 ADD = ac.ADD_LABEL
+CURRENT = SARAH + " (current)"
 
 
 def menu(card):
@@ -130,7 +131,7 @@ class Offer(Remote):
         card = self.queued()[-1]["card"]
         self.assertIn(ac.NONE_HERE, card["text"])
         self.assertNotIn(ac.PICK, card["text"])
-        self.assertEqual(labels(card), ["✓ " + SARAH, ADD], "only the one in use and Add account")
+        self.assertEqual(labels(card), [CURRENT, ADD], "only the one in use and Add account")
         self.assertEqual([b["label"] for b in card["buttons"]], ["Switch account"])
 
     def test_switch_account_from_the_phone_offers_the_saved_accounts_in_place(self):
@@ -143,20 +144,21 @@ class Offer(Remote):
         self.assertEqual(queued.get("edit"), "$acct", "in place of the card tapped")
         card = queued["card"]
         self.assertEqual([b["label"] for b in card["buttons"]], ["Switch account"])
-        self.assertEqual(labels(card), ["✓ " + SARAH, A, B, ADD])
+        self.assertEqual(labels(card), [CURRENT, A, B, ADD])
         self.assertIn(ac.PICK, card["text"])
         self.assertNotIn("Open this on the computer", card["text"])
         self.assertNotIn(ac.account_switch.elsewhere(ac.NAME), card["text"])
         self.assertFalse(self.request().exists(), "nothing is switched until an account is tapped")
 
-    def test_the_card_has_one_account_menu_the_one_in_use_checked_the_others_sorted_and_add_account(self):
-        # Owner 11-27: one dropdown, as the desktop shows it, in place of a row of "Use <address>" buttons.
+    def test_the_card_has_one_account_row_its_value_the_one_in_use_and_a_change_menu(self):
+        # One dropdown in place of "Use <address>" buttons, in the row every account card uses: the account
+        # in use is the row's value, and the menu is "Change".
         card = self.posted()
         self.assertEqual([b["label"] for b in card["buttons"]], ["Switch account"], "no Use buttons")
         row, = [r for g in card["groups"] for r in g["rows"]]
-        self.assertEqual((row["title"], row["actions"][0]["label"]), ("Account", SARAH))
+        self.assertEqual((row["title"], row["subtitle"], row["actions"][0]["label"]), ("Account", SARAH, "Change"))
         self.assertEqual(menu(card), [
-            ("✓ " + SARAH, "✓ " + SARAH, "", True),
+            (CURRENT, "Use " + SARAH, "", True),
             (A, "Use " + A, "card:account:agent:" + ac.saved_key(A), False),
             (B, "Use " + B, "card:account:agent:" + ac.saved_key(B), False),
             (ADD, ADD, "card:account:agent:add", False)])
@@ -165,6 +167,15 @@ class Offer(Remote):
         offers = issued.offered(card)
         self.assertEqual(offers["Use " + A], "card:account:agent:" + ac.saved_key(A), "menu items are offered")
         self.assertEqual(offers[ADD], "card:account:agent:add")
+
+    def test_with_no_account_read_the_row_has_no_value_and_no_current_item(self):
+        self.answer = {"loggedIn": False}
+        card = self.posted()
+        row, = [r for g in card["groups"] for r in g["rows"]]
+        self.assertNotIn("subtitle", row, "an unknown account is not named")
+        self.assertEqual(row["actions"][0]["label"], "Change")
+        self.assertEqual([(i[0], i[3]) for i in menu(card)], [(A, False), (B, False), (SARAH, False), (ADD, False)])
+        self.assertIsNone(ac.connector_cards._core()[0].problem(card))
 
     def test_a_tap_on_a_menu_account_switches_as_the_use_button_did(self):
         self.posted()

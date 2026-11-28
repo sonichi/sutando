@@ -730,6 +730,30 @@ class Issued(unittest.TestCase):
         self.assertEqual(run("nope", "--event-id", "$x")[0], 2)
 
 
+class ChoiceRow(unittest.TestCase):
+    def test_a_choice_row_is_its_value_and_one_change_menu_the_one_in_use_marked(self):
+        items = [ac.current_item("Codex", "Switch to Codex", ac.reply("runtime", "core", "codex")),
+                 ac.button("Claude Code", "reply", reply="Switch to Claude Code")]
+        row = ac.choice_row("Runs on", "Codex", items)
+        self.assertEqual(row, {"title": "Runs on", "subtitle": "Codex", "actions": [
+            {"label": "Change", "kind": "menu", "items": [
+                {"label": "Codex (current)", "kind": "reply", "reply": "Switch to Codex",
+                 "command": "card:runtime:core:codex", "disabled": True},
+                {"label": "Claude Code", "kind": "reply", "reply": "Switch to Claude Code"}]}]})
+        _, card = a_card(groups=[{"rows": [row]}])
+        self.assertIsNone(ac.problem(card))
+
+    def test_an_unknown_value_is_left_out_and_a_long_one_keeps_its_mark(self):
+        long = ac.current_item("x" * 200, "Use it")
+        self.assertEqual(len(long["label"]), ac.LIMITS["label"])
+        self.assertTrue(long["label"].endswith(" (current)"))
+        self.assertNotIn("command", long)
+        row = ac.choice_row("Account", "", [long])
+        self.assertNotIn("subtitle", row)
+        _, card = a_card(groups=[{"rows": [row]}])
+        self.assertIsNone(ac.problem(card))
+
+
 class Dispatch(Issued):
     """`agent_card.py click`: the one place a task is matched to a card, for every card."""
 

@@ -102,6 +102,21 @@ def group(label: str, rows: list) -> dict:
     return {"label": label, "rows": list(rows)}
 
 
+# A setting drawn the same on every client: its value in the row, one menu of choices to change it.
+MENU_LABEL, CURRENT_TAG = "Change", " (current)"
+
+
+def current_item(label: str, reply: str, command: str = "") -> dict:
+    """A choice row's item for the value in use: marked, and not tappable (a tap would change nothing)."""
+    return button(label[: LIMITS["label"] - len(CURRENT_TAG)] + CURRENT_TAG, "reply", reply=reply,
+                  command=command, disabled=True)
+
+
+def choice_row(title: str, value: str, items: list) -> dict:
+    """The row of one setting: `value`, what is in use, in words ('' for unknown), and a menu of `items`."""
+    return row(title, subtitle=value, actions=[button(MENU_LABEL, "menu", items=items)])
+
+
 _MD_SPECIAL = re.compile(r"([\\`*_\[\]<>])")
 
 
