@@ -162,7 +162,7 @@ def provider() -> None:
 
 def a_room_refusal_parks_after_its_budget() -> None:
     lane = pl.Lane(gb, ISO, refuse(403, NOT_IN_ROOM))
-    lane.write("proactive-notinroom.txt", "[channel: !gone:example.org]\nhourly report\n")
+    lane.write("proactive-notinroom.txt", "[channel: !gone:ag2.space]\nhourly report\n")
     saved, gb._WORKSPACE_RESOLVER = getattr(gb, "_WORKSPACE_RESOLVER", None), RESOLVER
     try:
         raised, parked = scan_for_an_hour(lane, "proactive-notinroom")
@@ -252,7 +252,7 @@ def a_quarantined_result_names_no_workspace_path() -> None:
 
 def a_join_landing_on_the_third_send_delivers() -> None:
     lane = pl.Lane(gb, ISO, refuse_until_joined(2))
-    lane.write("proactive-joinrace.txt", "[channel: !joining:example.org]\ngreeting\n")
+    lane.write("proactive-joinrace.txt", "[channel: !joining:ag2.space]\ngreeting\n")
     raised, parked = scan_for_an_hour(lane, "proactive-joinrace")
     check(len(lane.posts) == 3, f"refused twice, the third send lands ({len(lane.posts)} sends)")
     check(raised == 0 and parked == [], f"nothing reaches the auth path or parks ({raised}, {parked})")

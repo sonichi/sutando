@@ -244,6 +244,49 @@ def main() -> int:
     check(queued and gw.posts == [] and record.get("owner_dm") == "" and record.get("private") is True,
           f"n) an unmarked record whose room is found shared is cleared, never marked private: {record}")
 
+    # o) Between refreshes: the DM was read private and adopted, then gains a member, and no
+    #    refresh is due. The send-time read must hold the post, not trust the old reading.
+    ws = workspace(); gw = Gateway(DM); mod = load(ws, gw)
+    check(not drain(mod, ws, "proactive-morning-13.txt") and len(gw.posts) == 1,
+          f"o) premise: the private DM is adopted and receives a first post: {gw.posts}")
+    check(mod._ROUTING["next"] > time.time(), "o) premise: no refresh is due before the next send")
+    gw.members[DM].append("@intruder:example.org")
+    held = ws / "results" / "proactive-morning-14.txt"
+    held.write_text(BRIEFING, encoding="utf-8")
+    aged = time.time() - 7200
+    os.utime(held, (aged, aged))
+    mod._post_proactive()
+    check(held.exists() and len(gw.posts) == 1,
+          f"o) a member who joined since the refresh gets nothing; the post is held: posts={len(gw.posts)}")
+    check(held.exists() and held.stat().st_mtime == aged,
+          "o) held as the same pending file, its age kept for the stale-proactive-backlog health check")
+    check(mod._ROUTING["next"] == 0.0, "o) and the routing refresh is made due at once")
+    queued = drain(mod, ws, "proactive-morning-14.txt")
+    persisted = json.loads(mod._routing_file().read_text())
+    check(queued and len(gw.posts) == 1 and mod.proactive_room() == "" and persisted.get("owner_dm") == "",
+          f"o) the next pass clears the reading on disk and keeps holding: posts={len(gw.posts)} file={persisted}")
+
+    # p) Fail closed: the member list cannot be read at send time -> held, never posted.
+    ws = workspace(); gw = Gateway(DM); mod = load(ws, gw)
+    drain(mod, ws, "proactive-morning-15.txt")
+    gw.unreachable.add(DM)
+    queued = drain(mod, ws, "proactive-morning-16.txt")
+    check(queued and len(gw.posts) == 1, f"p) an unreadable member list at send time holds: posts={len(gw.posts)}")
+    gw.unreachable.discard(DM)
+    queued = drain(mod, ws, "proactive-morning-16.txt")
+    check(not queued and len(gw.posts) == 2, f"p) once readable and private again it is sent: posts={len(gw.posts)}")
+
+    # q) Positive control and cost: a still-private DM is read once more per send and delivered.
+    ws = workspace(); gw = Gateway(DM); mod = load(ws, gw)
+    drain(mod, ws, "proactive-morning-17.txt")
+    reads = []
+    real = gw.req
+    gw.req = lambda m, p, payload=None, **k: (reads.append(1) if (payload or {}).get("op") == "members" else None) or real(m, p, payload, **k)
+    mod._req = gw.req
+    queued = drain(mod, ws, "proactive-morning-18.txt")
+    check(not queued and len(gw.posts) == 2 and len(reads) == 1,
+          f"q) a private DM is still delivered, with one members read for the send: posts={len(gw.posts)} reads={len(reads)}")
+
     print(f"\n{'FAIL' if FAILS else 'PASS'}: {len(FAILS)} failure(s)")
     return 1 if FAILS else 0
 

@@ -43,6 +43,7 @@ os.environ.update({
 })
 
 from ag2_sparrow import remote_gateway_bridge as gb  # noqa: E402
+from _helpers.proactive_lane import known_owner, registry_reply  # noqa: E402
 
 ROOM = "!TargetRoomAbCdEf:ag2.space"
 OWNER_DM = "!OwnerDmRoomXyZ:ag2.space"
@@ -65,9 +66,10 @@ def drain(body: str):
     logs: list[str] = []
 
     def _fake_req(method, path, payload=None, timeout=None, **_kw):
-        if method == "POST":
+        reply = registry_reply(gb, method, path, payload, OWNER_DM)
+        if reply is None and method == "POST":
             posts.append(payload)
-        return {"ok": True, "event_id": "$evt"}
+        return reply or {"ok": True, "event_id": "$evt"}
 
     saved = (gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR, gb.PROACTIVE_ROOM,
              gb._req, gb.PROACTIVE_CLAIM_GATE, gb._log)
@@ -76,7 +78,8 @@ def drain(body: str):
     gb._log = logs.append
     gb._ROUTING.update(owner_dm=OWNER_DM, loaded=True, next=gb.time.time() + 3600)
     try:
-        gb._post_proactive()
+        with known_owner(gb):
+            gb._post_proactive()
     finally:
         (gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR, gb.PROACTIVE_ROOM,
          gb._req, gb.PROACTIVE_CLAIM_GATE, gb._log) = saved
