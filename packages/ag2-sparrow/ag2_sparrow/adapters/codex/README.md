@@ -213,11 +213,13 @@ live only on a thread no collaborator's turn is ever routed to:
 - The shared thread (`state/thread`: collaborators' turns, the owner's room turns, and the owner's DM when
   there is no owner-only conversation) is never opened with the tools: no `ag2-space` entry, no grant, no
   prompt hint. Team and guest threads never get them either.
-- Off while collaborators are admitted (the install default): a collaborator's turn runs commands in the
-  owner's folder, where no sandbox stops reads (`read-only` stops writes only), so it could read the agent's
-  credentials or, with a writable sandbox, write the grant and launcher under `state/`. Tools are offered only
-  with `--no-allow-collaborator`, read as exactly that: every non-owner turn is then restricted, started only
-  under the confined permission profile (reads limited to its own empty folder) or not run. `install` says so.
+- Off unless the owner is the only one served. Both `--no-allow-collaborator` and `--no-allow-non-owner`
+  must be set (the install defaults serve both, so a default install gets no tools); a setting that is missing
+  or cannot be read counts as serving them. A collaborator's turn runs commands in the owner's folder, where
+  no sandbox stops reads, and a restricted turn's confinement is known only by the profile name Codex reports.
+- It also needs an owner-only conversation that already exists: `--resume-thread <id>` at install, or a
+  `state/owner-thread` kept from before. Without one the owner's DM runs on the shared thread, with no tools.
+- `install` prints a `NOTE mcp:` when the recorded options mean no tools. Existing installs are not changed.
 - Defence in depth: the shim forwards a call only under a live per-turn grant (`state/ag2-mcp-grant.json`),
   written for an owner turn on a tools thread and removed when the turn ends. A resume Codex refuses, or
   does not answer in time, with the entry is retried on the same thread without it, and a start refused

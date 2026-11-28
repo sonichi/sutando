@@ -836,7 +836,8 @@ class Connector:
         open_to = self.grant_state_open_to()
         if open_to:
             log("ag2-space MCP tools not offered: %s could read the agent's credentials or write the grant, "
-                "launcher and thread files under state/ (--no-allow-collaborator keeps them the owner's)" % open_to)
+                "launcher and thread files under state/ (needs both --no-allow-collaborator and --no-allow-non-owner)"
+                % open_to)
             return {}
         if not token_file:
             log("ag2-space MCP tools not offered: no --token-env-file (the agent's own token file)")
@@ -870,14 +871,15 @@ class Connector:
                                                 "startup_timeout_sec": ROOM_TOOLS_STARTUP_S}}}
 
     def grant_state_open_to(self):
-        """Who besides the owner could reach the agent's credentials or write state/ (the per-turn grant, the
-        launcher, the owner-only thread's id), or "": nobody. A collaborator's turn runs commands in the owner's
-        folder under --sandbox, and no sandbox there stops reads (read-only was measured not to), so an install
-        that admits collaborators is open. One that does not (--no-allow-collaborator, read as exactly False)
-        serves every non-owner turn restricted: started only under CONFINED_PROFILE, else not run (Unconfined)."""
-        if getattr(self.args, "allow_collaborator", None) is False:
-            return ""
-        return "a collaborator's turn"
+        """Who besides the owner is served a turn at all, or "": nobody. A collaborator's turn runs commands in
+        the owner's folder, where no sandbox stops reads; a restricted turn's confinement is known only by the
+        profile name Codex reports. So the tools need both kept out (--no-allow-collaborator and
+        --no-allow-non-owner), each read as exactly False: a setting that is missing or anything else is open."""
+        if getattr(self.args, "allow_collaborator", None) is not False:
+            return "a collaborator's turn"
+        if getattr(self.args, "allow_non_owner", None) is not False:
+            return "a non-owner's turn"
+        return ""
 
     def bind_launch(self, tools):
         """Remember which ag2-space launch the thread now open runs with (none when it runs without the tools)."""

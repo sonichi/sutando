@@ -534,7 +534,7 @@ class Install(Base):
         self.assertEqual(rc, 0, err)
         self.assertEqual(cm.read_config(cli.config_path())["RESUME_THREAD"], thread, "matched and kept lowercase")
 
-    def test_an_install_that_admits_collaborators_is_told_it_gets_no_tools(self):
+    def test_an_install_that_serves_anyone_but_the_owner_is_told_it_gets_no_tools(self):
         engine = self.home / "Application Support" / "engine"   # a space in the path, as the desktop's
         engine.mkdir(parents=True)
         node = engine / "node"
@@ -542,13 +542,15 @@ class Install(Base):
         node.chmod(0o755)
         proxy = shlex.join([str(node), str(engine / "ag2-mcp-proxy.mjs")])
         runner = self.runner()
-        for sandbox in ("read-only", "workspace-write"):
-            rc, out, err = self.install_with(runner, False, "--mcp-proxy-command", proxy, "--sandbox", sandbox)
+        for flags in ((), ("--no-allow-collaborator",), ("--allow-collaborator", "--no-allow-non-owner"),
+                      ("--sandbox", "workspace-write")):
+            rc, out, err = self.install_with(runner, False, "--mcp-proxy-command", proxy, *flags)
             self.assertEqual(rc, 0, out + err)
-            self.assertIn("NOTE mcp: a collaborator's turn could read the agent's credentials", out, sandbox)
-        rc, out, err = self.install_with(runner, False, "--mcp-proxy-command", proxy, "--no-allow-collaborator")
+            self.assertIn("NOTE mcp: turns get no AG2 Space tools while anyone but the owner is served", out, flags)
+        rc, out, err = self.install_with(runner, False, "--mcp-proxy-command", proxy, "--no-allow-collaborator",
+                                         "--no-allow-non-owner")
         self.assertEqual(rc, 0, out + err)
-        self.assertNotIn("a collaborator's turn could read", out)
+        self.assertNotIn("while anyone but the owner is served", out)
 
     def test_mcp_proxy_command_is_checked_recorded_listed_and_handed_on_with_the_token_file(self):
         engine = self.home / "Application Support" / "engine"   # a space in the path, as the desktop's
