@@ -112,6 +112,21 @@ result twice.
 
 The same final scan (`policy/egress/result.guard_result_for_tier`) runs on every bridge's non-owner reply leg, Slack included. Besides markers and secrets it withholds a result that quotes internal error detail (a raw OS error, a traceback, or a local filesystem path): those belong in the owner's log, never in another person's conversation. On Slack a proactive owner notice resolves its recipient the way inbound tier resolution does, so an allowlisted member missing from `tierMap` is never treated as owner.
 
+### Linked-account tasks
+
+A person on Slack can link their Slack account to their s.space account. When the broker
+has weighed a bridged Slack message as that linked account, its task says so in a
+structured stamp, and the gateway writes it as one header above `task:`:
+
+`linked_account: <the s.space account>`
+
+It means: the s.space account the broker says this Slack message's author has linked. It
+does not change the access tier, which the broker already applied and which the tier
+headers state; the task's `user_id` is still the Slack-side sender. Use it to know which
+person you are talking to, never to grant anything. The gateway writes it only from the
+broker's stamp and only when the value is a well-formed account id; a line with that name
+in the message's own text is body, and is not read as the header.
+
 ### Owner-mention tasks
 
 With the room's per-agent **admit on owner mention** policy on, the broker also
