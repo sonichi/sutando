@@ -159,6 +159,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`install-health-check-launchd.sh`** — Install / uninstall the launchd-supervised health-check FALLBACK job.
 - **`install-sutando-app-launchd.sh`** — Install / uninstall / check the launchd-supervised Sutando.app job.
 - **`issued_cards.py`** — The agent panel cards this agent itself posted, so a card click counts only as an answer to one of them.
+- **`keychain_service.py`** — Shared macOS Keychain resolution for Claude Code CLI credentials.
 - **`lane_dedupe.py`** — Cross-lane duplicate guard: one room message becomes one task per agent, answered by its owner lane when known.
 - **`launch_hooks.py`** — Launch hooks: the scripts installed skills declare with the manifest field `on_launch`, each started once per core launch, detached, so no launch waits on or fails because of one.
 - **`live-agent-runtime.ts`** — LiveAgentRuntime — step 5a-2 of the interaction-planes refactor.
