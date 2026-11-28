@@ -16,14 +16,17 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
+import uuid
 from pathlib import Path
 
-from . import mcp_auth
+from . import mcp_auth, mcp_name_shim
 
 MINT_TIMEOUT_S = 30.0
 # What the token exchange's child keeps of this process's (already allowlisted) environment.
 MINT_ENV_KEEP = ("PATH", "HOME", "USER", "LANG", "TMPDIR")
 DESCRIPTOR_NAME = "ag2-mcp-descriptor.json"
+GRANT_NAME = "ag2-mcp-grant.json"
 PROXY_LOG_NAME = "ag2-mcp-proxy.log"
 SHIM_NAME = "ag2-mcp-shim"
 STATUS_NAME = "ag2-mcp-status.json"
@@ -162,3 +165,39 @@ def stdio_entry(proxy_command, token_env_file, agent_id, state_dir, run=subproce
     return {"name": mcp_auth.SERVER_NAME, "command": write_launcher(state, turn, tools), "args": list(argv),
             "env": [{"name": "AG2_MCP_DESCRIPTOR", "value": path},
                     {"name": "AG2_MCP_LOG", "value": os.path.join(state, PROXY_LOG_NAME)}]}, ""
+
+
+def grant_env(state_dir, launch):
+    """The env that makes a shim forward calls only under a live per-turn grant (`write_grant`) naming `launch`."""
+    return {mcp_name_shim.GRANT_ENV: os.path.join(os.path.abspath(state_dir), GRANT_NAME),
+            mcp_name_shim.LAUNCH_ENV: launch}
+
+
+def launch_of(config):
+    """The launch id a thread config's ag2-space entry carries (`grant_env`), or ''."""
+    try:
+        launch = config["mcp_servers"][mcp_auth.SERVER_NAME]["env"][mcp_name_shim.LAUNCH_ENV]
+    except (KeyError, TypeError):
+        return ""
+    return launch if isinstance(launch, str) else ""
+
+
+def write_grant(state_dir, launch, tier, tools, ttl, now=time.time):
+    """Write `<state>/ag2-mcp-grant.json` (0600) for the turn about to start: the launch whose shim may forward
+    `tools` until `ttl` seconds from now. Returns the grant's own turn id."""
+    turn = uuid.uuid4().hex
+    path = os.path.join(os.path.abspath(state_dir), GRANT_NAME)
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump({"launch": launch, "turn": turn, "tier": tier, "tools": sorted(tools), "expires": now() + ttl}, f)
+    os.replace(tmp, path)
+    return turn
+
+
+def retire_grant(state_dir):
+    """Remove the turn's grant: from here no shim forwards a call until the next turn's is written."""
+    try:
+        os.unlink(os.path.join(os.path.abspath(state_dir), GRANT_NAME))
+    except FileNotFoundError:
+        pass

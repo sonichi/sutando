@@ -515,7 +515,7 @@ class OnlyTheOwnersSessionHasRoomTools(ConnectBase):
     def call(self):
         """(forwarded?, the error message) for one room-tool call through the shim, gated on this root."""
         gate = mcp_name_shim.turn_gate({mcp_name_shim.GATE_ENV: json.dumps(hold_mod.gate_argv(self.root))})
-        names = mcp_name_shim.Names({"room.action.execute"}, gate)
+        names = mcp_name_shim.Names({"room.action.execute"}, gate=gate)
         names.rename_tools([{"name": "room.action.execute"}])
         forward, reply = mcp_name_shim.to_server(json.dumps(self.CALL) + "\n", names, set())
         return forward is not None, (json.loads(reply)["error"]["message"] if reply else "")
