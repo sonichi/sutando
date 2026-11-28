@@ -171,6 +171,64 @@ class ConnectorCards(unittest.TestCase):
         with self.assertRaises(ValueError):
             cc.queue(self.state, ROOM, *settled, edit="not-an-event")
 
+    def test_a_taps_answer_is_posted_under_the_tap_and_the_tapped_card_points_to_it(self):
+        ac, _ = cc._core()
+        self.posted()                                   # the menu, as $card1
+        answer = ac.build("model-switch-status", "pending", title="Model", body="Switching", text="Switching to Opus.",
+                          buttons=[ac.button("Undo", "reply", reply="Undo", command=ac.reply("model", "agent", "undo"))])
+        qid = cc.queue(self.state, ROOM, *answer, edit="$card1", below=True)
+        self.assertEqual(self.poster({"ok": True, "event_id": "$answer1"}).sweep(), 1)
+        new, moved = self.sent[-2:]
+        self.assertEqual((new["op"], new.get("event_id"), new["dedupe_key"]), ("message", None, "agent-card:" + qid))
+        self.assertEqual((moved["op"], moved["event_id"], moved["dedupe_key"], moved["body"]),
+                         ("edit", "$card1", "agent-card-moved:" + qid, cc.ANSWERED_BELOW))
+        pointer = moved["extra_content"]["space.ag2.card"]
+        self.assertEqual((pointer["id"], pointer["text"], pointer.get("buttons")), (cc.POINTER_CARD, cc.ANSWERED_BELOW, None))
+        self.assertIsNone(ac.problem(pointer), "the client draws the pointer")
+        self.assertEqual(cc.moved_to(self.state, "$card1"), "$answer1")
+        self.assertEqual(cc.absorb(self.state, self.root), 2)
+        # The tapped menu's buttons stop acting, as after an edit in place; the answer's act.
+        self.assertEqual(cc.click(headers("Switch to Opus"), "Switch to Opus", self.root).verdict, ac.FORGED)
+        undo = headers("Undo", event="$answer1", card_click=json.dumps({"card_id": "model-switch-status", "action": "Undo"}))
+        self.assertEqual(cc.click(undo, "Undo", self.root).verdict, ac.COMMAND)
+
+    def test_a_later_edit_of_a_tapped_card_lands_on_its_answer_below_one_hop_only(self):
+        ac, _ = cc._core()
+        self.posted()
+        note = lambda text: ac.build("model-switch-status", "done", title="Model", body=text, text=text)
+        cc.queue(self.state, ROOM, *note("Switching."), edit="$card1", below=True)
+        self.poster({"ok": True, "event_id": "$answer1"}).sweep()
+        # How it ended edits the answer in place, not the pointer left behind, and does not move again.
+        cc.queue(self.state, ROOM, *note("Switched."), edit="$card1")
+        cc.queue(self.state, ROOM, *note("Switched, really."), edit="$card1", below=True)
+        self.sent.clear()
+        self.poster({"ok": True, "event_id": "$answer1"}).sweep()
+        self.poster({"ok": True, "event_id": "$answer1"}).sweep()
+        self.assertEqual([(p["op"], p.get("event_id")) for p in self.sent], [("edit", "$answer1"), ("edit", "$answer1")])
+        # A tap on the answer moves its own answer below it; an edit of the first card still lands one hop away.
+        cc.queue(self.state, ROOM, *note("Again."), edit="$answer1", below=True)
+        self.poster({"ok": True, "event_id": "$answer2"}).sweep()
+        self.assertEqual((cc.moved_to(self.state, "$answer1"), cc.moved_to(self.state, "$card1")), ("$answer2", "$answer1"))
+        self.assertEqual(cc.moved_to(self.state, "$never"), "$never")
+
+    def test_the_answer_stands_when_the_tapped_card_cannot_be_pointed_to_it(self):
+        ac, _ = cc._core()
+        self.posted()
+        answer = ac.build("model-switch-status", "done", title="Model", body="Switched", text="Switched.")
+        cc.queue(self.state, ROOM, *answer, edit="$card1", below=True)
+
+        def post(payload):
+            self.sent.append(payload)
+            if payload["op"] == "edit":
+                raise OSError("relay down")
+            return {"ok": True, "event_id": "$answer1"}
+        self.assertEqual(cc.Poster(self.state, post, log=self.logs.append, clock=lambda: 1000.0).sweep(), 1)
+        self.assertEqual(cc.moved_to(self.state, "$card1"), "$answer1")
+        self.assertIn("agent-card: the tapped card was not pointed to its answer (OSError)", self.logs)
+        refused = cc.Poster(self.state, lambda p: {"ok": False}, log=self.logs.append, clock=lambda: 1000.0)
+        self.assertEqual(refused.send_below({"dedupe_key": "agent-card:x", "room_id": ROOM}, "$card1", answer[1]),
+                         ({"ok": False}, ""), "no answer posted: nothing to point to")
+
     def test_an_edit_the_server_refuses_is_posted_as_a_new_card_and_a_network_failure_is_retried(self):
         ac, _ = cc._core()
         body, card = ac.build("model-switch-status", "done", title="Model", body="Model: now Opus", text="Switched.")

@@ -270,15 +270,16 @@ def usable(bridge_state) -> bool:
     return bool(bridge_state) and os.path.isdir(bridge_state)
 
 
-def post(bridge_state, room, built, log, key: str = "", at_ns: int = 0, edit: str = "") -> bool:
+def post(bridge_state, room, built, log, key: str = "", at_ns: int = 0, edit: str = "", below: bool = False) -> bool:
     """Queue a built card for the bridge to post in `room`; False when it cannot be. With `key` the
     call may be repeated after a restart without a second card (connector_cards.queue). With `edit` (the
-    event id of the card being answered) it is shown in place of that card, not as a second one."""
+    event id of the card being answered) it is shown in place of that card, not as a second one; with
+    `below` (a tap's answer) it is posted under the tap and the tapped card points to it."""
     if not usable(bridge_state):
         return False
     try:
         connector_cards.queue(bridge_state, str(room or ""), *built, key=key, at_ns=at_ns,
-                              edit=edit if str(edit or "").startswith("$") else "")
+                              edit=edit if str(edit or "").startswith("$") else "", below=below)
         return True
     except (OSError, ValueError) as e:
         log("card not queued:", "%s: %s" % (type(e).__name__, e))

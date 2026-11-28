@@ -355,7 +355,7 @@ def _why(said: str, code: str, link: str) -> str:
 
 
 def answer(state_dir, event: str, use: bool, codex: str, env: dict, run=subprocess.run, homes=(), now=None,
-           wait_s=None) -> "tuple[str, str, list]":
+           wait_s=None, moved=lambda event: event) -> "tuple[str, str, list]":
     """The owner's Yes or No to the staged account, from the card `event` that asked; only the first answer
     counts, and only within LOGIN_WAIT_S of the question, checked here whatever the connector's loop has
     done. (outcome, the email or why not, every card that showed this sign-in): "used", "discarded",
@@ -365,7 +365,8 @@ def answer(state_dir, event: str, use: bool, codex: str, env: dict, run=subproce
     with locked(d):
         meta = read_json(d / "meta.json")
         cards = meta.get("cards") or []
-        if meta.get("phase") != CONFIRM_PHASE or not event or event != meta.get("edit"):
+        # The question may have been posted under the tap (`moved` says where): a tap there answers it too.
+        if meta.get("phase") != CONFIRM_PHASE or not event or event not in (meta.get("edit"), moved(meta.get("edit") or "")):
             return "stale", "", []
         write_private(d / "meta.json", dict(meta, phase=SETTLING))      # first answer only, before anything is done
         _journal(d, meta.get("room") or "", cards)
@@ -537,8 +538,10 @@ class Remote:
     def code_card(self, meta):
         host = urllib.parse.urlsplit(meta["link"]).hostname
         agent_card, _ = connector_cards._core()
-        return self.card("pending", "To add an account, open the sign-in page at %s on this phone or any device, sign "
-                                    "in, then enter this one-time code: %s. It works for %d minutes. I'll ask you here "
+        # Codex keeps one sign-in, so there is no saved account to pick: switching is signing in to the other one.
+        return self.card("pending", "To switch to another account, open the sign-in page at %s on this phone or any "
+                                    "device, sign in with that account, then enter this one-time code: %s. It works "
+                                    "for %d minutes. I'll ask you here "
                                     "before I use the account; until then I keep using the one I have."
                          % (host, meta["code"], int(LOGIN_WAIT_S // 60)),
                          [agent_card.button("Open %s" % host, "url", url=meta["link"])],
@@ -575,7 +578,7 @@ class Remote:
             return "account-not-started"
         built = self.confirm_card(meta["email"]) if meta["phase"] == CONFIRM_PHASE else self.code_card(meta)
         before = note_card(self.dir, room, tapped)      # on record before the edit is queued: a stop between leaves no orphan
-        if before is None or not self.accounts.post(room, built, edit=tapped):
+        if before is None or not self.accounts.post(room, built, edit=tapped, below=True):
             if before is not None:
                 forget_card(self.dir, tapped, before)
             if again and before is not None:
@@ -595,7 +598,8 @@ class Remote:
 
     def answer(self, use, sent, result_file) -> str:
         room, tapped = str(sent.get("channel_id") or ""), card_desk.tapped_event(sent)
-        outcome, said, cards = answer(self.dir, tapped, use, self.codex, self.env, run=self.run, homes=self.homes())
+        outcome, said, cards = answer(self.dir, tapped, use, self.codex, self.env, run=self.run, homes=self.homes(),
+                                      moved=lambda event: connector_cards.moved_to(self.accounts.bridge_state, event))
         if outcome == "stale":
             self.accounts.publish(result_file, self.accounts.quoted(ANSWERED_ALREADY) + "\n")
             return "account-device-stale"
@@ -610,7 +614,7 @@ class Remote:
             self.log("staged account not used:", said[:200])
             built = self.accounts.card("error", "I could not use that account: %s. %s" % (said, self.accounts.using()),
                                        ask=True)
-        shown = self.accounts.post(room, built, edit=tapped)
+        shown = self.accounts.post(room, built, edit=tapped, below=True)
         self.accounts.publish(result_file, account_switch.ANSWERED if shown else self.accounts.quoted(built[1]["text"]) + "\n")
         if shown:
             paid(self.dir, room, tapped)
