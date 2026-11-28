@@ -34,6 +34,7 @@ import uuid
 from ... import (account_switch, card_desk, connector_cards, desktop_accounts, held_start, live_view, model_switch,
                  quota_notice, signin_watch)
 from ...acp_host import quoted
+from ...bounded_file_read import read_regular
 from ...collaborator_turn import TIER_BLOCK_END, TIER_BLOCK_HEADER, TIER_REWRITES, stage_own_attachments, with_staged_paths
 from ...relay_loop import count_arg
 from ...task_io import (AUDIENCE_RULE, DONE_KEEP, NON_OWNER_NOTE, NON_OWNER_REFUSED, OWNER, OWNER_CAPABILITIES,  # noqa: F401
@@ -258,6 +259,15 @@ NOT_SAVED = "That account is no longer saved on this computer. Send /account for
 SWITCH_BUSY = "A switch is already waiting for the app on this computer. Send /account again in a minute."
 SWITCH_ASKED = ("Switching to %s… The app on this computer makes the switch; I move to the new account as soon "
                 "as it does. Send /account to see which account I'm on.")
+SWITCH_FILE = "codex-switch.json"      # under state/: the pick waiting for the app's answer (one at a time)
+SWITCH_UNCLAIMED_S, SWITCH_GIVE_UP_S = 90.0, 600.0
+NOW_USING = "Now using %s."
+SWITCH_REFUSED = "Could not switch to %s: %s."
+SWITCH_RESTARTED = "The app restarted during the switch. Send /account to see which account I'm on."
+SWITCH_UNCLAIMED = ("The app on this computer did not pick this up: it is not running, or it is a version that cannot "
+                    "switch Codex accounts from the phone yet. Nothing was changed.")
+SWITCH_UNTOLD = ("The app on this computer has not said how the switch to %s ended. Send /account to see which "
+                 "account I'm on.")
 
 
 def usage_state(answer, now=None) -> "dict | None":
@@ -568,15 +578,77 @@ class Connector:
         if account_remote.request_nonce(home) is not None or account_remote.claimed_any(home):
             accounts.say(room, accounts.card("info", SWITCH_BUSY), result_file, tapped)
             return "account-busy"
+        nonce = str(uuid.uuid4())
         try:
-            account_remote.write_request(home, key, str(uuid.uuid4()), time.time())
+            account_remote.write_request(home, key, nonce, time.time())
         except OSError as e:
             log("switch request not written:", "%s: %s" % (type(e).__name__, str(e)[:200]))
             accounts.say(room, accounts.card("error", "Could not switch: the request for the app could not be "
                                                             "written."), result_file, tapped)
             return "account-not-asked"
+        self.keep_switch({"nonce": nonce, "email": email, "room": room, "edit": tapped, "home": home,
+                          "at": time.time()})
         accounts.say(room, accounts.card("pending", SWITCH_ASKED % email), result_file, tapped)
         return "account-switching"
+
+    def keep_switch(self, rec) -> None:
+        path = os.path.join(self.args.state, SWITCH_FILE)
+        if rec:
+            write_atomic(path, json.dumps(rec))
+        else:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+    def switch_waiting(self) -> dict:
+        try:
+            with open(os.path.join(self.args.state, SWITCH_FILE), encoding="utf-8") as f:
+                rec = json.load(f)
+        except (OSError, ValueError):
+            return {}
+        return rec if isinstance(rec, dict) and account_remote.NONCE_RE.fullmatch(str(rec.get("nonce") or "")) else {}
+
+    def switch_tick(self, now=None) -> str:
+        """The pick waiting for the app: its answer (account_remote's v2 receipt in CODEX_HOME), or auth.json now on
+        the account picked, shown in place of the "Switching to …" card; what was told, '' while it still waits."""
+        rec = self.switch_waiting()
+        if not rec:
+            return ""
+        now = time.time() if now is None else now
+        home, nonce, email = str(rec.get("home") or ""), rec["nonce"], str(rec.get("email") or "")
+        receipt = os.path.join(home, account_remote.RESULT % nonce)
+        text, _ = read_regular(receipt, account_remote.FILE_MAX, follow=False)
+        said = None
+        if text is not None:
+            data = account_remote._parsed(text, nonce)
+            if data.get("unknown") is True or data.get("unreadable"):
+                said = ("info", SWITCH_RESTARTED)
+            elif data.get("ok"):
+                said = ("done", NOW_USING % (account_switch.shown(desktop_accounts.email_only(data["label"])) or email))
+            else:
+                why = account_remote.one_line(data.get("error") or "the app refused")
+                said = ("error", SWITCH_REFUSED % (email, why.rstrip(".")))
+        elif email and (signin_watch.codex_identity(home) or (None, ""))[1:2] == (email,):
+            said = ("done", NOW_USING % email)
+        elif account_remote.request_nonce(home) == nonce and now - float(rec.get("at") or 0) >= SWITCH_UNCLAIMED_S:
+            if account_remote.withdraw(home, nonce):
+                said = ("error", SWITCH_UNCLAIMED)
+        elif now - float(rec.get("at") or 0) >= SWITCH_GIVE_UP_S:
+            said = ("info", SWITCH_UNTOLD % email)
+        if said is None:
+            return ""
+        if not self.accounts.post(rec.get("room"), self.accounts.card(*said), key="codex-switch:" + nonce,
+                                  edit=str(rec.get("edit") or "")):
+            return ""       # told on a later look
+        if text is not None:
+            try:
+                os.unlink(receipt)
+            except OSError:
+                pass
+        self.keep_switch({})
+        log("account switch ->", said[0])
+        return said[1]
 
     @property
     def quota(self):
@@ -1404,6 +1476,7 @@ class Connector:
                 connector_cards.absorb(self.args.bridge_state, self.root)
                 self.accounts.expire()
                 self.accounts.remote.tick()
+                self.switch_tick()
                 self.quota.tick()
                 self.expire_held(done_path)
             except Exception as e:  # noqa: BLE001

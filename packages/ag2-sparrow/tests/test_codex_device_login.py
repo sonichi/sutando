@@ -1001,6 +1001,34 @@ class SavedMenuTest(Home, CardWorld, unittest.TestCase):
         self.assertEqual((shown["state"], shown["text"]), ("pending", cc.SWITCH_ASKED % "bob@example.org"))
         self.assertEqual(self.ops()[-1], ("edit", "$card1"), "in place of the card tapped")
 
+    def answered(self, **answer):
+        """Pick bob, then the app's v2 receipt for that request (desktop #1344), and a look by the connector."""
+        self.save("bob@example.org", "alice@example.com")
+        self.ask("$card1")
+        self.pick("task-pick", "Use bob@example.org", "$card1")
+        self.posted("$card2")
+        nonce = json.loads((self.home / account_remote.REQUEST).read_text())["nonce"]
+        (self.home / account_remote.REQUEST).unlink()
+        receipt = self.home / (account_remote.RESULT % nonce)
+        receipt.write_text(json.dumps(dict({"v": 2, "nonce": nonce}, **answer)))
+        self.dm("task-hello", "hello")
+        self.assertEqual(run_connector(self.work, once=1, extra=["--codex", str(self.codex), "--agent-id", self.AGENT]), 0)
+        ((_, told),) = self.posted("$card3")
+        self.assertEqual(self.ops(), [("edit", "$card1")], "in place of the card tapped")
+        self.assertFalse(receipt.exists(), "the receipt is taken once told")
+        self.assertFalse((self.work / "state" / cc.SWITCH_FILE).exists())
+        return told
+
+    def test_the_apps_answer_replaces_switching_with_now_using(self):
+        told = self.answered(ok=True, label="bob@example.org (Plus)", verified=False)
+        self.assertEqual((told["state"], told["text"]), ("done", "Now using bob@example.org."))
+
+    def test_the_apps_refusal_replaces_switching_with_why(self):
+        told = self.answered(ok=False, error="that account is not saved on this Mac for this agent")
+        self.assertEqual((told["state"], told["text"]),
+                         ("error", "Could not switch to bob@example.org: that account is not saved on this Mac for "
+                                   "this agent."))
+
     def test_a_pick_on_another_card_is_refused_and_writes_nothing(self):
         self.save("bob@example.org", "alice@example.com")
         self.ask("$card1")
