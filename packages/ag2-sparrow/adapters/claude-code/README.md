@@ -446,6 +446,10 @@ ag2-sparrow-claude-local connect --base <s.space backend URL> --agent <the agent
 # asks for the acp.<code>; or pipe it in with --code - (e.g. pbpaste | ... --code -)
 ```
 
+The code is one of two kinds, both taken the same way: `acp.<code>`, issued when the agent is added, and
+`rot.<code>`, re-issued for an agent that already exists (the first code expired, or its owner asked for
+a new one). Any other code is refused before anything is sent.
+
 The code is never needed on the command line, where ps and shell history
 would keep it: `connect` asks for it, or reads it from stdin with `--code -`.
 `--code <code>` still works and says so with a warning. `--base` and the relay
@@ -468,6 +472,25 @@ credential. The credential owner writes it to the agent's seat beside its root,
 mode 600. The bearer is never printed and never on a command line. `connect`
 then runs install with `--token-env-file` set to that `.env`, so the bridge runs
 as that seat alone. A new code (s.space's Reconnect) rewrites `token` in place.
+
+A re-issued `rot.` code replaces the agent's relay token, and the order matters. s.space hands the new
+token over only after the agent's owner has confirmed the code there, and confirming is what retires the
+token the agent held before: from that moment the old token no longer works, whether or not the new one
+has been installed. So get the host ready first, and confirm last:
+
+1. If the agent already runs on this host, stop its job yourself, with the command `connect`'s refusal
+   prints (`systemctl --user stop <unit>`; on macOS `launchctl bootout --wait <service>`). `connect` never
+   stops a running job: while the job runs, or its state cannot be read, it refuses before the code is
+   read or sent, and the seat is unchanged.
+2. Have the `connect` command ready to run on this host.
+3. Confirm the code in s.space, then run `connect` (or run it first and confirm within its retries).
+
+Until the owner confirms, s.space answers 202: `connect` retries on its backoff, then says s.space is
+still redeeming the code and to run `connect` again with the same code. Nothing is written in that case,
+so the seat still holds the old token, byte for byte, and no job is started. Once the same code answers
+200, only this agent's seat is rewritten (`token` in place, `.env` and its `GATEWAY_INSTANCE` kept);
+another agent's seat on the host is not touched. As with a first code, `--agent` must name the agent the
+code is for: a code that answers for another agent is spent and nothing is written.
 On a host whose bridges a supervisor runs (Sutando's), `connect` refuses: the
 worker pool owns the seats there.
 

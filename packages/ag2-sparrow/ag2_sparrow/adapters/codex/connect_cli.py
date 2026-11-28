@@ -461,7 +461,7 @@ def main(argv=None) -> int:
     c = sub.add_parser("connect", help="experimental, off in this release: refused unless enabled")
     c.add_argument("--experimental-connect", action="store_true", default=False, help=argparse.SUPPRESS)
     c.add_argument("--base", help="the s.space backend URL the code was issued by")
-    c.add_argument("--code", help="the one-time code from s.space (starts with acp.): - reads it from stdin; "
+    c.add_argument("--code", help="the one-time code from s.space (starts with acp., or rot. when re-issued): - reads it from stdin; "
                    "omitted, connect asks for it. A code given here is kept by ps and shell history")
     c.add_argument("--agent", help="required: the Matrix ID (@name:server) of the agent the code was made for, as "
                    "the app's connect command names it; without it connect refuses and the code is not used")
