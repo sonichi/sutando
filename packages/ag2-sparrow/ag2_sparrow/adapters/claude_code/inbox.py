@@ -130,6 +130,16 @@ def _installed_on(key, environ=None) -> bool:
         return False
 
 
+def owner_alone(environ=None) -> bool:
+    """Whether the installed config, as it reads now, has the room tools preview on and serves nobody but the
+    owner: both opt-outs exactly "0". Missing, anything else, or a config that cannot be read: False."""
+    try:
+        cfg = cm.read_config(_installed_config(environ))
+    except (OSError, ValueError):
+        return False
+    return cfg.get("ROOM_TOOLS_PREVIEW") == "1" and cfg.get(ALLOW_COLLABORATOR) == "0" and cfg.get(ALLOW_NON_OWNER) == "0"
+
+
 TOOLS_MARK = ("state", "room-tools", "session.json")    # hold.mark_tools_generation writes it
 
 
@@ -714,6 +724,8 @@ ROOM_TOOLS_NO_OWNER = "no turn of the owner's is running in this session, so no 
 ROOM_TOOLS_NOT_OWNERS = "this session was not started with the AG2 Space tools, so no room tool is called"
 ROOM_TOOLS_NO_SESSION = "no live session holds this root, so no room tool is called"
 ROOM_TOOLS_UNREAD = "the session's records could not be read, so no room tool is called"
+ROOM_TOOLS_OPENED = ("the install no longer has the room tools preview on with only the owner served, so no "
+                     "room tool is called")
 
 
 def room_tools_refusal(root) -> str:
@@ -723,6 +735,9 @@ def room_tools_refusal(root) -> str:
     the tools (tools_generation), and a turn of the owner's (the task's attested tier) is confirmed in it and
     its answer not yet staged: TURN_CONFIRMED. A claim only prepared, being sent or already answered is not
     that. A mark, claim or task that cannot be read refuses. Read under claims.lock, changing nothing."""
+    # Read at every call: an install loosened while this session runs on closes the tools at once.
+    if not owner_alone():
+        return ROOM_TOOLS_OPENED
     lc = _lifecycle(root)
     try:
         generation = _generation(root)

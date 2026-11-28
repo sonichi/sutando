@@ -40,6 +40,8 @@ SECRET = "relay-secret-do-not-leak"
 AGENT = "@cl:s.space"
 # Its first word must be an executable that exists (hold checks it at every start): this interpreter stands in.
 PROXY = shlex.join([sys.executable, "/app/ag2-mcp-proxy.mjs"])
+ALONE = {"ALLOW_COLLABORATOR": "0", "ALLOW_NON_OWNER": "0"}     # nobody but the owner is served
+ALONE_FLAGS = ("--no-allow-collaborator", "--no-allow-non-owner")
 DESC = {"version": 1, "lane": "primary", "env_key": "REMOTE_TASK_TOKEN",
         "mint_url": "https://relay.s.space/api/v1/mcp/agent-access-tokens", "mcp_url": "https://mcp.s.space/mcp",
         "relay": "https://relay.s.space"}
@@ -73,7 +75,7 @@ class RoomToolsArgv(unittest.TestCase):
         self.token = token_file(self.d)
         self.cfg = {"MCP_PROXY_COMMAND": PROXY, "TOKEN_ENV_FILE": self.token, "AGENT_ID": AGENT,
                     "CLAUDE_CONFIG_DIR": str(self.config_dir), "ROOT": str(self.root),
-                    "SESSION_ID": SESSION_ID, "ROOM_TOOLS_SESSION": SESSION_ID, "ROOM_TOOLS_PREVIEW": "1"}
+                    "SESSION_ID": SESSION_ID, "ROOM_TOOLS_SESSION": SESSION_ID, "ROOM_TOOLS_PREVIEW": "1", **ALONE}
         self.runs, self.lines = [], []
         self.desc = dict(DESC, env_file=self.token)
         self.rc = 0
@@ -157,7 +159,7 @@ class RoomToolsArgv(unittest.TestCase):
 
     def test_install_starts_a_new_conversation_for_the_tools_and_keeps_the_earlier_one_without_them(self):
         from ag2_sparrow.adapters.claude_code import cli as cc
-        on = {"MCP_PROXY_COMMAND": PROXY, "TOKEN_ENV_FILE": self.token, "ROOM_TOOLS_PREVIEW": "1"}
+        on = {"MCP_PROXY_COMMAND": PROXY, "TOKEN_ENV_FILE": self.token, "ROOM_TOOLS_PREVIEW": "1", **ALONE}
         old_id, new_id = SESSION_ID, "99999999-2222-4333-8444-555555555555"
 
         def decide(old, values, session_id, kept, resume="", live=None):
@@ -369,7 +371,7 @@ class InstallOption(ConnectBase):
         self.assertIn("--room-tools-preview", helped.getvalue())
         self.assertEqual((cfg["ROOM_TOOLS_PREVIEW"], cfg["ROOM_TOOLS_SESSION"]), ("", ""))
         self.assertIn("ROOM_TOOLS_PREVIEW", [key for key, _, _ in cli.RECORDED])
-        rc, out, err = self.install_with(runner, False, "--mcp-proxy-command", proxy, "--room-tools-preview")
+        rc, out, err = self.install_with(runner, False, "--mcp-proxy-command", proxy, "--room-tools-preview", *ALONE_FLAGS)
         self.assertEqual(rc, 0, out + err)
         cfg = cm.read_config(cli.config_path())
         self.assertEqual((cfg["ROOM_TOOLS_PREVIEW"], cfg["ROOM_TOOLS_SESSION"]), ("1", ""), "no token file: still no tools")
@@ -397,6 +399,8 @@ class HoldLaunch(ConnectBase):
         if over.get("MCP_PROXY_COMMAND"):
             over.setdefault("ROOM_TOOLS_SESSION", SESSION_ID)      # the conversation install started for the tools
             over.setdefault("ROOM_TOOLS_PREVIEW", "1")
+            for key, value in ALONE.items():
+                over.setdefault(key, value)
         self.configure(TOKEN_ENV_FILE=self.token, AGENT_ID=AGENT, **over)
         code, _, err = self.hold_cmd(patch=HOLD_PATCH % (DESC, self.token, rc))
         self.assertEqual(code, 0, err)
@@ -435,7 +439,7 @@ class HoldLaunch(ConnectBase):
 
     def test_a_tools_conversation_that_cannot_be_marked_is_not_started(self):
         self.configure(TOKEN_ENV_FILE=self.token, AGENT_ID=AGENT, MCP_PROXY_COMMAND=PROXY, ROOM_TOOLS_PREVIEW="1",
-                       ROOM_TOOLS_SESSION=SESSION_ID)
+                       ROOM_TOOLS_SESSION=SESSION_ID, **ALONE)
         patch = HOLD_PATCH % (DESC, self.token, 0) + "hold.mark_tools_generation = lambda *a, **k: False\n"
         code, _, err = self.hold_cmd(patch=patch)
         self.assertNotEqual(code, 0, err)
@@ -488,12 +492,21 @@ class OnlyTheOwnersSessionHasRoomTools(ConnectBase):
     def setUp(self):
         super().setUp()
         self.stub = write_isolated_stub(self.home)
-        self.configure(CLAUDE=str(self.stub), MCP_PROXY_COMMAND=PROXY, TOKEN_ENV_FILE=token_file(self.home),
-                       AGENT_ID=AGENT, ROOM_TOOLS_PREVIEW="1", ROOM_TOOLS_SESSION=SESSION_ID)
+        self.conf = dict(CLAUDE=str(self.stub), MCP_PROXY_COMMAND=PROXY, TOKEN_ENV_FILE=token_file(self.home),
+                         AGENT_ID=AGENT, ROOM_TOOLS_PREVIEW="1", ROOM_TOOLS_SESSION=SESSION_ID)
+        self.tighten()
         self.root = str(self.work)
         self.assertEqual(inbox.prepare_root(self.root), "")
         self.holder, _ = hold_consumer(self.work)
         self.addCleanup(unhold, self.holder)
+
+    def tighten(self, **over):
+        """The install as the tools need it: the preview on and nobody but the owner served."""
+        self.configure(**{**self.conf, **ALONE, **over})
+
+    def loosen(self, **over):
+        """The install changed while the session runs on: collaborators and other non-owners served again."""
+        self.configure(**{**self.conf, "ALLOW_COLLABORATOR": "1", "ALLOW_NON_OWNER": "1", **over})
 
     def with_tools(self):
         """The live session process, marked as hold marks one it started with the tools."""
@@ -532,7 +545,10 @@ class OnlyTheOwnersSessionHasRoomTools(ConnectBase):
         self.phase("task-o", lifecycle.TURN_CONFIRMED)
         self.assertEqual(self.call(), (True, ""), "the owner's own turn, confirmed in the session")
 
-        # A collaborator's task: answered on its own turn, never submitted to the session with the tools.
+        # The install loosened while the session runs on: the tools close at once, and a collaborator's task
+        # is answered on its own turn, never submitted to the session that has them.
+        self.loosen()
+        self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_OPENED))
         rc, out = self.claim("task-c", "team", "collaborator: true\n")
         self.assertEqual((rc, "admission" in out), (1, False), out)
         self.assertIn("never submitted to this session", out["refused"])
@@ -542,6 +558,7 @@ class OnlyTheOwnersSessionHasRoomTools(ConnectBase):
         self.assertNotIn("--mcp-config", run["argv"])
         self.assertFalse({k for k in run["env"] if k.startswith("AG2_MCP")}, "nothing of the tools reaches its turn")
         self.assertTrue((self.results / "task-c.txt").exists(), "and it is answered")
+        self.tighten()
         self.assertEqual(self.call(), (True, ""), "the owner's turn is not closed by it")
 
         # The owner's answer staged: the turn is over, and nothing authorizes a call any more.
@@ -551,16 +568,20 @@ class OnlyTheOwnersSessionHasRoomTools(ConnectBase):
 
     def test_a_collaborator_alone_authorizes_nothing(self):
         self.with_tools()
+        self.loosen()
         rc, out = self.claim("task-c", "team", "collaborator: true\n")
         self.assertEqual(rc, 1, out)
+        self.tighten()
         self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_NO_OWNER))
 
     def test_admission_follows_the_running_session_not_the_install_config(self):
         # The config says tools, the running session was started without them: collaborators stay in it, as
         # before, and no call gets through even on the owner's confirmed turn.
         self.assertIs(inbox.tools_generation(self.root, inbox._generation(self.root)), False)
+        self.loosen()
         rc, out = self.claim("task-c1", "team", "collaborator: true\n")
         self.assertEqual((rc, out.get("admission")), (0, "collaborator"), out)
+        self.tighten()
         rc, out = self.claim("task-o1", "owner")
         self.phase("task-o1", lifecycle.TURN_CONFIRMED)
         self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_NOT_OWNERS))
@@ -569,6 +590,7 @@ class OnlyTheOwnersSessionHasRoomTools(ConnectBase):
         # The session runs with the tools; the config is then changed, and then cannot be read at all: a
         # collaborator is still kept out of it, because the running process is what is asked.
         self.with_tools()
+        self.loosen()
         changed = cli.config_path().read_text().replace("ROOM_TOOLS_SESSION=%s" % SESSION_ID, "ROOM_TOOLS_SESSION=''")
         self.assertNotEqual(changed, cli.config_path().read_text())
         cli.config_path().write_text(changed)
@@ -586,8 +608,10 @@ class OnlyTheOwnersSessionHasRoomTools(ConnectBase):
         for text in ("not json", "[]", '{"pid": "seven"}'):
             mark.write_text(text)
             self.assertIsNone(inbox.tools_generation(self.root, inbox._generation(self.root)), text)
+        self.loosen()
         rc, out = self.claim("task-c", "team", "collaborator: true\n")
         self.assertEqual((rc, "admission" in out), (1, False), "never admitted on a doubt: %s" % out)
+        self.tighten()
         rc, out = self.claim("task-o", "owner")
         self.phase("task-o", lifecycle.TURN_CONFIRMED)
         self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_UNREAD))
@@ -603,6 +627,7 @@ class OnlyTheOwnersSessionHasRoomTools(ConnectBase):
         halves = ({"pid": gen["pid"]}, {"start": gen["start"]}, {"pid": gen["pid"], "start": None},
                   {"pid": gen["pid"], "start": ""}, {"pid": 1}, {"pid": 0, "start": gen["start"]},
                   {"pid": True, "start": gen["start"]}, {"pid": gen["pid"], "start": ["x"]}, {})
+        self.loosen()
         for i, half in enumerate(halves):
             with self.subTest(half=half):
                 mark.write_text(json.dumps(dict(half, session_id=SESSION_ID)))
@@ -611,6 +636,7 @@ class OnlyTheOwnersSessionHasRoomTools(ConnectBase):
                 self.assertEqual((rc, "admission" in out), (1, False), "kept outside the session: %s" % out)
                 self.assertIn("never submitted to this session", out["refused"])
         self.assertEqual(len(isolated_runs(self.home)), len(halves))
+        self.tighten()
         rc, out = self.claim("task-o", "owner")
         self.phase("task-o", lifecycle.TURN_CONFIRMED)
         self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_UNREAD), "and no call goes through on it")
@@ -637,8 +663,10 @@ class OnlyTheOwnersSessionHasRoomTools(ConnectBase):
 
     def test_a_restricted_sender_authorizes_nothing_and_does_not_close_the_owners_turn(self):
         self.with_tools()
+        self.loosen()
         rc, out = self.claim("task-g", "guest")
         self.assertEqual(rc, 1, out)
+        self.tighten()
         self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_NO_OWNER))
         rc, out = self.claim("task-o", "owner")
         self.assertEqual(rc, 0, out)
@@ -670,6 +698,48 @@ class OnlyTheOwnersSessionHasRoomTools(ConnectBase):
         self.claim("task-o", "owner")
         self.phase("task-o", lifecycle.TURN_CONFIRMED)
         self.assertEqual(verb(), (0, {"allowed": True, "why": ""}))
+
+    def test_an_install_loosened_or_unreadable_while_the_session_runs_closes_the_tools_at_once(self):
+        self.with_tools()
+        self.claim("task-o", "owner")
+        self.phase("task-o", lifecycle.TURN_CONFIRMED)
+        self.assertEqual(self.call(), (True, ""))
+        opened = ({"ALLOW_COLLABORATOR": "1"}, {"ALLOW_NON_OWNER": "1"}, {"ALLOW_COLLABORATOR": ""},
+                  {"ALLOW_NON_OWNER": ""}, {"ALLOW_COLLABORATOR": "no"}, {"ALLOW_NON_OWNER": "false"},
+                  {"ROOM_TOOLS_PREVIEW": ""}, {"ROOM_TOOLS_PREVIEW": "yes"})
+        for over in opened:
+            with self.subTest(over=over):
+                self.tighten(**over)
+                self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_OPENED))
+                self.assertFalse(hold_mod.tools_session({**self.conf, "SESSION_ID": SESSION_ID, **ALONE, **over}),
+                                 "and the next start gets no tools")
+        cli.config_path().write_text("not a config\n")
+        self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_OPENED), "a config that cannot be read is not a yes")
+        cli.config_path().unlink()
+        self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_OPENED))
+        self.tighten()
+        self.assertEqual(self.call(), (True, ""), "tightened again, the owner's confirmed turn calls them")
+
+    def test_a_start_with_the_preview_on_but_others_served_or_unknown_gets_no_tools_and_says_why(self):
+        base = dict(self.conf, SESSION_ID=SESSION_ID, ROOT=self.root)
+        for over in ({}, {"ALLOW_COLLABORATOR": "0"}, {"ALLOW_NON_OWNER": "0"},
+                     {"ALLOW_COLLABORATOR": "0", "ALLOW_NON_OWNER": "1"}, {"ALLOW_COLLABORATOR": None, "ALLOW_NON_OWNER": "0"}):
+            lines = []
+            got = hold_mod.room_tools_argv(dict(base, **over), self.root, self.root, entry=self.fail, log=lines.append)
+            self.assertEqual(got, [], over)
+            self.assertIn("serves collaborators or other non-owners", lines[0])
+            self.assertTrue(hold_mod.tools_conversation(dict(base, **over)), "still the owner's alone: never shared")
+
+    def fail(self, *a, **kw):
+        raise AssertionError("no token exchange is attempted")
+
+    def test_the_gate_reads_the_config_the_session_was_started_from(self):
+        with mock.patch.dict(os.environ, {hold_mod.ENV_CONFIG_DIR: "/agents/one"}):
+            code = hold_mod.gate_argv(self.root)[3]
+        self.assertIn("os.environ[%r] = %r; " % (hold_mod.ENV_CONFIG_DIR, "/agents/one"), code)
+        with mock.patch.dict(os.environ):
+            os.environ.pop(hold_mod.ENV_CONFIG_DIR, None)
+            self.assertNotIn("os.environ[", hold_mod.gate_argv(self.root)[3])
 
     def test_a_gate_that_cannot_answer_refuses(self):
         def gated(raw, run):
@@ -732,7 +802,7 @@ class PreviewThroughInstall(AgentRootBase):
         self.assertNotIn("NOTE mcp", out)
 
         # The owner turns the preview on: a new conversation for the tools, the earlier one kept by its id.
-        rc, out, err = self.install_default(fake, "--mcp-proxy-command", proxy, "--room-tools-preview")
+        rc, out, err = self.install_default(fake, "--mcp-proxy-command", proxy, "--room-tools-preview", *ALONE_FLAGS)
         self.assertEqual(rc, 0, out + err)
         on = self.cfg()
         self.assertNotEqual(on["SESSION_ID"], first["SESSION_ID"])
@@ -743,7 +813,7 @@ class PreviewThroughInstall(AgentRootBase):
         self.assertTrue(hold_mod.tools_session(on))
 
         # Installed again: the tools' conversation stays the session.
-        rc, out, err = self.install_default(fake, "--mcp-proxy-command", proxy, "--room-tools-preview")
+        rc, out, err = self.install_default(fake, "--mcp-proxy-command", proxy, "--room-tools-preview", *ALONE_FLAGS)
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(self.cfg()["SESSION_ID"], on["SESSION_ID"])
         self.assertEqual(self.cfg()["ROOM_TOOLS_SESSION"], on["SESSION_ID"])
@@ -787,6 +857,56 @@ class PreviewThroughInstall(AgentRootBase):
         self.assertEqual(hold_mod.room_tools_argv(off, off["ROOT"], str(Path(off["ROOT"]) / "tasks"),
                                                   log=lambda line: None), [], "started again, it gets no tools")
 
+    def test_the_preview_on_an_install_that_serves_others_gets_no_tools_and_loosening_later_leaves_them(self):
+        engine = self.home / "Application Support" / "engine"
+        engine.mkdir(parents=True)
+        node = engine / "node"
+        node.write_text("#!/bin/sh\n")
+        node.chmod(0o755)
+        proxy = shlex.join([str(node), str(engine / "ag2-mcp-proxy.mjs")])
+        fake = self.bridged()
+        rc, out, err = self.install_default(fake)
+        self.assertEqual(rc, 0, out + err)
+        first = self.cfg()
+        # The preview asked for with the defaults, or with only one of the two kept out: no tools, same session.
+        for flags in ((), ALONE_FLAGS[:1], ("--allow-collaborator", ALONE_FLAGS[1])):
+            rc, out, err = self.install_default(fake, "--mcp-proxy-command", proxy, "--room-tools-preview", *flags)
+            self.assertEqual(rc, 0, out + err)
+            got = self.cfg()
+            self.assertIn(cli.OWNER_ALONE_NOTE, out, flags)
+            self.assertNotIn(cli.PREVIEW_NOTE, out)
+            self.assertEqual((got["SESSION_ID"], got["ROOM_TOOLS_SESSION"]), (first["SESSION_ID"], ""), flags)
+            self.assertFalse(hold_mod.tools_session(got))
+        # Both kept out: the tools' own conversation.
+        rc, out, err = self.install_default(fake, "--mcp-proxy-command", proxy, "--room-tools-preview", *ALONE_FLAGS)
+        self.assertEqual(rc, 0, out + err)
+        on = self.cfg()
+        self.assertTrue(hold_mod.tools_session(on))
+        self.assertNotIn(cli.OWNER_ALONE_NOTE, out)
+        # Loosened later, the preview still asked for: the tools stop, the session leaves their conversation,
+        # and that conversation is remembered as the owner's alone.
+        rc, out, err = self.install_default(fake, "--mcp-proxy-command", proxy, "--room-tools-preview",
+                                            "--allow-collaborator", ALONE_FLAGS[1])
+        self.assertEqual(rc, 0, out + err)
+        loose = self.cfg()
+        self.assertIn(cli.OWNER_ALONE_NOTE, out)
+        self.assertEqual((loose["SESSION_ID"], loose["ROOM_TOOLS_SESSION"]), (first["SESSION_ID"], ""))
+        self.assertEqual(loose["OWNER_ONLY_SESSIONS"], on["SESSION_ID"])
+        self.assertFalse(hold_mod.tools_session(loose))
+        self.assertNotIn(on["SESSION_ID"], hold_mod.claude_argv(loose, loose["SESSION_ID"]),
+                         "the session collaborators enter never resumes the tools' history")
+        # Resumed by its id on the loosened install: the owner's alone, without the tools.
+        transcript = Path(on["CLAUDE_CONFIG_DIR"]) / "projects" / "-tasks" / (on["SESSION_ID"] + ".jsonl")
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text(json.dumps({"type": "tool_result", "content": "owner-only page"}) + "\n")
+        rc, out, err = self.install_default(fake, "--mcp-proxy-command", proxy, "--room-tools-preview",
+                                            "--resume-session", on["SESSION_ID"])
+        self.assertEqual(rc, 0, out + err)
+        back = self.cfg()
+        self.assertEqual((back["SESSION_ID"], back["ROOM_TOOLS_SESSION"]), (on["SESSION_ID"], ""))
+        self.assertTrue(hold_mod.tools_conversation(back))
+        self.assertFalse(hold_mod.tools_session(back))
+
     def test_an_agent_first_installed_with_the_preview_gets_a_new_conversation_when_it_is_turned_off(self):
         engine = self.home / "Application Support" / "engine"
         engine.mkdir(parents=True)
@@ -795,7 +915,7 @@ class PreviewThroughInstall(AgentRootBase):
         node.chmod(0o755)
         proxy = shlex.join([str(node), str(engine / "ag2-mcp-proxy.mjs")])
         fake = self.bridged()
-        rc, out, err = self.install_default(fake, "--mcp-proxy-command", proxy, "--room-tools-preview")
+        rc, out, err = self.install_default(fake, "--mcp-proxy-command", proxy, "--room-tools-preview", *ALONE_FLAGS)
         self.assertEqual(rc, 0, out + err)
         on = self.cfg()
         self.assertEqual((on["ROOM_TOOLS_SESSION"], on["EARLIER_SESSION_ID"]), (on["SESSION_ID"], ""))

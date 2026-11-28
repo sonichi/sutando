@@ -235,8 +235,10 @@ def gate_argv(root: str) -> list:
     """The inbox CLI's `room-tools` verb for `root`, run from this very package, isolated (-I), as mcp_stdio
     runs its own helpers: what the name shim runs before each room-tool call."""
     pkg = str(Path(__file__).resolve().parents[3])
-    code = ("import sys; sys.path.insert(0, %r); from ag2_sparrow.adapters.claude_code import cli; "
-            "raise SystemExit(cli.main(sys.argv[1:]))" % pkg)
+    # The gate reads the install config this session was started from, whatever env the MCP server is given.
+    conf = os.environ.get(ENV_CONFIG_DIR) or ""
+    code = ("import os, sys; %ssys.path.insert(0, %r); from ag2_sparrow.adapters.claude_code import cli; "
+            "raise SystemExit(cli.main(sys.argv[1:]))" % ("os.environ[%r] = %r; " % (ENV_CONFIG_DIR, conf) if conf else "", pkg))
     return [sys.executable, "-I", "-c", code, "inbox", "--root", root, "room-tools"]
 
 
@@ -250,11 +252,18 @@ def tools_conversation(cfg: dict, session_id=None) -> bool:
     return mine == (cfg.get("ROOM_TOOLS_SESSION") or "") or mine in (cfg.get("OWNER_ONLY_SESSIONS") or "").split()
 
 
+def owner_alone(cfg: dict) -> bool:
+    """Whether the install serves nobody but the owner: both opt-outs recorded, each exactly "0". A key that is
+    missing or holds anything else counts as serving them (inbox.owner_alone reads the same from the live config)."""
+    return cfg.get(inbox.ALLOW_COLLABORATOR) == "0" and cfg.get(inbox.ALLOW_NON_OWNER) == "0"
+
+
 def tools_session(cfg: dict, session_id=None) -> bool:
-    """Whether this start gets the tools: the conversation install started for them, with the preview on."""
+    """Whether this start gets the tools: the conversation install started for them, with the preview on and
+    nobody but the owner served."""
     mine = cfg.get("SESSION_ID") or "" if session_id is None else session_id
-    return (cfg.get("ROOM_TOOLS_PREVIEW") == "1" and bool(mine) and mine == (cfg.get("ROOM_TOOLS_SESSION") or "")
-            and mine == (cfg.get("SESSION_ID") or ""))
+    return (cfg.get("ROOM_TOOLS_PREVIEW") == "1" and owner_alone(cfg) and bool(mine)
+            and mine == (cfg.get("ROOM_TOOLS_SESSION") or "") and mine == (cfg.get("SESSION_ID") or ""))
 
 
 def room_tools_argv(cfg: dict, root: str, cwd: str, entry=None, log=None, session_id=None) -> list:
@@ -269,6 +278,10 @@ def room_tools_argv(cfg: dict, root: str, cwd: str, entry=None, log=None, sessio
         return []
     if not token_file:
         log("ag2-space MCP tools not offered: no TOKEN_ENV_FILE (the agent's own token file)")
+        return []
+    if cfg.get("ROOM_TOOLS_PREVIEW") == "1" and not owner_alone(cfg):
+        log("ag2-space MCP tools not offered: the install serves collaborators or other non-owners; they need "
+            "both --no-allow-collaborator and --no-allow-non-owner")
         return []
     if not tools_session(cfg, session_id):
         log("ag2-space MCP tools not offered: this conversation was not started for them (it may hold other "
