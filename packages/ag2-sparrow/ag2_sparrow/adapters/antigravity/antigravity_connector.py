@@ -66,6 +66,10 @@ from ... import (account_switch, acp_host, card_desk, connector_cards, held_star
 from ...bounded_file_read import read_regular_bytes
 from ...acp_host import MESSAGE_EVENT, SESSIONS_NAME, TASK_NAME_RE, SessionStore, quoted, trigger_of  # noqa: F401
 from ...acp_client import AcpClient as _SharedClient
+# The stdio entry and its helpers are shared with the Codex connector; their names stay importable from here.
+from ...mcp_stdio import (DESCRIPTOR_NAME, MINT_ENV_KEEP, MINT_TIMEOUT_S, PROXY_LOG_NAME, ROOM_TOOLS_HINT,  # noqa: F401
+                          SHIM_NAME, STATUS_NAME, _descriptor_file, _exchange, mint_argv, mint_env, shim_args,
+                          stdio_entry, write_launcher)
 from ...relay_loop import count_arg
 from .gemini_key import API_KEY_AUTH, UNREAD, authenticate_with_app_key
 from . import agy_account, agy_usage
@@ -131,102 +135,9 @@ def sspace_grant(headers, kind=None):
     return mcp_auth.OWNER_TOOLS if sspace_tools_for(headers, kind) else frozenset()
 
 
-MINT_TIMEOUT_S = 30.0
-# What the token exchange's child keeps of this process's (already allowlisted) environment.
-MINT_ENV_KEEP = ("PATH", "HOME", "USER", "LANG", "TMPDIR")
-
-
-def mint_argv(*command):
-    """`ag2-sparrow-mcp <command...>` (default `acp`) from this very package (a source tree or the zipapp),
-    isolated (-I) so neither the child's directory nor PYTHONPATH can put another module first."""
-    root = str(Path(mcp_auth.__file__).resolve().parents[1])
-    code = ("import sys; sys.path.insert(0, %r); from ag2_sparrow.mcp_auth import main; "
-            "raise SystemExit(main(%r))" % (root, list(command or ("acp",))))
-    return [sys.executable, "-I", "-c", code]
-
-
-def mint_env(token_env_file, agent_id, environ=None):
-    """(the exchange's environment, '') or ({}, why): the agent's own token file as its bridge reads it
-    (`connect_bridge.credential_env`) and MINT_ENV_KEEP, nothing else."""
-    from ... import connect_bridge
-    cred, problem = connect_bridge.credential_env(token_env_file, agent_id)
-    if problem:
-        return {}, problem
-    source = os.environ if environ is None else environ
-    env = {k: source[k] for k in MINT_ENV_KEEP if k in source}
-    env.update(cred)
-    return env, ""
-
-
-def _exchange(command, token_env_file, agent_id, run, extra=()):
-    """(the JSON object `ag2-sparrow-mcp <command>` printed, '') or (None, why), run as `mint_env` says."""
-    env, problem = mint_env(token_env_file, agent_id)
-    if problem:
-        return None, problem
-    try:
-        done = run(mint_argv(command, *extra), env=env, cwd=os.path.dirname(token_env_file) or "/", capture_output=True,
-                   text=True, timeout=MINT_TIMEOUT_S, stdin=subprocess.DEVNULL)
-    except (OSError, subprocess.TimeoutExpired) as e:
-        return None, "the token exchange did not run (%s)" % type(e).__name__
-    if done.returncode != 0:
-        lines = (done.stderr or "").strip().splitlines()
-        return None, (lines[-1][:200] if lines else "the token exchange exited %s" % done.returncode)
-    try:
-        out = json.loads(done.stdout)
-    except ValueError:
-        out = None
-    return (out, "") if isinstance(out, dict) else (None, "the token exchange printed no JSON object")
-
-
-DESCRIPTOR_NAME = "ag2-mcp-descriptor.json"
-PROXY_LOG_NAME = "ag2-mcp-proxy.log"
-
-
-SHIM_NAME = "ag2-mcp-shim"
-
-
-def shim_args(argv):
-    """The arguments that run `argv` (the proxy) under `mcp_name_shim`, from this very package, isolated: agy
-    drops every tool whose name has a dot, so the shim offers `room_action_execute` for `room.action.execute`."""
-    root = str(Path(mcp_auth.__file__).resolve().parents[1])
-    code = ("import sys; sys.path.insert(0, %r); from ag2_sparrow.mcp_name_shim import main; "
-            "raise SystemExit(main(sys.argv[1:]))" % root)
-    return ["-I", "-c", code, "--"] + list(argv)
-
-
-STATUS_NAME = "ag2-mcp-status.json"
 LAUNCHES_NAME = "ag2-mcp-launches.json"
 # What a room is told when the tools did not come up: fixed words only; codes, argv and paths stay local.
 TOOLS_DOWN = "S.space tools didn't start this turn (%s), so I couldn't use Room Commons."
-
-
-def write_launcher(state, turn="", tools=frozenset()):
-    """`<state>/ag2-mcp-shim` (0700): a plain executable that runs the shim, so agy's stdio entry is a file and
-    its args are only the proxy's command line (agy started no process for a `python -I -c <code>` entry). It
-    hands the shim this turn's id, `<state>/ag2-mcp-status.json`, where the shim says how far it got, and the
-    server tools it may list and call (`tools`; none by default)."""
-    path = os.path.join(state, SHIM_NAME)
-    env = {"AG2_MCP_SHIM_TURN": turn, "AG2_MCP_SHIM_STATUS": os.path.join(state, STATUS_NAME),
-           "AG2_MCP_SHIM_TOOLS": ",".join(sorted(tools))}
-    text = "#!/bin/sh\n%s exec %s \"$@\"\n" % (" ".join("%s=%s" % (k, shlex.quote(v)) for k, v in env.items()),
-                                              " ".join(shlex.quote(a) for a in [sys.executable] + shim_args([])))
-    tmp = "%s.%d.tmp" % (path, os.getpid())
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o700)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(text)
-    os.chmod(tmp, 0o700)
-    os.replace(tmp, path)
-    return path
-
-
-def _descriptor_file(desc, token_env_file):
-    """The file a descriptor must name: the .env itself, or for `token_format: "raw"` (no env_key) the raw
-    token file that seat .env points at; None for any other shape."""
-    if desc.get("token_format") == "raw" and "env_key" not in desc:
-        return mcp_auth.seat_token_file(token_env_file) or None
-    if "token_format" not in desc and isinstance(desc.get("env_key"), str):
-        return os.path.realpath(token_env_file)
-    return None
 
 
 def tools_down(status_path, turn_id, resumed):
@@ -283,39 +194,6 @@ class LaunchLog:
             log("launch outcome not recorded:", type(e).__name__)
             with contextlib.suppress(OSError):
                 os.unlink(tmp)
-
-
-def stdio_entry(proxy_command, token_env_file, agent_id, state_dir, run=subprocess.run, turn="", tools=frozenset()):
-    """(the ACP stdio `McpServer` running the desktop's `ag2-mcp-proxy` as this agent, '') or (None, why). The
-    proxy gets only the path of a non-secret descriptor (written 0600 in `state_dir`) naming the agent's own
-    token file, as Claude Code's `ag2-space` stdio entry does; the relay token never enters agy's environment."""
-    argv = shlex.split(proxy_command or "")
-    if not argv:
-        return None, "no --mcp-proxy-command"
-    desc, why = _exchange("descriptor", token_env_file, agent_id, run, ("--env-file", token_env_file))
-    if desc is None:
-        return None, why
-    try:
-        for k in ("mint_url", "mcp_url"):
-            mcp_auth._safe_url(k, desc.get(k))
-        ok = desc.get("version") == 1 and isinstance(desc.get("env_file"), str) \
-            and os.path.realpath(desc["env_file"]) == _descriptor_file(desc, token_env_file)
-    except mcp_auth.McpAuthError:
-        ok = False
-    if not ok:
-        return None, "the token exchange printed no proxy descriptor"
-    if isinstance(agent_id, str) and agent_id.startswith("@") and ":" in agent_id:
-        desc["agent_id"] = agent_id   # who a re-mint must turn out to be
-    state = os.path.abspath(state_dir)
-    path = os.path.join(state, DESCRIPTOR_NAME)
-    tmp = "%s.%d.tmp" % (path, os.getpid())
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(desc, f)
-    os.replace(tmp, path)
-    return {"name": mcp_auth.SERVER_NAME, "command": write_launcher(state, turn, tools), "args": list(argv),
-            "env": [{"name": "AG2_MCP_DESCRIPTOR", "value": path},
-                    {"name": "AG2_MCP_LOG", "value": os.path.join(state, PROXY_LOG_NAME)}]}, ""
 
 
 def declares_http_mcp(init):
@@ -597,10 +475,7 @@ def wake_prompt(task_id, headers, message, operator_lines, cwd, note=NON_OWNER_N
                "your final message exactly %s and nothing else."
                % (" as the reply" if event in (None, MESSAGE_EVENT) else "", NO_REPLY))
     if sspace_tools_for(headers, kind):
-        out.append("When this session has the %s MCP tools, they act in AG2 Space as you, this agent: use "
-                   "room_action_execute (the server's room.action.execute; find Actions with room_actions_search and "
-                   "room_actions_describe) to create or edit Room Commons pages and for other room actions, and put "
-                   "the page link in your reply." % mcp_auth.SERVER_NAME)
+        out.append(ROOM_TOOLS_HINT)
         room = (headers.get("channel_id") or "").strip()
         if room:
             out.append(ROOM_HISTORY % room)

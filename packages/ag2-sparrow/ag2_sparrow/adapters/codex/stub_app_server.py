@@ -13,6 +13,10 @@ reasoning item and part of a reply come first. A prompt that opens with the shar
 paragraph, with ` room=R from=S tier=T` added, so a test sees which room and sender each turn named.
 `[[history]]` adds ` history=[...]`: the thread's earlier turns, after a `carried:<id>` item when it was resumed.
 
+`thread/resume` fails for a thread id starting `stale-`, never answers for `hang-`, and fails for `nomcp-` only
+when its config adds `mcp_servers` (a runtime refusing that override at resume). `[[toolcall]]` records an
+ag2-space tool call and its result on the turn's thread; `[[history]]` echoes the thread's id and recorded items.
+
 `account/rateLimits/read` answers as `stub-limits` under CODEX_HOME says ("out": a window used up; "ok": usage
 left); with no such file the method is unknown.
 
@@ -166,12 +170,16 @@ for line in sys.stdin:
         if meth == "thread/resume" and tid.startswith("stale-"):
             send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32603, "message": "no rollout found for thread id " + tid}})
             continue
+        if meth == "thread/resume" and tid.startswith("nomcp-") and (p.get("config") or {}).get("mcp_servers"):
+            send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": "invalid config: mcp_servers"}})
+            continue
         if meth == "thread/resume" and tid.startswith("hang-"):
             continue   # never answers: the client's timeout must fall back
         # A thread resumed from disk holds the conversation saved there: one "carried:<id>" item stands for it.
         seed = ["carried:" + tid] if meth == "thread/resume" else []
         THREADS[tid] = {"cwd": p.get("cwd", "/"), "params": p, "emptied": THREADS.get(tid, {}).get("emptied"),
-                        "history": THREADS.get(tid, {}).get("history", seed)}
+                        "history": THREADS.get(tid, {}).get("history", seed),
+                        "items": THREADS.get(tid, {}).get("items", [])}
         send({"jsonrpc": "2.0", "id": rid, "result": {"thread": thread_obj(tid), "model": p.get("model") or "stub-model",
                                                       "modelProvider": "stub", "cwd": THREADS[tid]["cwd"],
                                                       "approvalPolicy": "never", "sandbox": "read-only", "approvalsReviewer": None,
@@ -206,8 +214,12 @@ for line in sys.stdin:
             reply = "[model-card]"
         if "[[askaccount]]" in text:
             reply = "[account-card]"
+        if "[[toolcall]]" in text:
+            THREADS[tid]["items"].append({"type": "mcpToolCall", "server": "ag2-space", "tool": "room_list",
+                                          "result": "TOOL-RESULT-" + turn_id[:8]})
         if "[[history]]" in text:
-            reply += " history=" + json.dumps(THREADS[tid]["history"])
+            reply += " thread=%s history=%s items=%s" % (tid, json.dumps(THREADS[tid]["history"]),
+                                                         json.dumps(THREADS[tid]["items"], sort_keys=True))
         THREADS[tid]["history"].append(said.strip().split("\n")[0][:80])
         if "[[config]]" in text:      # what the thread was started with, for a test to pin its overrides
             reply += " config=" + json.dumps(tp.get("config"), sort_keys=True)

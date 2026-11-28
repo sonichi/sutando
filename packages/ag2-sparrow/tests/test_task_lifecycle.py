@@ -2163,7 +2163,9 @@ class BoundaryGuardTest(SpyMixin, unittest.TestCase):
                          {"state", "results", "tasks", "results/<task>.txt",
                           "results/.<task>.txt.<tmp>", "state/done", "state/.done.<tmp>", "state/threads",
                           "state/thread", "state/.thread.<tmp>", "state/metrics.jsonl",
-                          "state/app-server-stub.stderr", "state/live-view.log"})
+                          "state/app-server-stub.stderr", "state/live-view.log",
+                          # The per-turn room-tools grant (mcp_stdio.GRANT_NAME), retired at start and each turn's end.
+                          "state/ag2-mcp-grant.json"})
 
     def test_the_codex_owner_dm_writes_its_owner_only_thread(self):
         with tempfile.TemporaryDirectory() as d:
@@ -2179,7 +2181,7 @@ class BoundaryGuardTest(SpyMixin, unittest.TestCase):
                           "results/.<task>.txt.<tmp>", "state/done", "state/.done.<tmp>", "state/threads",
                           "state/owner-thread", "state/.owner-thread.<tmp>", "state/resume-thread-taken",
                           "state/.resume-thread-taken.<tmp>", "state/metrics.jsonl", "state/quota-room.json",
-                          "state/quota-room.json.tmp",
+                          "state/quota-room.json.tmp", "state/ag2-mcp-grant.json",
                           "state/app-server-stub.stderr", "state/live-view.log"})
 
     def strings(self, tree):

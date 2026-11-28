@@ -29,6 +29,7 @@ from pathlib import Path
 from ... import _dirs, connect_bridge as cb, connect_common as cm, live_view, model_settings, task_io
 from ...connect_bridge import EXTERNAL, UNIT
 from ...connect_common import EXIT_CHILD_HELD, EXIT_HELD, EXIT_UNUSABLE, RUN_TIMEOUT_S, Shape, _v
+from ...mcp_stdio import mcp_proxy_command
 from . import codex_connector
 
 SHAPE = "codex-local"
@@ -38,7 +39,7 @@ SANDBOXES = ("read-only", "workspace-write")
 ENV_KEEP = ("PATH", "HOME", "USER")
 REQUIRED_KEYS = ("CODEX", "INBOX_DIR", "RESULTS_DIR")
 CONFIG_KEYS = ("CODEX", "INBOX_DIR", "RESULTS_DIR", "CODEX_HOME", "SANDBOX", "ALLOW_NON_OWNER", "MODEL",
-               "RESUME_THREAD", "ALLOW_COLLABORATOR") + cb.CONFIG_KEYS
+               "RESUME_THREAD", "ALLOW_COLLABORATOR", "MCP_PROXY_COMMAND") + cb.CONFIG_KEYS
 THREAD_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 LOCAL = Shape(name=SHAPE, command=COMMAND, description="the Codex connector as an s.space agent",
               cli="Codex CLI", min_version=MIN_CODEX, version_anchor=r"^codex",
@@ -95,6 +96,10 @@ def connector_argv(cfg: dict, root: str, root_fd: int) -> list:
         argv += ["--model", cfg["MODEL"]]
     if cfg.get("RESUME_THREAD"):
         argv += ["--resume-thread", cfg["RESUME_THREAD"]]
+    # The AG2 Space tools as the agent itself: only with both its own token file and the desktop's proxy.
+    if cfg.get("MCP_PROXY_COMMAND") and cfg.get("TOKEN_ENV_FILE"):
+        argv += ["--token-env-file", cfg["TOKEN_ENV_FILE"], "--agent-id", cfg.get("AGENT_ID", ""),
+                 "--mcp-proxy-command", cfg["MCP_PROXY_COMMAND"]]
     return argv
 
 
@@ -162,7 +167,8 @@ def resolve_root(args) -> "tuple[dict, str]":
 RECORDED = (("CODEX", "codex", str), ("CODEX_HOME", "codex_home", str), ("SANDBOX", "sandbox", str),
             ("ALLOW_NON_OWNER", "non_owner", lambda v: "0" if v == "0" else ""), ("MODEL", "model", str),
             ("RESUME_THREAD", "resume_thread", str),
-            ("ALLOW_COLLABORATOR", "collaborator", lambda v: "0" if v == "0" else ""))
+            ("ALLOW_COLLABORATOR", "collaborator", lambda v: "0" if v == "0" else ""),
+            ("MCP_PROXY_COMMAND", "mcp_proxy_command", str))
 
 
 def kept_collaborator(collaborator):
@@ -181,6 +187,10 @@ def install(args) -> int:
         return cb.install_token_stdin(args, LOCAL, lambda: connect_preflight(args, login=False), install, COMMAND,
                                       work=None)
     problem = cb.recorded_install_args(args, LOCAL, RECORDED)
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return EXIT_UNUSABLE
+    proxy, problem = mcp_proxy_command(getattr(args, "mcp_proxy_command", None))
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
@@ -214,11 +224,17 @@ def install(args) -> int:
               "RESULTS_DIR": str(Path(root) / "results"),
               "CODEX_HOME": str(Path(args.codex_home).expanduser().resolve()) if args.codex_home else "",
               "SANDBOX": args.sandbox, "ALLOW_NON_OWNER": "0" if args.non_owner == "0" else "1",
-              "MODEL": args.model or "", "RESUME_THREAD": resume,
+              "MODEL": args.model or "", "RESUME_THREAD": resume, "MCP_PROXY_COMMAND": proxy,
               "ALLOW_COLLABORATOR": "0" if getattr(args, "collaborator", None) == "0" else "1",
               "AGENT_ID": where["agent_id"], "BRIDGE": mode if mode != EXTERNAL else "",
               "TOKEN_ENV_FILE": where["token_file"], "TOKEN_VAULT_KEY": "",
               "BRIDGE_STATE_DIR": str(cb.bridge_home(root) / "state") if mode != EXTERNAL else ""}
+    if proxy and not where["token_file"]:
+        print("NOTE mcp: --mcp-proxy-command acts as the agent through its own token file; with --work there is "
+              "none, so turns get no AG2 Space tools")
+    if proxy and (values["ALLOW_COLLABORATOR"] != "0" or values["ALLOW_NON_OWNER"] != "0"):
+        print("NOTE mcp: turns get no AG2 Space tools while anyone but the owner is served; they need both "
+              "--no-allow-collaborator and --no-allow-non-owner, and an owner-only conversation (--resume-thread)")
     if args.sandbox == "workspace-write":
         print("NOTE sandbox: workspace-write lets an owner turn write under the work root; a turn retried after "
               "the app-server dies can repeat side effects the first attempt already made")
@@ -458,6 +474,10 @@ def session_options(p) -> None:
                    help="continue this Codex conversation (saved under --codex-home's sessions/) in the owner's "
                         "DM only, as `codex resume <id>` does, on an owner-only thread; it never becomes the "
                         "shared thread that collaborators and other rooms use")
+    p.add_argument("--mcp-proxy-command", help="the stdio ag2-mcp-proxy command line ('<node> <the desktop app's "
+                   "engine/ag2-mcp-proxy.mjs>'), each path quoted when it has a space: the owner-only thread of the "
+                   "owner's DM gets the AG2 Space tools as this agent, only with both --no-allow-collaborator and "
+                   "--no-allow-non-owner (needs --token-env-file; default: none)")
 
 
 def agent_option(p):

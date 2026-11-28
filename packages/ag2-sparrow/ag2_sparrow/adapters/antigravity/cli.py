@@ -25,6 +25,7 @@ from pathlib import Path
 from ... import _dirs, connect_bridge as cb, connect_common as cm, live_view, model_settings, task_io
 from ...acp_client import AUTH_REQUIRED, AcpError
 from ...connect_bridge import EXTERNAL, UNIT
+from ...mcp_stdio import mcp_proxy_command  # noqa: F401 - shared with codex-local
 from ...connect_common import EXIT_CHILD_HELD, EXIT_HELD, EXIT_UNUSABLE, Shape
 from . import antigravity_connector as gc
 from .gemini_key import authenticate_with_app_key
@@ -64,23 +65,6 @@ def acp_command(acp: "str | None") -> "tuple[str, str]":
     if not exe:
         return "", (f"{argv[0]} is not on PATH; install Antigravity CLI (curl -fsSL "
                     "https://antigravity.google/cli/install.sh | bash) or pass --acp-command with its full path")
-    return shlex.join([os.path.abspath(exe)] + argv[1:]), ""
-
-
-def mcp_proxy_command(value: "str | None") -> "tuple[str, str]":
-    """(the stdio proxy's command line, each word quoted, '') or ('', why). Its first word must be an executable
-    file: an unquoted path with a space (the desktop's engine sits under Application Support) splits there, so
-    it is refused with the quoting to use rather than recorded broken."""
-    if not value:
-        return "", ""
-    try:
-        argv = shlex.split(value)
-    except ValueError as e:
-        return "", f"--mcp-proxy-command does not parse ({e})"
-    exe = shutil.which(argv[0]) if argv else None
-    if not exe or len(argv) < 2:
-        return "", ("--mcp-proxy-command must name an executable and its arguments, each path quoted when it has "
-                    "a space: --mcp-proxy-command \"'<node>' '<path>/ag2-mcp-proxy.mjs'\"")
     return shlex.join([os.path.abspath(exe)] + argv[1:]), ""
 
 

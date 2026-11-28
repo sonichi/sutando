@@ -14,6 +14,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+sys.path.append(str(Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before the imports below: codex_connector reaches the agent's token file (the room tools' exchange).
+isolate_os_environ()
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import test_antigravity_adapter as agy_t  # noqa: E402  (its Work harness and stub agy)
 import test_codex_connector as codex_t  # noqa: E402  (its stub app-server runner)

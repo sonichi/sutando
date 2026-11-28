@@ -534,6 +534,60 @@ class Install(Base):
         self.assertEqual(rc, 0, err)
         self.assertEqual(cm.read_config(cli.config_path())["RESUME_THREAD"], thread, "matched and kept lowercase")
 
+    def test_an_install_that_serves_anyone_but_the_owner_is_told_it_gets_no_tools(self):
+        engine = self.home / "Application Support" / "engine"   # a space in the path, as the desktop's
+        engine.mkdir(parents=True)
+        node = engine / "node"
+        node.write_text("#!/bin/sh\n")
+        node.chmod(0o755)
+        proxy = shlex.join([str(node), str(engine / "ag2-mcp-proxy.mjs")])
+        runner = self.runner()
+        for flags in ((), ("--no-allow-collaborator",), ("--allow-collaborator", "--no-allow-non-owner"),
+                      ("--sandbox", "workspace-write")):
+            rc, out, err = self.install_with(runner, False, "--mcp-proxy-command", proxy, *flags)
+            self.assertEqual(rc, 0, out + err)
+            self.assertIn("NOTE mcp: turns get no AG2 Space tools while anyone but the owner is served", out, flags)
+        rc, out, err = self.install_with(runner, False, "--mcp-proxy-command", proxy, "--no-allow-collaborator",
+                                         "--no-allow-non-owner")
+        self.assertEqual(rc, 0, out + err)
+        self.assertNotIn("while anyone but the owner is served", out)
+
+    def test_mcp_proxy_command_is_checked_recorded_listed_and_handed_on_with_the_token_file(self):
+        engine = self.home / "Application Support" / "engine"   # a space in the path, as the desktop's
+        engine.mkdir(parents=True)
+        node = engine / "node"
+        node.write_text("#!/bin/sh\n")
+        node.chmod(0o755)
+        proxy = shlex.join([str(node), str(engine / "ag2-mcp-proxy.mjs")])
+        with contextlib.redirect_stdout(io.StringIO()) as helped, self.assertRaises(SystemExit):
+            cli.main(["install", "--help"])
+        self.assertIn("--mcp-proxy-command", helped.getvalue(), "the desktop checks help before passing it")
+        for bad in ("%s %s" % (node, engine / "ag2-mcp-proxy.mjs"), "'unterminated", "/no/such/node x.mjs", str(node)):
+            rc, _, err = self.install_with(self.runner(), False, "--mcp-proxy-command", bad)
+            self.assertEqual(rc, 2, bad)
+            self.assertIn("--mcp-proxy-command", err)
+            self.assertFalse(cli.config_path().exists(), "refused before anything is written")
+        runner = self.runner()
+        rc, out, err = self.install_with(runner, False, "--mcp-proxy-command", proxy)
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("NOTE mcp:", out, "--work has no token file of the agent's own")
+        cfg = cm.read_config(cli.config_path())
+        self.assertEqual(shlex.split(cfg["MCP_PROXY_COMMAND"]), shlex.split(proxy))
+        self.assertNotIn("--mcp-proxy-command", cli.connector_argv(cfg, str(self.work), 7), "no token file: no tools")
+        argv = cli.connector_argv(dict(cfg, TOKEN_ENV_FILE="/a/agent.env", AGENT_ID="@cx:s.space"), str(self.work), 7)
+        got = cc.build_parser().parse_args(argv[argv.index("--work"):])
+        self.assertEqual((got.token_env_file, got.agent_id, shlex.split(got.mcp_proxy_command)),
+                         ("/a/agent.env", "@cx:s.space", shlex.split(proxy)))
+        # A repair reinstall from the record keeps it; a conf written before the option stays valid, with no tools.
+        rc, out, err = self.install_with(runner, False)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(cm.read_config(cli.config_path())["MCP_PROXY_COMMAND"], cfg["MCP_PROXY_COMMAND"])
+        self.assertIn(("MCP_PROXY_COMMAND", "mcp_proxy_command", str), cli.RECORDED)
+        old = {k: v for k, v in cfg.items() if k != "MCP_PROXY_COMMAND"}
+        self.assertNotIn("--mcp-proxy-command", cli.connector_argv(dict(old, TOKEN_ENV_FILE="/a/agent.env"),
+                                                                   str(self.work), 7))
+        self.assertIsNone(cc.build_parser().parse_args(["--work", "w"]).mcp_proxy_command)
+
     def test_install_refuses_an_old_codex_before_writing_anything(self):
         (self.home / "codex-version").write_text("0.157.0")
         rc, _, err = self.install()

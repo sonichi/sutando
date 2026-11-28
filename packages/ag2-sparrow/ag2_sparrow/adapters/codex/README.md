@@ -201,6 +201,30 @@ never stamps envelopes, so there is no signature to check: an `invalid`/`unsigne
 submitted like any other, and the attested tier is the only gate — hence the refusal by default and the
 hard isolation above for whoever is admitted.
 
+## Room tools (`mcp_servers.ag2-space`)
+
+With `--mcp-proxy-command` and the agent's own `--token-env-file`, the owner-only thread gets the AG2 Space
+room tools: the desktop's stdio proxy under the name shim, acting as the agent. They, and every tool result,
+live only on a thread no collaborator's turn is ever routed to:
+
+- Tools are attached only to the owner-only thread (`state/owner-thread`): the one an owner turn
+  (`turn_policy`'s `owner_dm`) with `channel_kind: dm` in the attested headers runs on when there is an
+  owner-only conversation to continue (`--resume-thread`, carried over once, or the one kept there).
+- The shared thread (`state/thread`: collaborators' turns, the owner's room turns, and the owner's DM when
+  there is no owner-only conversation) is never opened with the tools: no `ag2-space` entry, no grant, no
+  prompt hint. Team and guest threads never get them either.
+- Off unless the owner is the only one served. Both `--no-allow-collaborator` and `--no-allow-non-owner`
+  must be set (the install defaults serve both, so a default install gets no tools); a setting that is missing
+  or cannot be read counts as serving them. A collaborator's turn runs commands in the owner's folder, where
+  no sandbox stops reads, and a restricted turn's confinement is known only by the profile name Codex reports.
+- It also needs an owner-only conversation that already exists: `--resume-thread <id>` at install, or a
+  `state/owner-thread` kept from before. Without one the owner's DM runs on the shared thread, with no tools.
+- `install` prints a `NOTE mcp:` when the recorded options mean no tools. Existing installs are not changed.
+- Defence in depth: the shim forwards a call only under a live per-turn grant (`state/ag2-mcp-grant.json`),
+  written for an owner turn on a tools thread and removed when the turn ends. A resume Codex refuses, or
+  does not answer in time, with the entry is retried on the same thread without it, and a start refused
+  with it is started again without it.
+
 ## Three shapes
 
 | | 1. own app-server thread (`--server stdio`) | 2. `--push` → `codex queue` into a live TUI | 3. `codex exec resume <id> "<prompt>"` |
