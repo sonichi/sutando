@@ -231,8 +231,29 @@ PREVIEW_NOTE = ("NOTE mcp: room tools preview. While it is on, only your own tas
                 "without --room-tools-preview to turn it off.")
 
 
+def owner_only_sessions(cfg: dict) -> list:
+    """The conversations that once had the room tools (OWNER_ONLY_SESSIONS): each holds their results, so a
+    session on one is the owner's alone for good, whatever the preview says now."""
+    return [s for s in (cfg.get("OWNER_ONLY_SESSIONS") or "").split() if SESSION_ID_RE.match(s)]
+
+
 def room_tools_session(old: dict, values: dict, session_id: str, kept: str, resume: str, live_server, stop_cmd: str,
                        mint=None) -> dict:
+    """`_room_tools_session`'s answer plus OWNER_ONLY_SESSIONS: a conversation that stops being the tools' one
+    is remembered there, so resuming it later never makes it the session collaborators share."""
+    got = _room_tools_session(old, values, session_id, kept, resume, live_server, stop_cmd, mint)
+    was, history = old.get("ROOM_TOOLS_SESSION") or "", owner_only_sessions(old)
+    if was and was != got["ROOM_TOOLS_SESSION"] and was not in history:
+        history.append(was)
+    now = got.get("SESSION_ID", session_id)
+    if now in history and now != got["ROOM_TOOLS_SESSION"]:
+        print(f"NOTE mcp: the conversation {now} once had the AG2 Space tools: it stays the owner's alone (a "
+              "collaborator's task is answered outside it), and it runs without the tools")
+    return dict(got, OWNER_ONLY_SESSIONS=" ".join(history))
+
+
+def _room_tools_session(old: dict, values: dict, session_id: str, kept: str, resume: str, live_server, stop_cmd: str,
+                        mint=None) -> dict:
     """Which conversation may carry the AG2 Space tools: only one started for them, with no earlier turn of any
     sender in it. {SESSION_ID?, ROOM_TOOLS_SESSION, EARLIER_SESSION_ID}: an install that turns the tools on
     starts a new conversation (the earlier one stays on disk, named by EARLIER_SESSION_ID, and is never given
@@ -350,7 +371,7 @@ def _install(args) -> int:
               "TOKEN_VAULT_KEY": vault_key(segment) if mode not in (UNIT, EXTERNAL) and not where["token_file"] else "",
               "BRIDGE_STATE_DIR": str(state), "TMUX": tmux, "MCP_PROXY_COMMAND": proxy,
               "ROOM_TOOLS_PREVIEW": "1" if getattr(args, "room_tools_preview", False) else "",
-              "ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": ""}
+              "ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": "", "OWNER_ONLY_SESSIONS": ""}
     if proxy and not where["token_file"]:
         print("NOTE mcp: --mcp-proxy-command acts as the agent through its own token file; this install has none "
               "(--token-env-file), so the session gets no AG2 Space tools")

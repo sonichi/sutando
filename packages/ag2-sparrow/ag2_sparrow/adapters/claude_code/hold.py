@@ -241,15 +241,20 @@ def gate_argv(root: str) -> list:
 
 
 def tools_conversation(cfg: dict, session_id=None) -> bool:
-    """Whether `session_id` (default: the configured one) is the conversation install started for the room
-    tools. Only the owner's tasks ever enter it, whether or not the tools are on now: it holds their results."""
+    """Whether `session_id` (default: the configured one) is a conversation that has, or once had, the room
+    tools: the one install started for them (ROOM_TOOLS_SESSION) or one it left since (OWNER_ONLY_SESSIONS).
+    Only the owner's tasks ever enter it, whether or not the tools are on now: it holds their results."""
     mine = cfg.get("SESSION_ID") or "" if session_id is None else session_id
-    return bool(mine) and mine == (cfg.get("ROOM_TOOLS_SESSION") or "") and mine == (cfg.get("SESSION_ID") or "")
+    if not mine or mine != (cfg.get("SESSION_ID") or ""):
+        return False
+    return mine == (cfg.get("ROOM_TOOLS_SESSION") or "") or mine in (cfg.get("OWNER_ONLY_SESSIONS") or "").split()
 
 
 def tools_session(cfg: dict, session_id=None) -> bool:
-    """Whether this start gets the tools: the tools' own conversation, with the preview on."""
-    return cfg.get("ROOM_TOOLS_PREVIEW") == "1" and tools_conversation(cfg, session_id)
+    """Whether this start gets the tools: the conversation install started for them, with the preview on."""
+    mine = cfg.get("SESSION_ID") or "" if session_id is None else session_id
+    return (cfg.get("ROOM_TOOLS_PREVIEW") == "1" and bool(mine) and mine == (cfg.get("ROOM_TOOLS_SESSION") or "")
+            and mine == (cfg.get("SESSION_ID") or ""))
 
 
 def room_tools_argv(cfg: dict, root: str, cwd: str, entry=None, log=None, session_id=None) -> list:

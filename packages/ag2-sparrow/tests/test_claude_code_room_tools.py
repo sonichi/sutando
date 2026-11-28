@@ -165,6 +165,7 @@ class RoomToolsArgv(unittest.TestCase):
             with contextlib.redirect_stdout(said):
                 got = cc.room_tools_session(old, values, session_id, kept, resume, lambda: live, "stop it",
                                             mint=lambda: new_id)
+            self.remembered = got.pop("OWNER_ONLY_SESSIONS")
             return got, said.getvalue()
         # No proxy, or no token file of the agent's own: no tools session.
         for values in ({}, {"MCP_PROXY_COMMAND": PROXY}, {"TOKEN_ENV_FILE": self.token}):
@@ -180,6 +181,17 @@ class RoomToolsArgv(unittest.TestCase):
         got, said = decide(was_on, quiet, new_id, new_id)
         self.assertEqual(got, {"SESSION_ID": old_id, "ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": ""})
         self.assertIn("back to the earlier conversation (%s), without the tools" % old_id, said)
+        self.assertEqual(self.remembered, new_id, "the conversation that had the tools is remembered as the owner's alone")
+        # Resumed later by its id, it is the session again, still the owner's alone and without the tools.
+        left = {"SESSION_ID": old_id, "ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": "", "OWNER_ONLY_SESSIONS": new_id}
+        for values in (quiet, on):
+            got, said = decide(left, values, new_id, new_id, resume=new_id)
+            self.assertEqual((got["ROOM_TOOLS_SESSION"], self.remembered), ("", new_id), values)
+            self.assertIn("stays the owner's alone", said)
+            cfg = dict(values, SESSION_ID=new_id, ROOM_TOOLS_SESSION="", OWNER_ONLY_SESSIONS=self.remembered)
+            self.assertEqual((hold_mod.tools_conversation(cfg), hold_mod.tools_session(cfg)), (True, False))
+        self.assertEqual(cc.owner_only_sessions({"OWNER_ONLY_SESSIONS": "%s not-an-id %s" % (new_id, old_id)}),
+                         [new_id, old_id])
         # With none from before it (the agent was first installed with the preview): a new one, never the
         # tools' conversation handed to everyone.
         third = "77777777-2222-4333-8444-555555555555"
@@ -187,7 +199,8 @@ class RoomToolsArgv(unittest.TestCase):
         with contextlib.redirect_stdout(said):
             got = cc.room_tools_session({"SESSION_ID": new_id, "ROOM_TOOLS_SESSION": new_id}, quiet, new_id, new_id, "",
                                         lambda: None, "stop it", mint=lambda: third)
-        self.assertEqual(got, {"SESSION_ID": third, "ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": ""})
+        self.assertEqual(got, {"SESSION_ID": third, "ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": "",
+                               "OWNER_ONLY_SESSIONS": new_id})
         self.assertIn("a new conversation, without the tools", said.getvalue())
         # While the session that had the tools is not proven gone, it stays the tools' conversation on record
         # (so it stays the owner's alone), and the install after it is stopped leaves it.
@@ -412,6 +425,13 @@ class HoldLaunch(ConnectBase):
         self.assertNotIn("--mcp-config", session["argv"])
         mark = json.loads((self.work / "state" / "room-tools" / "session.json").read_text())
         self.assertEqual(mark["pid"], session["pid"], "marked owner-only: it holds the tools' results")
+
+    def test_a_resumed_conversation_that_once_had_the_tools_is_marked_the_owners_alone(self):
+        session, err = self.started(MCP_PROXY_COMMAND=PROXY, ROOM_TOOLS_PREVIEW="", ROOM_TOOLS_SESSION="",
+                                    OWNER_ONLY_SESSIONS="11111111-2222-4333-8444-555555555555 " + SESSION_ID)
+        self.assertNotIn("--mcp-config", session["argv"])
+        mark = json.loads((self.work / "state" / "room-tools" / "session.json").read_text())
+        self.assertEqual(mark["pid"], session["pid"], "collaborators are kept out of it")
 
     def test_a_tools_conversation_that_cannot_be_marked_is_not_started(self):
         self.configure(TOKEN_ENV_FILE=self.token, AGENT_ID=AGENT, MCP_PROXY_COMMAND=PROXY, ROOM_TOOLS_PREVIEW="1",
@@ -724,6 +744,20 @@ class PreviewThroughInstall(AgentRootBase):
         self.assertNotIn(on["SESSION_ID"], started, "the session collaborators enter never resumes the preview's history")
         self.assertEqual(started[-1], first["SESSION_ID"])
         self.assertIn("owner-only page", transcript.read_text(), "the preview's conversation is kept on disk, untouched")
+        self.assertEqual(off["OWNER_ONLY_SESSIONS"], on["SESSION_ID"])
+
+        # On, off, then the owner resumes the old preview conversation by its id: it is the session again, but
+        # never the one collaborators share, and it has no tools.
+        rc, out, err = self.install_default(fake, "--mcp-proxy-command", proxy, "--resume-session", on["SESSION_ID"])
+        self.assertEqual(rc, 0, out + err)
+        back = self.cfg()
+        self.assertEqual((back["SESSION_ID"], back["ROOM_TOOLS_SESSION"], back["OWNER_ONLY_SESSIONS"]),
+                         (on["SESSION_ID"], "", on["SESSION_ID"]))
+        self.assertIn("stays the owner's alone", out)
+        self.assertTrue(hold_mod.tools_conversation(back), "hold marks a session on it as the owner's alone")
+        self.assertFalse(hold_mod.tools_session(back))
+        self.assertEqual(hold_mod.room_tools_argv(back, back["ROOT"], str(Path(back["ROOT"]) / "tasks"),
+                                                  log=lambda line: None), [])
         self.assertEqual(hold_mod.room_tools_argv(off, off["ROOT"], str(Path(off["ROOT"]) / "tasks"),
                                                   log=lambda line: None), [], "started again, it gets no tools")
 
