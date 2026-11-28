@@ -21,8 +21,8 @@ from unittest import mock
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE))
-from ag2_sparrow import account_switch, connector_cards, desktop_accounts, detached_login, signin_watch  # noqa: E402
-from ag2_sparrow.adapters.claude_code import account_remote  # noqa: E402
+from ag2_sparrow import (account_request, account_switch, connector_cards, desktop_accounts, detached_login,  # noqa: E402
+                         signin_watch)
 from ag2_sparrow.adapters.codex import codex_connector as cc, device_login as dl  # noqa: E402
 
 from test_codex_connector import CardWorld, metrics, result, run_connector  # noqa: E402
@@ -952,6 +952,8 @@ class SavedMenuTest(Home, CardWorld, unittest.TestCase):
         CardWorld.setUp(self)
         (self.home / "stub-account").write_text("alice@example.com")
         self.CARD = account_switch.CARD
+        self.consumer = self.home / account_request.CONSUMER      # the app watches this home (desktop #1344)
+        self.consumer.write_text(json.dumps({"v": 2, "runtimes": ["claude", "codex"]}))
         self.appdata = Path(self.tmp.name) / "appdata"
         self.store = self.appdata.joinpath(*desktop_accounts.CODEX_STORE) / desktop_accounts.saved_key(self.AGENT)
         patch = mock.patch.object(desktop_accounts, "app_data_dirs", lambda *a, **k: [self.appdata])
@@ -981,10 +983,22 @@ class SavedMenuTest(Home, CardWorld, unittest.TestCase):
         (menu,) = row["actions"]
         self.assertEqual((row["title"], menu["kind"], menu["label"]), ("Account", "menu", "alice@example.com"))
         self.assertEqual([(i["label"], i.get("command"), i.get("disabled")) for i in menu["items"]],
-                         [("✓ alice@example.com", "card:account:agent:" + desktop_accounts.saved_key("alice@example.com"), True),
+                         [("✓ alice@example.com", None, True),
                           ("bob@example.org", "card:account:agent:" + desktop_accounts.saved_key("bob@example.org"), None),
                           (account_switch.ADD_ITEM, "card:account:agent:add", None)])
         self.assertNotIn("Switch account", [b["label"] for b in card.get("buttons") or []], "the dropdown, not buttons")
+
+    def test_without_the_apps_consumer_marker_for_codex_the_card_stays_as_it_was(self):
+        self.save("bob@example.org", "alice@example.com")
+        for i, marker in enumerate((None, {"v": 2, "runtimes": ["claude"]}, {"v": 1, "runtimes": ["codex"]})):
+            if marker is None:
+                self.consumer.unlink()
+            else:
+                self.consumer.write_text(json.dumps(marker))
+            card = self.ask("$card%d" % (i + 1))
+            self.assertNotIn("groups", card, marker)
+            self.assertEqual([b["label"] for b in card["buttons"]],
+                             ["Switch account", "Add account", account_switch.HERE_LABEL], marker)
 
     def test_with_none_saved_the_menu_holds_only_add_account(self):
         card = self.ask("$card1")
@@ -994,9 +1008,9 @@ class SavedMenuTest(Home, CardWorld, unittest.TestCase):
         self.save("bob@example.org", "alice@example.com")
         self.ask("$card1")
         self.assertEqual(self.pick("task-pick", "Use bob@example.org", "$card1"), account_switch.ANSWERED)
-        req = json.loads((self.home / account_remote.REQUEST).read_text())
+        req = json.loads((self.home / account_request.REQUEST).read_text())
         self.assertEqual((req["v"], req["key"]), (2, desktop_accounts.saved_key("bob@example.org")))
-        self.assertEqual(oct((self.home / account_remote.REQUEST).stat().st_mode & 0o777), "0o600")
+        self.assertEqual(oct((self.home / account_request.REQUEST).stat().st_mode & 0o777), "0o600")
         ((_, shown),) = self.posted("$card2")
         self.assertEqual((shown["state"], shown["text"]), ("pending", cc.SWITCH_ASKED % "bob@example.org"))
         self.assertEqual(self.ops()[-1], ("edit", "$card1"), "in place of the card tapped")
@@ -1007,9 +1021,9 @@ class SavedMenuTest(Home, CardWorld, unittest.TestCase):
         self.ask("$card1")
         self.pick("task-pick", "Use bob@example.org", "$card1")
         self.posted("$card2")
-        nonce = json.loads((self.home / account_remote.REQUEST).read_text())["nonce"]
-        (self.home / account_remote.REQUEST).unlink()
-        receipt = self.home / (account_remote.RESULT % nonce)
+        nonce = json.loads((self.home / account_request.REQUEST).read_text())["nonce"]
+        (self.home / account_request.REQUEST).unlink()
+        receipt = self.home / (account_request.RESULT % nonce)
         receipt.write_text(json.dumps(dict({"v": 2, "nonce": nonce}, **answer)))
         self.dm("task-hello", "hello")
         self.assertEqual(run_connector(self.work, once=1, extra=["--codex", str(self.codex), "--agent-id", self.AGENT]), 0)
@@ -1020,8 +1034,35 @@ class SavedMenuTest(Home, CardWorld, unittest.TestCase):
         return told
 
     def test_the_apps_answer_replaces_switching_with_now_using(self):
-        told = self.answered(ok=True, label="bob@example.org (Plus)", verified=False)
+        told = self.answered(ok=True, label="bob@example.org (Plus)", verified=True)
         self.assertEqual((told["state"], told["text"]), ("done", "Now using bob@example.org."))
+
+    def test_a_switch_not_yet_verified_is_said_as_applied_not_as_now_using(self):
+        for i, answer in enumerate(({"verified": False}, {})):      # {}: an older app that does not say
+            with self.subTest(answer=answer):
+                if i:
+                    self.tearDown()
+                    self.setUp()
+                told = self.answered(ok=True, label="bob@example.org", **answer)
+                self.assertEqual((told["state"], told["text"]), ("info", cc.SWITCHED_UNVERIFIED % "bob@example.org"))
+                self.assertNotIn("Now using", told["text"])
+
+    def test_a_claim_the_app_never_answered_does_not_hold_later_picks_back(self):
+        self.save("bob@example.org", "alice@example.com")
+        self.ask("$card1")
+        self.pick("task-pick", "Use bob@example.org", "$card1")
+        self.posted("$card2")
+        nonce = json.loads((self.home / account_request.REQUEST).read_text())["nonce"]
+        claim = self.home / (account_request.CLAIMED % nonce)
+        (self.home / account_request.REQUEST).rename(claim)        # the app took it, then stopped answering
+        old = time.time() - cc.SWITCH_GIVE_UP_S - 5
+        os.utime(claim, (old, old))
+        self.ask("$card3")
+        self.pick("task-again", "Use bob@example.org", "$card3")
+        ((_, shown),) = self.posted("$card4")
+        self.assertEqual(shown["text"], cc.SWITCH_ASKED % "bob@example.org", "not refused as busy")
+        self.assertFalse(claim.exists(), "the stale claim is retired")
+        self.assertNotEqual(json.loads((self.home / account_request.REQUEST).read_text())["nonce"], nonce)
 
     def test_the_apps_refusal_replaces_switching_with_why(self):
         told = self.answered(ok=False, error="that account is not saved on this Mac for this agent")
@@ -1035,9 +1076,9 @@ class SavedMenuTest(Home, CardWorld, unittest.TestCase):
         said = "Use bob@example.org"
         self.pick("task-stale", said, "$elsewhere")
         self.assertEqual(metrics(self.work)[-1]["card"], "account-card-expired", "a fresh card, nothing switched")
-        self.assertFalse((self.home / account_remote.REQUEST).exists())
+        self.assertFalse((self.home / account_request.REQUEST).exists())
         self.assertIn("couldn't match that button", self.pick("task-guest", said, "$card1", tier="guest"))
-        self.assertFalse((self.home / account_remote.REQUEST).exists())
+        self.assertFalse((self.home / account_request.REQUEST).exists())
 
 
 if __name__ == "__main__":

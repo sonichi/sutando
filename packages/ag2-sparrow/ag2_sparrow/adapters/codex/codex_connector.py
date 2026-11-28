@@ -31,8 +31,8 @@ import threading
 import time
 import uuid
 
-from ... import (account_switch, card_desk, connector_cards, desktop_accounts, held_start, live_view, model_switch,
-                 quota_notice, signin_watch)
+from ... import (account_request, account_switch, card_desk, connector_cards, desktop_accounts, held_start, live_view,
+                 model_switch, quota_notice, signin_watch)
 from ...acp_host import quoted
 from ...bounded_file_read import read_regular
 from ...collaborator_turn import TIER_BLOCK_END, TIER_BLOCK_HEADER, TIER_REWRITES, stage_own_attachments, with_staged_paths
@@ -42,7 +42,6 @@ from ...task_io import (AUDIENCE_RULE, DONE_KEEP, NON_OWNER_NOTE, NON_OWNER_REFU
                         make_dirs, non_owner_note, parse_task, pid_alive, exit_code, record_done, refusal_body,
                         release_lock,
                         root_path, start_time, stop_requested, turn_policy, write_atomic)
-from ..claude_code import account_remote
 from . import device_login
 
 CLIENT = {"name": "ag2-sparrow-codex", "version": "0.1.0"}
@@ -262,6 +261,7 @@ SWITCH_ASKED = ("Switching to %s… The app on this computer makes the switch; I
 SWITCH_FILE = "codex-switch.json"      # under state/: the pick waiting for the app's answer (one at a time)
 SWITCH_UNCLAIMED_S, SWITCH_GIVE_UP_S = 90.0, 600.0
 NOW_USING = "Now using %s."
+SWITCHED_UNVERIFIED = "Switched to %s on this computer; not yet confirmed. The next message runs on it."
 SWITCH_REFUSED = "Could not switch to %s: %s."
 SWITCH_RESTARTED = "The app restarted during the switch. Send /account to see which account I'm on."
 SWITCH_UNCLAIMED = ("The app on this computer did not pick this up: it is not running, or it is a version that cannot "
@@ -547,9 +547,13 @@ class Connector:
                 self._accounts.saved, self._accounts.pick = self.saved_accounts, self.pick_saved
         return self._accounts
 
-    def saved_accounts(self) -> dict:
+    def saved_accounts(self):
         """{key: address} of the Codex accounts the desktop app saved for this agent; none when this agent's
-        Codex home is not its own (a switch there would change another login)."""
+        Codex home is not its own (a switch there would change another login). None, and so no dropdown, until
+        the app says it takes Codex requests in this home (its consumer marker)."""
+        home = os.environ.get("CODEX_HOME") or ""
+        if not home or not account_request.consumer_takes(home, "codex"):
+            return None
         try:
             home = device_login.own_home(child_env(), device_login.installed_homes())
         except device_login.Refused:
@@ -558,7 +562,7 @@ class Connector:
 
     def pick_saved(self, key, sent, result_file) -> str:
         """The owner picked saved account `key` on a card that offered it: ask the desktop app to switch to it
-        (account_remote's request in CODEX_HOME), shown in place of the card; signin_settle then restarts Codex."""
+        (account_request's request in CODEX_HOME), shown in place of the card; signin_settle then restarts Codex."""
         accounts, agent_card = self.accounts, connector_cards._core()[0]
         room, tapped = str(sent.get("channel_id") or ""), card_desk.tapped_event(sent)
         if agent_card.owner_may_act(sent) is not None or card_desk.in_room(sent) \
@@ -571,16 +575,19 @@ class Connector:
             accounts.say(room, accounts.card("error", "Could not switch: %s" % e), result_file, tapped)
             return "account-refused"
         email = desktop_accounts.codex_saved(self.args.agent_id, home).get(key)
+        if not account_request.consumer_takes(home, "codex"):
+            email = ""
         if not email:
             accounts.say(room, accounts.card("error", NOT_SAVED), result_file, tapped)
             return "account-not-saved"
-        # The request file of Claude Code's phone switch (account_remote, v2), in CODEX_HOME: one at a time.
-        if account_remote.request_nonce(home) is not None or account_remote.claimed_any(home):
+        # The request file of Claude Code's phone switch (account_request, v2), in CODEX_HOME: one at a time.
+        account_request.retire_claims(home, SWITCH_GIVE_UP_S)
+        if account_request.request_nonce(home) is not None or account_request.claimed_any(home):
             accounts.say(room, accounts.card("info", SWITCH_BUSY), result_file, tapped)
             return "account-busy"
         nonce = str(uuid.uuid4())
         try:
-            account_remote.write_request(home, key, nonce, time.time())
+            account_request.write_request(home, key, nonce, time.time())
         except OSError as e:
             log("switch request not written:", "%s: %s" % (type(e).__name__, str(e)[:200]))
             accounts.say(room, accounts.card("error", "Could not switch: the request for the app could not be "
@@ -607,34 +614,40 @@ class Connector:
                 rec = json.load(f)
         except (OSError, ValueError):
             return {}
-        return rec if isinstance(rec, dict) and account_remote.NONCE_RE.fullmatch(str(rec.get("nonce") or "")) else {}
+        return rec if isinstance(rec, dict) and account_request.NONCE_RE.fullmatch(str(rec.get("nonce") or "")) else {}
 
     def switch_tick(self, now=None) -> str:
-        """The pick waiting for the app: its answer (account_remote's v2 receipt in CODEX_HOME), or auth.json now on
+        """The pick waiting for the app: its answer (account_request's v2 receipt in CODEX_HOME), or auth.json now on
         the account picked, shown in place of the "Switching to …" card; what was told, '' while it still waits."""
         rec = self.switch_waiting()
         if not rec:
             return ""
         now = time.time() if now is None else now
         home, nonce, email = str(rec.get("home") or ""), rec["nonce"], str(rec.get("email") or "")
-        receipt = os.path.join(home, account_remote.RESULT % nonce)
-        text, _ = read_regular(receipt, account_remote.FILE_MAX, follow=False)
+        receipt = os.path.join(home, account_request.RESULT % nonce)
+        text, _ = read_regular(receipt, account_request.FILE_MAX, follow=False)
         said = None
         if text is not None:
-            data = account_remote._parsed(text, nonce)
+            data = account_request._parsed(text, nonce)
             if data.get("unknown") is True or data.get("unreadable"):
                 said = ("info", SWITCH_RESTARTED)
             elif data.get("ok"):
-                said = ("done", NOW_USING % (account_switch.shown(desktop_accounts.email_only(data["label"])) or email))
+                name = account_switch.shown(desktop_accounts.email_only(data["label"])) or email
+                verified = data.get("verified") is True
+                said = ("done", NOW_USING % name) if verified else ("info", SWITCHED_UNVERIFIED % name)
             else:
-                why = account_remote.one_line(data.get("error") or "the app refused")
+                why = account_request.one_line(data.get("error") or "the app refused")
                 said = ("error", SWITCH_REFUSED % (email, why.rstrip(".")))
         elif email and (signin_watch.codex_identity(home) or (None, ""))[1:2] == (email,):
             said = ("done", NOW_USING % email)
-        elif account_remote.request_nonce(home) == nonce and now - float(rec.get("at") or 0) >= SWITCH_UNCLAIMED_S:
-            if account_remote.withdraw(home, nonce):
+        elif account_request.request_nonce(home) == nonce and now - float(rec.get("at") or 0) >= SWITCH_UNCLAIMED_S:
+            if account_request.withdraw(home, nonce):
                 said = ("error", SWITCH_UNCLAIMED)
         elif now - float(rec.get("at") or 0) >= SWITCH_GIVE_UP_S:
+            try:        # this pick's claim, never answered: it no longer holds later picks back
+                os.unlink(os.path.join(home, account_request.CLAIMED % nonce))
+            except OSError:
+                pass
             said = ("info", SWITCH_UNTOLD % email)
         if said is None:
             return ""

@@ -117,9 +117,10 @@ def account_menu(saved: dict, current: str, add_verb: str = "add") -> list:
     items = []
     for key, email in sorted(ranked[:agent_card.LIMITS["menu_items"] - 1], key=lambda kv: kv[1].lower()):
         here = bool(using) and email.lower() == using
+        # The one in use is checked and acts as nothing: no command, so no tap on it can switch.
         items.append(agent_card.button(((CHECK if here else "") + email)[:cap], "reply", reply=use_words(email),
-                                       command=agent_card.reply("account", "agent", key),
-                                       **({"disabled": True} if here else {})))
+                                       **({"disabled": True} if here else
+                                          {"command": agent_card.reply("account", "agent", key)})))
     items.append(agent_card.button(ADD_ITEM, "reply", reply=ADD_WORDS,
                                    command=agent_card.reply("account", "agent", add_verb)))
     menu = agent_card.button((current or NO_ACCOUNT)[:cap], "menu", items=items)
@@ -229,23 +230,26 @@ class AccountSwitch:
         """The account in use as the dropdown names it (`status` read it); '' when none or unknown."""
         return self.in_use
 
-    def menu_accounts(self, saved=None) -> dict:
-        """The dropdown's saved accounts: `saved` when the caller read them already, else `saved()` now."""
-        if saved is not None:
+    def menu_accounts(self, saved=None):
+        """The dropdown's saved accounts: `saved` when the caller read them already, else `saved()` now; None when
+        there is no dropdown (no `saved`, or it says None: nothing on this computer takes a pick)."""
+        if saved is not None or self.saved is None:
             return saved
         try:
-            return dict(self.saved() or {})
-        except Exception as e:  # noqa: BLE001 - the dropdown still offers "Add account…"
+            found = self.saved()
+        except Exception as e:  # noqa: BLE001 - fail closed: the card as it is without the dropdown
             self.log("saved accounts not read:", "%s: %s" % (type(e).__name__, str(e)[:200]))
-            return {}
+            return None
+        return None if found is None else dict(found)
 
     def card(self, state: str, text: str, url: str = "", ask: bool = False, signed_out: bool = False, saved=None):
         """The card; asked for (`ask`) with `saved` set, the dropdown of `menu_accounts(saved)` in place of the
         "Switch account" and "Add account" buttons."""
         agent_card, _ = connector_cards._core()
         buttons, groups = [], None
-        if ask and self.saved is not None:
-            groups = account_menu(self.menu_accounts(saved), self.menu_current())
+        menu = self.menu_accounts(saved) if ask else None
+        if menu is not None:
+            groups = account_menu(menu, self.menu_current())
             if self.remote is not None and self.switch_anywhere:
                 buttons.append(agent_card.button(HERE_LABEL, "reply", reply=HERE_LABEL,
                                                  command=agent_card.reply("account", "agent", HERE)))
