@@ -33,8 +33,9 @@ check $? "a moved entry does not fail the launch"
 check $? "nothing goes to stdout"
 [ "$(grep -c "⚠" "$TMP/err")" = "1" ] && grep -qF "⚠ MCP server \"Old-Space\" connects to $OLD, which moved to $NEW ($NEW_MCP)" "$TMP/err"
 check $? "one warning names the entry, the server it is on and where that server moved"
-grep -qF 'claude mcp remove --scope user "Old-Space"' "$TMP/err"
-check $? "the warning gives the remove command"
+grep -qF "Remove it with: CLAUDE_CONFIG_DIR=$(cd "$TMP/moved" && pwd -P) claude mcp remove --scope user Old-Space" "$TMP/err" \
+  || grep -qF "Remove it with: CLAUDE_CONFIG_DIR=$TMP/moved claude mcp remove --scope user Old-Space" "$TMP/err"
+check $? "the warning gives the remove command, naming the seat's own Claude folder"
 [ "$(cksum < "$TMP/moved/.claude.json")" = "$before" ]
 check $? "the config is left as it was"
 

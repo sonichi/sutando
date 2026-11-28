@@ -395,7 +395,7 @@ def cmd_moved_mcp_servers(args) -> int:
         name = json.dumps(e["name"])
         to = f"{e['successor']} ({e['mcp_url']})" if e["mcp_url"] else e["successor"]
         print(f"MCP server {name} connects to {e['server']}, which moved to {to}; it will not connect. "
-              f"Remove it with: claude mcp remove --scope user {name}")
+              f"Remove it with: {connections.mcp_remove_command(e['name'], args.mcp_config)}")
     return 0
 
 

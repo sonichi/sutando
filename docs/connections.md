@@ -695,7 +695,9 @@ A seat's Claude config can also hold an MCP entry that connects straight to a se
 proxy). When that server has moved, the entry is refused on every connect, and the move re-points
 only the proxy's descriptor. `scripts/connections.py moved-mcp-servers`
 (`connections.moved_mcp_servers`) lists such entries with the successor's endpoint and the
-`claude mcp remove` command; the Claude worker launcher prints one warning per entry when the seat
+`claude mcp remove` command (`connections.mcp_remove_command`: the name shell-quoted, and
+`CLAUDE_CONFIG_DIR=<folder>` in front when the config is not stock Claude Code's, as a worker's own
+folder is not); only user-scope entries are checked. The Claude worker launcher prints one warning per entry when the seat
 starts, and never edits the config.
 
 The proxy decides whom it acts as once, when the seat starts. A worker given its own agent while

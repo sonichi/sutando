@@ -4762,6 +4762,20 @@ def moved_mcp_servers(mcp_config: Optional[Path] = None, space_of=None) -> "list
     return out
 
 
+def mcp_remove_command(name: str, mcp_config: Optional[Path] = None) -> str:
+    """The shell command that removes the user-scope MCP entry `name` from the Claude Code config
+    `mcp_config` (default as `moved_mcp_servers`): the name shell-quoted as one argument, and
+    `CLAUDE_CONFIG_DIR=<the config's folder>` in front unless that folder is stock Claude Code's, so
+    the command edits the file that was read from whichever shell it is pasted into."""
+    import shlex
+    from util_paths import claude_home_path
+    config = Path(mcp_config) if mcp_config is not None else claude_home_path(".claude.json")
+    folder = Path(os.path.abspath(config.expanduser())).parent
+    stock = Path(os.path.abspath(claude_home_path(vanilla=True).expanduser()))
+    own = "" if os.path.realpath(folder) == os.path.realpath(stock) else f"CLAUDE_CONFIG_DIR={shlex.quote(str(folder))} "
+    return f"{own}claude mcp remove --scope user {shlex.quote(name)}"
+
+
 def _codex_config_path(environ: Mapping[str, str]) -> Optional[Path]:
     """`config.toml` of the Codex home: `CODEX_HOME`, else the codex `core_config_dirs` entry."""
     home = (environ.get("CODEX_HOME") or "").strip()
