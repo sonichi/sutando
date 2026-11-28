@@ -86,6 +86,17 @@ def stamp_claim(manager, hitl_id: str, claim: dict) -> bool:
     return stamp_subject(manager, hitl_id, claim=dict(claim))
 
 
+def cancel_if_pending(manager, hitl_id: str) -> bool:
+    """Cancel the card only while it is still unclicked, re-read under the store lock a click takes."""
+    from hitl.schema import STATUS_PENDING  # noqa: PLC0415
+    with manager.store.locked():
+        req = manager.get(hitl_id)
+        if req is None or req.status != STATUS_PENDING:
+            return False
+        manager.cancel(hitl_id)
+        return True
+
+
 def retire_cards(manager, ask_id: str) -> list:
     """Cancel every live card of this question (clicked or not); returns their ids."""
     gone = []
