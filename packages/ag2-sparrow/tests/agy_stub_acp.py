@@ -26,7 +26,7 @@ home holds a settings.json (and its text) or any global context file, and its pr
 Long-lived use (one process, many turns): each process's first log line also carries its pid, so a test counts
 spawns; `refuse-load` under $HOME makes `session/load` fail as a load under another sign-in might (assumed
 wording); with `models` the `session/load` answer carries `models` too (assumed: no signed-in agy load has been
-captured); STUB:DIE answers the prompt and then exits, a process that dies while idle; STUB:ROOM answers with
+captured); `authenticate` answers {} and is logged with the key's length only; STUB:DIE answers the prompt and then exits, a process that dies while idle; STUB:ROOM answers with
 the room and sender its prompt's shared-session lead names.
 `session/new` offers the modes default, accept-edits and plan as agy's `--mode` names them (assumed: no
 signed-in agy has listed its ACP modes yet); `no-modes` under $HOME offers none, `set-mode-fails` makes
@@ -135,7 +135,7 @@ def media_turn(sid, text):
 def prompt(rid, params):
     sid = params["sessionId"]
     text = "".join(b.get("text", "") for b in params.get("prompt") or [])
-    log({"method": "session/prompt", "sessionId": sid, "text": text,
+    log({"method": "session/prompt", "sessionId": sid, "text": text, "pid": os.getpid(),
          "blocks": [{k: (v if k != "data" else len(v)) for k, v in b.items() if k != "text"}
                     for b in params.get("prompt") or []]})
     if "STUB:HANG" in text:
@@ -308,6 +308,12 @@ def main():
         m = json.loads(line)
         method, rid, params = m.get("method"), m.get("id"), m.get("params") or {}
         if method is None:
+            continue
+        if method == "authenticate":   # logged without the key: its length and this process's pid only
+            key = (params.get("_meta") or {}).get("apiKey") or ""
+            log({"method": method, "params": {"methodId": params.get("methodId"), "key_len": len(key)},
+                 "pid": os.getpid()})
+            send({"jsonrpc": "2.0", "id": rid, "result": {}})
             continue
         if method != "session/prompt":
             log({"method": method, "params": params})

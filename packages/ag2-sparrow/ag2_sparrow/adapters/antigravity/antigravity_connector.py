@@ -8,7 +8,7 @@ Space MCP server attached, its id kept in `state/shared-session.json` (0600) and
 a restart; each turn is one `session/prompt` whose first paragraph names the room, the sender and that the reply
 goes back to that room (acp_host.shared_session_lead); a collaborator's turn carries the same non-owner note.
 The process is restarted when it exited, a request timed out, the turn hit a sign-in or quota error, or the
-app's Gemini API key was saved or removed; a turn whose prompt was not sent yet is tried once more. A shared
+app's Gemini API key was saved, replaced or removed (its Keychain item's dates, never the key); a turn whose prompt was not sent yet is tried once more. A shared
 Session opened under the other authentication, or whose load agy refuses, is replaced by a new one (logged).
 `--shared-session-turns N` starts a new shared Session after N turns (default 0: never; agy reports no context
 compaction over ACP). Turns still run one at a time. The per-room Sessions of earlier releases
@@ -656,7 +656,7 @@ class Connector:
                 lambda *a, **k: self.client_factory(*a, **k), self.args, STDERR_NAME, NOT_SIGNED_IN, log,
                 os.path.join(state, acp_host.SHARED_NAME), on_initialized=self.use_app_gemini_key,
                 mcp_servers=lambda init: self.sspace_servers(init, mcp_auth.OWNER_TOOLS), on_models=self.models_seen,
-                auth_probe=self.accounts.keyed, turn_cap=getattr(self.args, "shared_session_turns", 0),
+                auth_probe=self.accounts.key_marker, turn_cap=getattr(self.args, "shared_session_turns", 0),
                 media_root=os.path.realpath(os.path.join(state, acp_host.MEDIA_ROOT_NAME)))
         return self.host
 

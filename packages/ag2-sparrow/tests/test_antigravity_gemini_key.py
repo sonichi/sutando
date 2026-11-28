@@ -44,20 +44,48 @@ def wrapped(key, tag="t1"):
     return base64.b64encode(json.dumps({"tag": tag, "value": key}).encode()).decode()
 
 
+ITEM_DATES = ("20261127000000Z", "20261127000000Z")
+# What `security find-generic-password` (no -w/-g) prints for an item: its attributes. The comment attribute
+# here carries the stored value, as a hostile item might, so a marker that kept anything but the dates would show it.
+ATTRIBUTES = """keychain: "/Users/x/Library/Keychains/login.keychain-db"
+version: 512
+class: "genp"
+attributes:
+    0x00000007 <blob>="%(service)s"
+    "acct"<blob>="GEMINI_API_KEY"
+    "cdat"<timedate>=0x32303236313132373030303030305A00  "%(cdat)s\\000"
+    "icmt"<blob>="%(stored)s"
+    "mdat"<timedate>=0x32303236313132373030303030305A00  "%(mdat)s\\000"
+    "svce"<blob>="%(service)s"
+"""
+
+
 class FakeKeychain:
-    """`/usr/bin/security find-generic-password -a ACCOUNT -s SERVICE -w` over a dict {service: stored}."""
+    """`/usr/bin/security find-generic-password -a ACCOUNT -s SERVICE [-w]` over a dict {service: stored}: with
+    -w the value, without it the attributes, dated by `dates` {service: (cdat, mdat)}."""
 
     def __init__(self, items=None):
         self.items = dict(items or {})
-        self.asked = []
+        self.dates = {}
+        self.asked, self.listed = [], []   # value reads (-w); attribute-only reads
+
+    def save(self, service, stored, cdat=None, mdat=None):
+        """The app storing a value into an item: a changed modification date (and a new creation date when given)."""
+        old = self.dates.get(service, ITEM_DATES)
+        self.items[service] = stored
+        self.dates[service] = (cdat or old[0], mdat or old[1])
 
     def __call__(self, argv, **kw):
         service = argv[argv.index("-s") + 1]
         account = argv[argv.index("-a") + 1]
-        self.asked.append((argv[0], service, account))
+        (self.asked if "-w" in argv else self.listed).append((argv[0], service, account))
         stored = self.items.get(service) if account == gk.ACCOUNT else None
         if stored is None:
             return subprocess.CompletedProcess(argv, 44, "", "security: SecKeychainSearchCopyNext: not found\n")
+        if "-w" not in argv:
+            cdat, mdat = self.dates.get(service, ITEM_DATES)
+            return subprocess.CompletedProcess(argv, 0, ATTRIBUTES % {"service": service, "stored": stored,
+                                                                    "cdat": cdat, "mdat": mdat}, "")
         return subprocess.CompletedProcess(argv, 0, stored + "\n", "")
 
 
@@ -116,6 +144,12 @@ class Base(unittest.TestCase):
         saved = mock.patch.object(gk, "key_saved", lambda agent_id="": gk.agent_service(agent_id) in self.keychain.items)
         saved.start()
         self.addCleanup(saved.stop)
+        # The key item's change marker (the long-lived agy restarts when it changes): the fake Keychain's attributes.
+        real_marker = gk.key_marker
+        marker = mock.patch.object(gk, "key_marker", lambda agent_id="": real_marker(agent_id, run=self.keychain,
+                                                                                     platform="darwin", environ={}))
+        marker.start()
+        self.addCleanup(marker.stop)
 
     def args(self, *extra):
         a = gc.build_parser().parse_args(["--work", str(self.tmp / "work"), "--cwd", str(self.tmp / "cwd"),
@@ -298,6 +332,95 @@ class RestrictedTurns(Base):
                                             key_source=lambda _a: DUMMY_KEY)
         self.assertFalse(sent)
         self.assertNotIn("authenticate", agy.methods_called())
+
+
+class KeyChanges(Base):
+    """The long-lived agy runs on the key it authenticated with at start: a key replaced in this agent's item
+    (pasted, or a saved one chosen) restarts it before the next turn, which resumes the shared Session."""
+    KEY_B = "AIzaDUMMY-second-key-fedcba9876543210"
+
+    def key_sent(self, agy):
+        return [p["_meta"]["apiKey"] for m, p in agy.calls if m == "authenticate"]
+
+    def test_a_pasted_key_restarts_agy_on_it_and_the_next_turn_resumes_the_shared_session(self):
+        service = gk.agent_service(AGENT)
+        self.keychain.save(service, wrapped(DUMMY_KEY))
+        conn = gc.Connector(self.args())
+        self.owner_turn(conn, "task-1")
+        first = self.shared()["session_id"]
+        _, _, logs = self.owner_turn(conn, "task-2")                  # the same key: the same process
+        self.assertEqual(len(FakeAgy.spawned), 1)
+        self.assertNotIn("restarting", logs)
+
+        self.keychain.save(service, wrapped(self.KEY_B), mdat="20261127010203Z")   # A -> B, pasted
+        status, _, logs = self.owner_turn(conn, "task-3")
+        self.assertEqual(status, "completed")
+        self.assertEqual(len(FakeAgy.spawned), 2, "a new agy for the new key")
+        old, new = FakeAgy.spawned
+        self.assertEqual((self.key_sent(old), self.key_sent(new)), ([DUMMY_KEY], [self.KEY_B]))
+        self.assertEqual(new.methods_called()[:3], ["initialize", "authenticate", "session/load"])
+        self.assertEqual([p["sessionId"] for m, p in new.calls if m in ("session/load", "session/prompt")],
+                         [first, first], "the next turn runs on the new process, in the saved Session")
+        self.assertEqual(logs.count("restarting the agent: the authentication changed"), 1)
+        self.assertEqual(old.methods_called().count("session/prompt"), 2, "nothing more was sent to the old one")
+        for text in (logs, conn.host.probed, json.dumps(self.shared())):
+            self.assertNotIn(DUMMY_KEY, text)
+            self.assertNotIn(self.KEY_B, text)
+        self.assertEqual(conn.host.probed, "saved cdat=20261127000000Z mdat=20261127010203Z")
+
+        del self.keychain.items[service]                                 # removed: back on the sign-in, as before
+        _, _, logs = self.owner_turn(conn, "task-4")
+        self.assertEqual(len(FakeAgy.spawned), 3)
+        self.assertNotIn("authenticate", FakeAgy.spawned[-1].methods_called())
+        self.assertIn("not resuming shared session %s" % first, logs)
+        self.assertEqual(self.shared()["auth"], acp_host.SIGNED_IN_AUTH)
+
+    def test_choosing_a_saved_key_restarts_agy_and_another_agents_key_does_not(self):
+        service, other = gk.agent_service(AGENT), gk.agent_service("@other-agy:s.space")
+        self.keychain.save(service, wrapped(DUMMY_KEY))
+        conn = gc.Connector(self.args())
+        self.owner_turn(conn, "task-1")
+        self.keychain.save(other, wrapped(self.KEY_B), cdat="20261127050000Z", mdat="20261127050000Z")
+        _, _, logs = self.owner_turn(conn, "task-2")                  # another agent's item changed: no restart
+        self.assertEqual(len(FakeAgy.spawned), 1)
+        self.assertNotIn("restarting", logs)
+        # A saved key chosen in the app: its item written anew (deleted and added: both dates change).
+        self.keychain.save(service, wrapped(self.KEY_B, tag="saved-2"), cdat="20261127060000Z", mdat="20261127060000Z")
+        _, _, logs = self.owner_turn(conn, "task-3")
+        self.assertEqual(len(FakeAgy.spawned), 2)
+        self.assertEqual(self.key_sent(FakeAgy.spawned[-1]), [self.KEY_B])
+        self.assertIn("restarting the agent: the authentication changed", logs)
+        self.assertNotIn(self.KEY_B, logs)
+
+
+class KeyMarker(unittest.TestCase):
+    def test_only_the_items_dates_and_never_its_value(self):
+        chain = FakeKeychain()
+        chain.save(gk.agent_service(AGENT), wrapped(DUMMY_KEY), cdat="20261101000000Z", mdat="20261102030405Z")
+        marker = gk.key_marker(AGENT, run=chain, platform="darwin", environ={})
+        self.assertEqual(marker, "saved cdat=20261101000000Z mdat=20261102030405Z")
+        self.assertNotIn(DUMMY_KEY, marker)
+        self.assertNotIn(wrapped(DUMMY_KEY), marker)
+        self.assertEqual((chain.asked, chain.listed), ([], [(gk.SECURITY, gk.agent_service(AGENT), gk.ACCOUNT)]))
+        argv_seen = []
+        gk.key_marker(AGENT, run=lambda argv, **k: argv_seen.append(argv) or chain(argv, **k), platform="darwin",
+                      environ={})
+        self.assertFalse({"-w", "-g"} & set(argv_seen[0]), "attributes only: the secret is never asked for")
+
+    def test_no_item_no_dates_and_failures(self):
+        chain = FakeKeychain()
+        self.assertEqual(gk.key_marker(AGENT, run=chain, platform="darwin", environ={}), "", "none saved")
+        self.assertEqual(gk.key_marker(AGENT, run=lambda argv, **k: subprocess.CompletedProcess(argv, 0, "x\n", ""),
+                                       platform="darwin", environ={}), "saved", "dates not printed")
+        for boom in (subprocess.TimeoutExpired("security", 1), FileNotFoundError()):
+            self.assertEqual(gk.key_marker(AGENT, run=lambda *a, **k: (_ for _ in ()).throw(boom),
+                                           platform="darwin", environ={}), "")
+        chain.save(gk.agent_service(AGENT), wrapped(DUMMY_KEY))
+        self.assertEqual(gk.key_marker(AGENT, run=chain, platform="linux", environ={}), "")
+        self.assertEqual(gk.key_marker(AGENT, run=chain, platform="darwin", environ={gk.OPT_OUT_ENV: "off"}), "")
+        self.assertEqual(gk.key_marker("", run=chain, platform="darwin", environ={}), "")
+        self.assertEqual(chain.listed, [(gk.SECURITY, gk.agent_service(AGENT), gk.ACCOUNT)],
+                         "only the first read, before the item existed, ran `security`")
 
 
 class Probe(Base):

@@ -256,9 +256,10 @@ as is or base64 JSON `{"tag", "value"}`). After `initialize`, when agy lists `ge
 key, the Google sign-in is left untouched. Guest turns (`--gemini-dir`) never get the key. The key goes only
 into that request on agy's stdin: never argv, environment or logs. Each saved Session records its auth mode
 (`auth`: `sign-in` or `gemini-api-key`, none = `sign-in`); a Session opened under the other mode is not
-resumed (resuming a sign-in Session still bills the Google account's quota), a new one is opened. Saving or
-removing the key restarts the long-lived agy before the next turn (whether a key is saved is read without
-reading the key).
+resumed (resuming a sign-in Session still bills the Google account's quota), a new one is opened. Saving,
+replacing (A to B) or removing the key restarts the long-lived agy before the next turn, which then resumes
+the shared Session: the change is seen in this agent's own item's creation and modification dates, read with
+`security find-generic-password` without `-w`/`-g` (never the key, and no other agent's item).
 `AG2_AGY_GEMINI_KEY=0` in the connector's environment turns this off. See `gemini_key.py`.
 
 ## The account card

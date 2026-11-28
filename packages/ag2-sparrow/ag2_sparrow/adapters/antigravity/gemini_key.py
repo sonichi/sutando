@@ -21,6 +21,7 @@ import base64
 import binascii
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -149,6 +150,28 @@ def key_saved(agent_id: str = "", run=None, platform: str = None, environ=None,
     except (OSError, subprocess.SubprocessError):
         return False
     return getattr(done, "returncode", 1) == 0
+
+
+# Only the item's creation and modification dates (14 digits + Z) are kept: nothing else it prints.
+_ITEM_DATE = re.compile(r'"(cdat|mdat)"<timedate>=\S*\s*"(\d{14}Z)')
+
+
+def key_marker(agent_id: str = "", run=None, platform: str = None, environ=None,
+               timeout: float = READ_TIMEOUT_S) -> str:
+    """A change marker for this agent's own saved key, with no secret in it: '' when none is saved (or off
+    macOS, without the agent id, opted out, on any failure), else "saved cdat=<date> mdat=<date>" from the
+    item's attributes (no `-w`/`-g`). Saving another key into the item, or deleting and adding it, changes it."""
+    if not agent_id or (platform or sys.platform) != "darwin" or opted_out(environ):
+        return ""
+    try:
+        done = (run or subprocess.run)([SECURITY, "find-generic-password", "-a", ACCOUNT, "-s", agent_service(agent_id)],
+                                       capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if getattr(done, "returncode", 1) != 0:
+        return ""
+    dates = dict(_ITEM_DATE.findall(getattr(done, "stdout", "") or ""))
+    return " ".join(["saved"] + ["%s=%s" % (k, dates[k]) for k in ("cdat", "mdat") if k in dates])
 
 
 REMOVED, ABSENT, FAILED = "removed", "absent", "failed"

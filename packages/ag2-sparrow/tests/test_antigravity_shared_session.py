@@ -14,6 +14,7 @@ import io
 import json
 import os
 import shlex
+import subprocess
 import sys
 import tempfile
 import threading
@@ -31,7 +32,7 @@ from _helpers.subprocess_coverage import covered_code  # noqa: E402
 PKG_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG_ROOT))
 from ag2_sparrow import acp_client, acp_host, connector_cards, task_io  # noqa: E402
-from ag2_sparrow.adapters.antigravity import antigravity_connector as gc  # noqa: E402
+from ag2_sparrow.adapters.antigravity import antigravity_connector as gc, gemini_key as gk  # noqa: E402
 
 STUB = str(Path(__file__).resolve().parent / "agy_stub_acp.py")
 # The stub as a `python -c` child: measured too when the suite runs under subprocess coverage.
@@ -281,6 +282,93 @@ class SharedSessionTest(unittest.TestCase):
         self.assertIn(gc.TOOLS_DOWN % "the helper did not start", self.w.result("task-2"))
 
 
+class KeyChain:
+    """`security find-generic-password` over {service: (value, mdat)}: the value with -w, else the dates only."""
+
+    def __init__(self):
+        self.items = {}
+
+    def __call__(self, argv, **kw):
+        got = self.items.get(argv[argv.index("-s") + 1])
+        if got is None:
+            return subprocess.CompletedProcess(argv, 44, "", "not found\n")
+        if "-w" in argv:
+            return subprocess.CompletedProcess(argv, 0, got[0] + "\n", "")
+        return subprocess.CompletedProcess(argv, 0, '    "cdat"<timedate>=0x00  "20261127000000Z\\000"\n'
+                                                    '    "mdat"<timedate>=0x00  "%s\\000"\n' % got[1], "")
+
+
+class KeySwapTest(unittest.TestCase):
+    """A Gemini API key replaced in the app (A -> B) restarts the long-lived agy, which signs in on B and resumes
+    the shared Session; the same key keeps it; another agent's item never touches it."""
+    AGENT, KEY_A, KEY_B = "@agy:s.space", "AIzaDUMMY-key-A-0123456789", "AIzaDUMMY-key-B-9876543210abcdef"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.w = Work(self.tmp.name)
+        self.chain = KeyChain()
+        for name in ("gemini_api_key_from_app", "key_marker"):
+            real = getattr(gk, name)
+            patcher = mock.patch.object(gk, name, lambda agent_id="", real=real: real(
+                agent_id, run=self.chain, platform="darwin", environ={}))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.service = gk.agent_service(self.AGENT)
+
+    def turn(self, conn, tid):
+        self.w.task(tid, "STUB:TEXT " + tid)
+        conn.handle(tid + ".txt")
+
+    def test_a_to_b_restarts_on_b_and_resumes_and_the_same_key_does_not(self):
+        self.chain.items[self.service] = (self.KEY_A, "20261127000000Z")
+        conn = gc.Connector(self.w.args("--agent-id", self.AGENT))
+        with contextlib.redirect_stderr(io.StringIO()) as out:
+            self.turn(conn, "task-1")
+            self.turn(conn, "task-2")
+            self.assertEqual(len(self.w.boots()), 1, "the same key: one process")
+            old = conn.host.client
+            self.chain.items[gk_service_other(self.AGENT)] = (self.KEY_B, "20261127090000Z")
+            self.turn(conn, "task-3")
+            self.assertEqual(len(self.w.boots()), 1, "another agent's key: no restart")
+            self.chain.items[self.service] = (self.KEY_B, "20261127010203Z")
+            self.turn(conn, "task-4")
+            self.assertIsNotNone(old.p.poll(), "the old agy exited")
+            conn.host.close()
+        err = out.getvalue()
+        boots = self.w.boots()
+        self.assertEqual(len(boots), 2)
+        auths = self.w.calls("authenticate")
+        self.assertEqual([(a["pid"], a["params"]["key_len"]) for a in auths],
+                         [(boots[0]["pid"], len(self.KEY_A)), (boots[1]["pid"], len(self.KEY_B))])
+        self.assertEqual([r["params"]["sessionId"] for r in self.w.calls("session/load")], ["s-1"])
+        prompts = self.w.prompts()
+        self.assertEqual([(r["pid"], r["sessionId"]) for r in prompts],
+                         [(boots[0]["pid"], "s-1")] * 3 + [(boots[1]["pid"], "s-1")])
+        self.assertEqual(self.w.result("task-4"), self.w.result("task-1").replace("task-1", "task-4"))
+        self.assertEqual(err.count("restarting the agent: the authentication changed"), 1)
+        stored = (self.w.root / "state" / acp_host.SHARED_NAME).read_text() + (self.w.home / "stub.log").read_text()
+        for key in (self.KEY_A, self.KEY_B):
+            self.assertNotIn(key, err + stored + str(conn.host.probed))
+
+    def test_a_removed_key_restarts_on_the_sign_in_as_before(self):
+        self.chain.items[self.service] = (self.KEY_A, "20261127000000Z")
+        conn = gc.Connector(self.w.args("--agent-id", self.AGENT))
+        with contextlib.redirect_stderr(io.StringIO()) as out:
+            self.turn(conn, "task-1")
+            del self.chain.items[self.service]
+            self.turn(conn, "task-2")
+            conn.host.close()
+        self.assertEqual(len(self.w.boots()), 2)
+        self.assertEqual(len(self.w.calls("authenticate")), 1, "the new agy is not sent a key")
+        self.assertIn("not resuming shared session s-1", out.getvalue())
+        self.assertEqual(self.w.shared()["auth"], acp_host.SIGNED_IN_AUTH)
+
+
+def gk_service_other(agent):
+    return gk.agent_service("@other-" + agent.lstrip("@"))
+
+
 # ── AcpHost's restart rules, on a fake client ────────────────────────────────
 
 class FakeClient:
@@ -413,6 +501,19 @@ class HostTest(unittest.TestCase):
             raise RuntimeError("keychain")
         host.auth_probe = broken
         self.assertEqual(host.restart_reason(), "", "an unreadable probe reads as unchanged")
+
+    def test_a_changed_key_marker_closes_the_old_process_and_an_unchanged_one_keeps_it(self):
+        marker = ["saved mdat=1"]
+        host = self.host(self.OK, auth_probe=lambda: marker[0])
+        self.run_turn(host)
+        self.run_turn(host)
+        self.assertEqual(len(self.spawned), 1, "the same key: the same process")
+        marker[0] = "saved mdat=2"
+        self.run_turn(host)
+        self.assertEqual(len(self.spawned), 2)
+        self.assertTrue(self.spawned[0].closed, "the old process is closed before the new one serves")
+        self.assertEqual([m for m, _ in self.spawned[1].calls][-1], "session/prompt")
+        self.assertEqual(host.probed, "saved mdat=2")
 
     def test_only_the_turn_in_progress_and_its_own_session_get_permissions_and_updates(self):
         seen = []
