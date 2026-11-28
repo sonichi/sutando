@@ -573,8 +573,8 @@ class RemoteCardTest(Home, CardWorld, unittest.TestCase):
         ((_, expired),) = self.posted("$card1")
         self.assertEqual(self.ops(), [("edit", "$card1")])
         self.assertEqual((expired["id"], expired["state"]), (account_switch.CARD, "error"))
-        self.assertTrue(expired["text"].startswith("The sign-in expired before it was finished, so I stopped it. Tap "
-                                                   "Add account to start again."))
+        self.assertEqual(expired["text"], "The sign-in code expired before it was used, so I stopped it. "
+                                          + account_switch.BELOW, "one way on: the buttons below")
         self.assertNotIn(CODE, json.dumps(expired))
         self.assertTrue(self.stub_gone())
 

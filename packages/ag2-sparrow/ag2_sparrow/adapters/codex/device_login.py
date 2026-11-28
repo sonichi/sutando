@@ -649,8 +649,7 @@ class Remote:
             built = self.accounts.card("error", UNANSWERED % (int(LOGIN_WAIT_S // 60), self.accounts.using()), ask=True)
             outcome = "account-device-unanswered"
         elif done["exit"] == "timeout":
-            built = self.accounts.card("error", "The sign-in expired before it was finished, so I stopped it. Tap Add "
-                                                "account to start again.", ask=True)
+            built = self.accounts.card("error", "The sign-in code expired before it was used, so I stopped it.", ask=True)
             outcome = "account-device-expired"
         else:
             why = done["why"] or "Codex's sign-in ended with exit code %s" % done["exit"]
