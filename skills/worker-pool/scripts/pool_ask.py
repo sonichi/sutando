@@ -45,6 +45,7 @@ sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE.parents[2] / "src"))
 from task_body_guard import confine_user_content, header_safe_value  # noqa: E402
 import skill_config  # noqa: E402
+from local_task_protocol import valid_archive_lookup_id  # noqa: E402
 
 pr = _sibling("pool_roster")
 rt = _sibling("pool_router")
@@ -162,14 +163,17 @@ def compose(task_id: str, to: str, question: str, *, sender: str, wait: bool,
 def ask(workspace, to: str, question: str, *, wait_s: float = 0.0,
         sleep=time.sleep, tier: str = "team", relayed_from: "str | None" = None,
         parent_task: "str | None" = None, parent_generation: "int | None" = None,
-        allow_handoff: bool = True, runner=None) -> dict:
+        allow_handoff: bool = True, runner=None, task_id: "str | None" = None) -> dict:
     ws = Path(workspace)
     roster = pr.load_roster(ws)     # one snapshot: the recipient is resolved and routed against it
     rid = resolve_in(roster, to)
     sender = whoami()
     if rid == sender:
         raise ValueError("that is you")
-    task_id = f"task-{secrets.token_hex(9)}"
+    if task_id is None:
+        task_id = f"task-{secrets.token_hex(9)}"
+    elif not (task_id.startswith("task-") and valid_archive_lookup_id(task_id)):
+        raise ValueError(f"not a task id: {task_id!r}")
     ph = _sibling("pool_handoff")
     # Read once: every decision below and the folder written use this one answer.
     dirs = ph.own_dirs(ws, rid) if rid != pr.CORE else None

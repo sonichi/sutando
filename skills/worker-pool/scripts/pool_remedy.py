@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import fcntl
+import hashlib
 import importlib.util
 import json
 import os
@@ -445,13 +446,56 @@ def retry_limit(workspace, repo, worker_id, *, runner=None):
             "task_id": task_id, "send_code": sent.code}
 
 
-def apply(workspace, repo, decisions: dict, *, runner=None, spawn=None) -> dict:
+REDELIVER_ASK = (
+    "Your usage limit has lifted. Deliveries that reached you while you were limited were not "
+    "announced again: process your outstanding deliveries now. Do not run core startup or core "
+    "schedules. Reply [no-send] when they are handled.")
+
+
+def redeliver_task_id(worker_id: str, released_at: float) -> str:
+    """The one wake task for this seat's release: a retry after an unclear outcome finds it."""
+    digest = hashlib.sha256(f"{worker_id}|{released_at!r}".encode()).hexdigest()[:18]
+    return f"task-redeliver-{digest}"
+
+
+def redeliver(workspace, repo, worker_id, *, runner=None) -> dict:
+    """Re-offer a seat's owed work after its limit hold lifted: one fresh task through pool_ask,
+    which whichever watcher holds the inbox announces. Types nothing into the pane."""
+    import task_disposition as tdisp
+    released = sup.limit_released_at(workspace, worker_id)
+    if released is None:
+        return {"worker_id": worker_id, "outcome": "no-release"}
+    task_id = redeliver_task_id(worker_id, released)
+    served = {"worker_id": worker_id, "outcome": "redelivered", "task_id": task_id, "released_at": released}
+    if tdisp.task_disposition(workspace, task_id) != tdisp.MISSING:
+        return {**served, "already": True}
+    if (sup.is_paused(workspace, worker_id)
+            or worker_id not in sup.supervised_workers(workspace)
+            or sup.work_outstanding(workspace, worker_id) is not True):
+        return {"worker_id": worker_id, "outcome": "no-work-or-paused"}
+    socket, session = sup._open_tmux(workspace, worker_id)
+    runtime = wc.worker_runtime(workspace, worker_id)
+    if not socket or runtime is None:
+        return {"worker_id": worker_id, "outcome": "unsupported-or-no-session"}
+    text = wc.capture(socket, session, runner or subprocess.run)
+    if text is None or sup.classify_pane_text(text, runtime, workspace=workspace, socket=socket,
+                                              session=session) != ps.PANE_IDLE:
+        return {"worker_id": worker_id, "outcome": "pane-not-idle"}
+    try:
+        _sibling("pool_ask").ask(workspace, worker_id, REDELIVER_ASK, allow_handoff=False, task_id=task_id)
+    except (OSError, ValueError) as exc:
+        return {"worker_id": worker_id, "outcome": "delivery-failed", "why": str(exc)}
+    return served
+
+
+def apply(workspace, repo, decisions: dict, *, runner=None, spawn=None, redeliveries=()) -> dict:
     """Act on a tick's decisions. `recover` resumes the session; `rearm_watcher`
     ensures the inbox's supervisor, whose standby arms once no session watcher
     holds the inbox. A wedge card is raised and never acts on the session: only a
     dead session is ever respawned, and a logged-out one is carded for its /login
-    because a fresh session meets the same expired login. `escalate` is returned
-    untouched, because asking the owner is the core's, not a timer's."""
+    because a fresh session meets the same expired login. Each worker in `redeliveries` (beside
+    its decision, never instead of it) gets one fresh task for the limit release it is owed.
+    `escalate` is returned untouched, because asking the owner is the core's, not a timer's."""
     done = {}
     rearms = {}
     cards = {}
@@ -475,10 +519,15 @@ def apply(workspace, repo, decisions: dict, *, runner=None, spawn=None) -> dict:
         elif decision == ps.REARM_WATCHER:
             rearms[worker_id] = ensure_supervisor(workspace, repo, worker_id,
                                                   runner=runner)
+    redelivered = {w: redeliver(workspace, repo, w, runner=runner)
+                   for w in redeliveries if not suspension(workspace)}
     sup.acknowledge_cards(workspace, [w for w, r in cards.items() if r.get("outcome") == "carded"])
+    sup.acknowledge_redelivered(workspace, {w: r["released_at"] for w, r in redelivered.items()
+                                            if r.get("outcome") == "redelivered" and "released_at" in r})
     return {"recoveries": done,
             "rearms": rearms,
             "cards": cards,
+            "redeliveries": redelivered,
             "escalations": sorted(w for w, d in decisions.items() if d == ps.ESCALATE)}
 
 
@@ -568,13 +617,13 @@ def _sweep(a, runner=None) -> int:
                          or (o.get("pane") == ps.PANE_WORKING
                              and previous and current != previous))):
                 recovered.add(w)
-    idle = {"recoveries": {}, "rearms": {}, "cards": {}, "escalations": []}
+    idle = {"recoveries": {}, "rearms": {}, "cards": {}, "redeliveries": {}, "escalations": []}
     escalations = sorted(w for w, d in tick["decisions"].items() if d == ps.ESCALATE)
     if not a.dry_run and not held:
         _repair_human_cards(a.workspace, tick)
     acted = ({**idle, "dry_run": True} if a.dry_run
              else {**idle, "escalations": escalations, "suspended": held} if held
-             else apply(a.workspace, a.repo, tick["decisions"]))
+             else apply(a.workspace, a.repo, tick["decisions"], redeliveries=tick.get(ps.REDELIVER, ())))
     if resumed is not None:
         acted["resume"] = resumed
     if not a.dry_run and not held and not suspension(a.workspace):

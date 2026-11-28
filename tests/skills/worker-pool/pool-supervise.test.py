@@ -520,7 +520,7 @@ class TheCommandLine(Base):
                          {"decisions", "observations", "resumed", "not_supervised", "routing",
                           "wedged", "wedge_kinds", "auth_expired", "sentinels_retired",
                           "sentinel_retire_errors", "sentinels_deferred",
-                          "delivery_blocks", "notifier_stalls", "limit_waits"})
+                          "delivery_blocks", "notifier_stalls", "limit_waits", "redeliver"})
 
     def test_a_resume_sample_says_so(self):
         make_worker(self.ws)

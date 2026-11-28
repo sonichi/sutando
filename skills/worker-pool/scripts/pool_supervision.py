@@ -40,6 +40,10 @@ LIMIT_PROBE_S = 900.0
 LIMIT_MAX_ATTEMPTS = 4
 
 NOTHING, RECOVER, ESCALATE, REARM_WATCHER = "nothing", "recover", "escalate", "rearm_watcher"
+# A watcher announces a payload once per lifetime, so what arrived during a limit is re-offered
+# once when the seat's hold lifts. A release older than the window is not the episode at hand.
+REDELIVER = "redeliver"
+REDELIVER_WINDOW_S = 3600.0
 # A wedged live session's card: the cause named (abnormal text), a frozen turn
 # offering an Escape, or an expired login. No card decision ends or types into a session.
 CARD_CAUSE, CARD_FROZEN, CARD_LOGIN, CARD_HUMAN, CARD_UNDELIVERED = (
@@ -86,6 +90,8 @@ class Observation:
     limit_reset_at: float | None = None
     # The banner's own reset words: an unchanged banner keeps the deadline it first parsed to.
     limit_banner: str | None = None
+    # When the seat's own limit hold was lifted; None while it holds, or with no record.
+    limit_released_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -111,6 +117,8 @@ class WorkerEvidence:
     limit_exhausted: bool = False
     limit_banner: str | None = None
     limit_reset_at: float | None = None
+    # The hold release whose wake task is queued: one redelivery per episode.
+    redelivered_for: float | None = None
 
 
 @dataclass(frozen=True)
@@ -237,6 +245,31 @@ def _wedge_rung(ev: WorkerEvidence, obs: Observation, now: float, *,
         return ev, NOTHING
     # A card decision repeats each tick until `acknowledge` records that it was raised.
     return ev, WEDGE_CARDS[kind]
+
+
+def _redeliver_rung(ev: WorkerEvidence, obs: Observation, now: float) -> bool:
+    """True while a hold release is unserved, for a seat idle again that still owes work under a
+    live watcher. A hold in force has no release, and a pane not idle (a limit, a gate, a turn) waits."""
+    released = obs.limit_released_at
+    return not (released is None or released == ev.redelivered_for or now - released > REDELIVER_WINDOW_S
+                or obs.paused or obs.session_alive is not True or obs.pane != PANE_IDLE
+                or obs.work_outstanding is not True or obs.watcher_beat != LIVE)
+
+
+def redeliveries(state: SupervisionState, observations: dict[str, Observation], now: float) -> list[str]:
+    """Workers owed a redelivery this tick: beside their one decision, never instead of it, so a
+    card and a wake task each retry until their own acknowledgment."""
+    return sorted(w for w, o in observations.items()
+                  if _redeliver_rung(state.workers.get(w, WorkerEvidence()), o, now))
+
+
+def acknowledge_redelivered(state: SupervisionState, served: dict) -> SupervisionState:
+    """Record {worker id: release} whose wake task is queued, so that release is not re-offered."""
+    workers = dict(state.workers)
+    for w, released in served.items():
+        if w in workers:
+            workers[w] = replace(workers[w], redelivered_for=released)
+    return replace(state, workers=workers)
 
 
 def acknowledge(state: SupervisionState, worker_ids) -> SupervisionState:
