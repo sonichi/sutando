@@ -152,7 +152,7 @@ class RoomToolsArgv(unittest.TestCase):
 
     def test_install_starts_a_new_conversation_for_the_tools_and_keeps_the_earlier_one_without_them(self):
         from ag2_sparrow.adapters.claude_code import cli as cc
-        on = {"MCP_PROXY_COMMAND": PROXY, "TOKEN_ENV_FILE": self.token}
+        on = {"MCP_PROXY_COMMAND": PROXY, "TOKEN_ENV_FILE": self.token, "ROOM_TOOLS_PREVIEW": "1"}
         old_id, new_id = SESSION_ID, "99999999-2222-4333-8444-555555555555"
 
         def decide(old, values, session_id, kept, resume="", live=None):
@@ -164,12 +164,22 @@ class RoomToolsArgv(unittest.TestCase):
         # No proxy, or no token file of the agent's own: no tools session.
         for values in ({}, {"MCP_PROXY_COMMAND": PROXY}, {"TOKEN_ENV_FILE": self.token}):
             self.assertEqual(decide({}, values, old_id, old_id)[0], {"ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": ""})
+        # The proxy and the token file without the preview (what an app update passes): nothing changes for an
+        # agent that has a conversation, and nothing is said. Its collaborators keep the session they share.
+        quiet = {k: v for k, v in on.items() if k != "ROOM_TOOLS_PREVIEW"}
+        for kept in (old_id, ""):
+            self.assertEqual(decide({"SESSION_ID": old_id}, quiet, old_id, kept),
+                             ({"ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": ""}, ""), kept)
+        # Turning the preview off again leaves the tools' conversation as the session, without the tools.
+        was_on = {"SESSION_ID": new_id, "ROOM_TOOLS_SESSION": new_id, "EARLIER_SESSION_ID": old_id}
+        self.assertEqual(decide(was_on, quiet, new_id, new_id)[0], {"ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": old_id})
         # A first install: the conversation it minted is the tools'.
         self.assertEqual(decide({}, on, old_id, "")[0], {"ROOM_TOOLS_SESSION": old_id, "EARLIER_SESSION_ID": ""})
         # The tools turned on for an agent that already has a conversation: a new one, the earlier kept.
         got, said = decide({"SESSION_ID": old_id}, on, old_id, old_id)
         self.assertEqual(got, {"SESSION_ID": new_id, "ROOM_TOOLS_SESSION": new_id, "EARLIER_SESSION_ID": old_id})
         self.assertIn("the earlier one (%s) is kept, without them" % old_id, said)
+        self.assertIn(cc.PREVIEW_NOTE, said, "the owner is told what the preview costs a collaborator")
         # Installed again: the tools' conversation stays, and so does the record of the earlier one.
         again = {"SESSION_ID": new_id, "ROOM_TOOLS_SESSION": new_id, "EARLIER_SESSION_ID": old_id}
         self.assertEqual(decide(again, on, new_id, new_id)[0], {"ROOM_TOOLS_SESSION": new_id, "EARLIER_SESSION_ID": old_id})
@@ -313,6 +323,20 @@ class InstallOption(ConnectBase):
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(cm.read_config(cli.config_path())["MCP_PROXY_COMMAND"], cfg["MCP_PROXY_COMMAND"])
         self.assertIn(("MCP_PROXY_COMMAND", "mcp_proxy_command", str), cli.RECORDED)
+        # The proxy command alone (what the desktop app passes) turns nothing on: the tools are a preview the
+        # owner asks for, listed in --help, recorded, and kept on a repair like the command.
+        self.assertIn("--room-tools-preview", helped.getvalue())
+        self.assertEqual((cfg["ROOM_TOOLS_PREVIEW"], cfg["ROOM_TOOLS_SESSION"]), ("", ""))
+        self.assertIn("ROOM_TOOLS_PREVIEW", [key for key, _, _ in cli.RECORDED])
+        rc, out, err = self.install_with(runner, False, "--mcp-proxy-command", proxy, "--room-tools-preview")
+        self.assertEqual(rc, 0, out + err)
+        cfg = cm.read_config(cli.config_path())
+        self.assertEqual((cfg["ROOM_TOOLS_PREVIEW"], cfg["ROOM_TOOLS_SESSION"]), ("1", ""), "no token file: still no tools")
+        # A repair install keeps both from the record.
+        rc, out, err = self.install_with(runner, False)
+        self.assertEqual(rc, 0, out + err)
+        again = cm.read_config(cli.config_path())
+        self.assertEqual((again["ROOM_TOOLS_PREVIEW"], again["MCP_PROXY_COMMAND"]), ("1", cfg["MCP_PROXY_COMMAND"]))
 
     def test_a_config_without_it_stays_valid_with_no_tools(self):
         path = self.configure()

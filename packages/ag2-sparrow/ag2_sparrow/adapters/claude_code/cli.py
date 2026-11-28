@@ -205,7 +205,8 @@ RECORDED = (("CLAUDE", "claude", str), ("PLUGIN_DIR", "plugin_dir", lambda v: v 
             ("HMAC_STRICT", "no_hmac_strict", lambda v: v == hmac_policy.OPT_OUT),
             (inbox.ALLOW_NON_OWNER, "non_owner", lambda v: "0" if v == "0" else ""),
             (inbox.ALLOW_COLLABORATOR, "collaborator", lambda v: "0" if v == "0" else ""),
-            ("MCP_PROXY_COMMAND", "mcp_proxy_command", str))
+            ("MCP_PROXY_COMMAND", "mcp_proxy_command", str),
+            ("ROOM_TOOLS_PREVIEW", "room_tools_preview", lambda v: v == "1"))
 
 
 # Install and connect ran, but a kept session id stayed instead of --resume-session's.
@@ -225,6 +226,11 @@ def resume_outcome(rc: int) -> int:
     return EXIT_RESUME_NOT_APPLIED
 
 
+PREVIEW_NOTE = ("NOTE mcp: room tools preview. While it is on, only your own tasks run in the agent's session; a "
+                "collaborator's task gets a reply with no memory of earlier messages and no tools. Install again "
+                "without --room-tools-preview to turn it off.")
+
+
 def room_tools_session(old: dict, values: dict, session_id: str, kept: str, resume: str, live_server, stop_cmd: str,
                        mint=None) -> dict:
     """Which conversation may carry the AG2 Space tools: only one started for them, with no earlier turn of any
@@ -233,10 +239,13 @@ def room_tools_session(old: dict, values: dict, session_id: str, kept: str, resu
     the tools); while the old session is not proven gone, or when the owner names a conversation to resume,
     the tools stay off and the command says so."""
     earlier = old.get("EARLIER_SESSION_ID") or ""
-    if not (values.get("MCP_PROXY_COMMAND") and values.get("TOKEN_ENV_FILE")):
+    # A preview the owner turns on (--room-tools-preview): the proxy command alone, which the desktop app
+    # records at every install and update, changes nothing.
+    if not (values.get("ROOM_TOOLS_PREVIEW") == "1" and values.get("MCP_PROXY_COMMAND") and values.get("TOKEN_ENV_FILE")):
         return {"ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": earlier}
     if kept and kept == (old.get("ROOM_TOOLS_SESSION") or ""):
         return {"ROOM_TOOLS_SESSION": kept, "EARLIER_SESSION_ID": earlier}
+    print(PREVIEW_NOTE)
     if not kept:        # a conversation minted by this install: nobody has spoken in it
         return {"ROOM_TOOLS_SESSION": session_id, "EARLIER_SESSION_ID": earlier}
     if resume and kept == resume:
@@ -323,8 +332,9 @@ def _install(args) -> int:
               inbox.ALLOW_COLLABORATOR: "0" if args.collaborator == "0" else "1", "AGENT_ID": agent_id, "BRIDGE": mode,
               "TOKEN_ENV_FILE": where["token_file"],
               "TOKEN_VAULT_KEY": vault_key(segment) if mode not in (UNIT, EXTERNAL) and not where["token_file"] else "",
-              "BRIDGE_STATE_DIR": str(state), "TMUX": tmux, "MCP_PROXY_COMMAND": proxy, "ROOM_TOOLS_SESSION": "",
-              "EARLIER_SESSION_ID": ""}
+              "BRIDGE_STATE_DIR": str(state), "TMUX": tmux, "MCP_PROXY_COMMAND": proxy,
+              "ROOM_TOOLS_PREVIEW": "1" if getattr(args, "room_tools_preview", False) else "",
+              "ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": ""}
     if proxy and not where["token_file"]:
         print("NOTE mcp: --mcp-proxy-command acts as the agent through its own token file; this install has none "
               "(--token-env-file), so the session gets no AG2 Space tools")
@@ -912,7 +922,11 @@ def session_options(p) -> None:
     p.add_argument("--mcp-proxy-command", help="the stdio ag2-mcp-proxy command line ('<node> <the desktop app's "
                    "engine/ag2-mcp-proxy.mjs>'), each path quoted when it has a space: the session (the owner's and "
                    "attested collaborators' turns) gets the AG2 Space tools as this agent, through --mcp-config; "
-                   "needs the agent's own token file (default: none, no AG2 Space tools)")
+                   "needs the agent's own token file and --room-tools-preview (default: none, no AG2 Space tools)")
+    p.add_argument("--room-tools-preview", action="store_true",
+                   help="preview, off by default: with --mcp-proxy-command, start a new conversation that has the AG2 "
+                        "Space tools and takes only the owner's tasks; a collaborator's task is then answered with no "
+                        "memory and no tools (the earlier conversation is kept, without the tools)")
     p.add_argument("--claude", default="claude", help="the claude executable (default: claude on PATH)")
     p.add_argument("--tmux", help="the tmux executable, 3.2 or newer, recorded for every later command (default: the "
                    "recorded one, else PATH, the desktop app's engine/bin, %s)" % ", ".join(launcher.TMUX_DIRS))
