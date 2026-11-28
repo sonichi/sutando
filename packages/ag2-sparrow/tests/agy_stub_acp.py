@@ -26,7 +26,7 @@ home holds a settings.json (and its text) or any global context file, and its pr
 Long-lived use (one process, many turns): each process's first log line also carries its pid, so a test counts
 spawns; `refuse-load` under $HOME makes `session/load` fail as a load under another sign-in might (assumed
 wording); with `models` the `session/load` answer carries `models` too (assumed: no signed-in agy load has been
-captured); `authenticate` answers {} and is logged with the key's length only; STUB:DIE answers the prompt and then exits, a process that dies while idle; STUB:ROOM answers with
+captured); `authenticate` answers {} (an error with `refuse-key` under $HOME) and is logged with the key's length only; STUB:DIE answers the prompt and then exits, a process that dies while idle; STUB:ROOM answers with
 the room and sender its prompt's shared-session lead names.
 `session/new` offers the modes default, accept-edits and plan as agy's `--mode` names them (assumed: no
 signed-in agy has listed its ACP modes yet); `no-modes` under $HOME offers none, `set-mode-fails` makes
@@ -313,7 +313,10 @@ def main():
             key = (params.get("_meta") or {}).get("apiKey") or ""
             log({"method": method, "params": {"methodId": params.get("methodId"), "key_len": len(key)},
                  "pid": os.getpid()})
-            send({"jsonrpc": "2.0", "id": rid, "result": {}})
+            if os.path.exists(os.path.join(HOME, "refuse-key")):
+                send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": "API key not valid"}})
+            else:
+                send({"jsonrpc": "2.0", "id": rid, "result": {}})
             continue
         if method != "session/prompt":
             log({"method": method, "params": params})

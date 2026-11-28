@@ -811,6 +811,20 @@ class KeychainItem(unittest.TestCase):
             AGENT, run=lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError()), platform="darwin",
             environ={}), "")
 
+    def test_a_failed_read_is_told_apart_from_none_saved(self):
+        def code(rc):
+            return lambda argv, **kw: subprocess.CompletedProcess(argv, rc, "", "")
+        read = lambda run: gk.gemini_api_key_from_app(AGENT, run=run, platform="darwin", environ={})  # noqa: E731
+        self.assertIs(read(code(51)), gk.KEY_UNREAD)
+        self.assertIsNot(read(code(gk.NOT_FOUND)), gk.KEY_UNREAD)
+        outcomes = []
+        init = {"authMethods": [{"id": gk.METHOD_ID}]}
+        for key in (gk.KEY_UNREAD, ""):
+            self.assertFalse(gk.authenticate_with_app_key(None, init, 1, [], AGENT, key_source=lambda _a, k=key: k,
+                                                          report=outcomes.append))
+        self.assertFalse(gk.authenticate_with_app_key(None, {}, 1, [], AGENT, report=outcomes.append))
+        self.assertEqual(outcomes, [gk.UNREAD, gk.NO_KEY, gk.NOT_TRIED])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -922,7 +922,8 @@ class AcpHost:
     `on_models(models)` gets the ACP `models` of each Session opened. Before a turn the process is restarted when it
     exited, or when `auth_probe()` gives another marker than the last known one (the adapter's authentication
     changed; None, the probe could not tell, changes nothing). The last known marker is the one read just before and
-    after `on_initialized` in the start that authenticated, when both reads agree; else it is unknown and the next
+    after `on_initialized` in the start that authenticated, when both reads agree and `auth_settled()` (when given)
+    says that start read what the marker watches; else it is unknown and the next
     marker read restarts the process once, so the one running is proven on it. A request that timed out, or a
     sign-in error, closes it so the next turn starts clean. A turn whose prompt was not sent yet when the process
     went away is tried once more on a fresh one. With `turn_cap`, a Session that has had that many turns is left
@@ -930,12 +931,13 @@ class AcpHost:
     agent declares them), inside which each turn's attachments are copied."""
 
     def __init__(self, client_factory, args, stderr_name, not_signed_in, log, shared_path, on_initialized=None,
-                 mcp_servers=None, on_models=None, auth_probe=None, turn_cap=0, media_root=None):
+                 mcp_servers=None, on_models=None, auth_probe=None, turn_cap=0, media_root=None, auth_settled=None):
         self.client_factory, self.args, self.stderr_name = client_factory, args, stderr_name
         self.not_signed_in, self.log = not_signed_in, log
         self.file = SharedSessionFile(shared_path)
         self.on_initialized, self.mcp_servers, self.on_models = on_initialized, mcp_servers, on_models
         self.auth_probe, self.turn_cap, self.media_root = auth_probe, int(turn_cap or 0), media_root
+        self.auth_settled = auth_settled
         self.client = None
         self.init, self.auth, self.probed = {}, None, None
         self.session_id, self.turns, self.models, self.model = None, 0, {}, ""
@@ -1005,7 +1007,10 @@ class AcpHost:
             if self.on_initialized is not None else None
         after = self._probe() if self.auth_probe is not None else None
         # The baseline is a marker read on both sides of this start's authenticate; else unknown, and restarts once.
-        self.probed = before if before is not None and before == after else None
+        settled = self.auth_settled is None or self.auth_settled()
+        self.probed = before if before is not None and before == after and settled else None
+        if not settled:
+            self.log("this start could not read what the authentication watches; it restarts once it reads")
         if before is not None and after is not None and before != after:
             self.log("the authentication changed while the agent started; it restarts before the next turn")
         self.log("agent started (pid %s), auth %s" % (self.pid, self.auth or "none"))

@@ -67,7 +67,7 @@ from ...bounded_file_read import read_regular_bytes
 from ...acp_host import MESSAGE_EVENT, SESSIONS_NAME, TASK_NAME_RE, SessionStore, quoted, trigger_of  # noqa: F401
 from ...acp_client import AcpClient as _SharedClient
 from ...relay_loop import count_arg
-from .gemini_key import API_KEY_AUTH, authenticate_with_app_key
+from .gemini_key import API_KEY_AUTH, UNREAD, authenticate_with_app_key
 from . import agy_account, agy_usage
 from ...team_guardrail import SANDBOXED_DELEGATION_CODEX
 from ...task_io import (ALLOW_COLLABORATOR_FLAG, COLLABORATOR, NON_OWNER_NOTE, NON_OWNER_REFUSED, OWNER, RESTRICTED,
@@ -634,6 +634,7 @@ class Connector:
         self.accounts = agy_account.AgyAccount(
             args.state, getattr(args, "bridge_state", None), NAME, getattr(args, "agent_id", None) or "", publish,
             quoted, log)
+        self.key_outcome = None   # the last authenticate_with_app_key outcome (gemini_key.USED, UNREAD, ...)
         self.agy_pid = None   # the owner turn's agy process, whose own log names the account it used
         # agy's own usage, as the desktop app reads it for this agent (agy_usage.read); None: not now.
         self.usage_reader = lambda agent_id: agy_usage.read(self.args.state, agent_id)
@@ -660,7 +661,8 @@ class Connector:
                 os.path.join(state, acp_host.SHARED_NAME), on_initialized=self.use_app_gemini_key,
                 mcp_servers=lambda init: self.sspace_servers(init, mcp_auth.OWNER_TOOLS), on_models=self.models_seen,
                 auth_probe=self.accounts.key_marker, turn_cap=getattr(self.args, "shared_session_turns", 0),
-                media_root=os.path.realpath(os.path.join(state, acp_host.MEDIA_ROOT_NAME)))
+                media_root=os.path.realpath(os.path.join(state, acp_host.MEDIA_ROOT_NAME)),
+                auth_settled=lambda: self.key_outcome != UNREAD)
         return self.host
 
     def models_seen(self, models: dict):
@@ -813,9 +815,10 @@ class Connector:
         """Owner and collaborator turns only: agy on the Gemini API key saved in the app (gemini_key). The auth
         mode is saved with the Session: a Session opened on the Google sign-in is not resumed on the key (its
         session/load still bills that account's quota), nor the other way round."""
-        self.agy_pid = getattr(getattr(client, "p", None), "pid", None)
+        self.agy_pid, self.key_outcome = getattr(getattr(client, "p", None), "pid", None), None
         keyed = authenticate_with_app_key(client, init, self.args.rpc_timeout, argv,
-                                  agent_id=getattr(self.args, "agent_id", None) or "", log=log)
+                                  agent_id=getattr(self.args, "agent_id", None) or "", log=log,
+                                  report=lambda outcome: setattr(self, "key_outcome", outcome))
         return API_KEY_AUTH if keyed else acp_host.SIGNED_IN_AUTH
 
     @staticmethod

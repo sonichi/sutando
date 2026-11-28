@@ -399,11 +399,12 @@ class KeySwapTest(ChainCase):
 
 class VersionChain(KeyChain):
     """KeyChain whose items carry the app's version (gena); `fail` makes attribute reads unknown, and `after_read`
-    runs once right after the next key read (-w), to change the item before authenticate."""
+    runs once right after the next key read (-w), to change the item before authenticate; `fail_read` makes the
+    key read (-w) fail while attribute reads still answer."""
 
     def __init__(self):
         super().__init__()
-        self.fail, self.after_read = False, None
+        self.fail, self.after_read, self.fail_read = False, None, False
 
     def __call__(self, argv, **kw):
         got = self.items.get(argv[argv.index("-s") + 1])
@@ -413,6 +414,8 @@ class VersionChain(KeyChain):
             hook, self.after_read = self.after_read, None
             if hook:
                 hook()
+            if self.fail_read:
+                return subprocess.CompletedProcess(argv, 51, "", "user interaction is not allowed\n")
             return subprocess.CompletedProcess(argv, 0, got[0] + "\n", "")
         if self.fail:
             return subprocess.CompletedProcess(argv, 1, "", "interaction not allowed\n")
@@ -472,6 +475,42 @@ class BaselineTest(ChainCase):
         boots = self.w.boots()
         self.assertEqual(len(boots), 2)
         self.assertEqual(self.auths(), [(boots[1]["pid"], len(self.KEY_B))])
+
+    def test_a_key_that_could_not_be_read_leaves_the_baseline_unknown_and_restarts_once_on_the_key(self):
+        self.chain.items[self.service] = (self.KEY_A, self.V1)
+        self.chain.fail_read = True
+        conn = gc.Connector(self.w.args("--agent-id", self.AGENT))
+        with contextlib.redirect_stderr(io.StringIO()) as out:
+            self.turn(conn, "task-1")
+            self.assertEqual((conn.key_outcome, conn.host.probed), (gk.UNREAD, None), "the markers agree, unproven")
+            self.chain.fail_read = False
+            self.turn(conn, "task-2")
+            self.assertEqual((conn.key_outcome, conn.host.probed), (gk.USED, "saved v=%s%s" % (gk.VERSION_PREFIX, self.V1)))
+            self.turn(conn, "task-3")
+            conn.host.close()
+        boots = self.w.boots()
+        self.assertEqual(len(boots), 2, "one restart once the key reads, then none")
+        self.assertEqual(self.auths(), [(boots[1]["pid"], len(self.KEY_A))], "the first agy was sent no key")
+        self.assertEqual([r["pid"] for r in self.w.prompts()], [boots[0]["pid"]] + [boots[1]["pid"]] * 2)
+        self.assertIn("it could not be read; staying on the Google sign-in", out.getvalue())
+        self.assertEqual(out.getvalue().count("restarting the agent: the authentication changed"), 1)
+
+    def test_a_key_read_but_refused_stays_on_the_sign_in_and_keeps_the_marker_without_restarting(self):
+        self.chain.items[self.service] = (self.KEY_A, self.V1)
+        (self.w.home / "refuse-key").write_text("")
+        conn = gc.Connector(self.w.args("--agent-id", self.AGENT))
+        with contextlib.redirect_stderr(io.StringIO()) as out:
+            self.turn(conn, "task-1")
+            self.assertEqual((conn.key_outcome, conn.host.probed),
+                             (gk.REJECTED, "saved v=%s%s" % (gk.VERSION_PREFIX, self.V1)))
+            self.turn(conn, "task-2")
+            conn.host.close()
+        boots = self.w.boots()
+        self.assertEqual(len(boots), 1, "the same marker: no restart on a refused key")
+        self.assertEqual(self.auths(), [(boots[0]["pid"], len(self.KEY_A))])
+        self.assertEqual(self.w.shared()["auth"], acp_host.SIGNED_IN_AUTH)
+        self.assertEqual([r["pid"] for r in self.w.prompts()], [boots[0]["pid"]] * 2)
+        self.assertIn("not accepted (AcpError); staying on the Google sign-in", out.getvalue())
 
 
 def gk_service_other(agent):

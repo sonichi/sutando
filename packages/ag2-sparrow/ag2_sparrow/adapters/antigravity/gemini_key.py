@@ -39,6 +39,14 @@ NOT_FOUND = 44   # `security`'s exit when the item does not exist
 VERSION_PREFIX = "ag2v1-"   # the app's item version: this and 32 random hex digits, set anew on every write
 
 
+class _Unread(str):
+    """'' that says the key could not be read (no answer, another exit), unlike none saved or an unusable value."""
+
+
+KEY_UNREAD = _Unread()
+USED, REJECTED, UNREAD, NO_KEY, NOT_TRIED = "used", "rejected", "unread", "no key", "not tried"
+
+
 class AuthUnconfirmed(AcpError):
     """`authenticate` was sent and not answered: whether this agy runs on the key is not known."""
 
@@ -75,9 +83,10 @@ def _read_item(service: str, run, timeout: float) -> str:
         done = run([SECURITY, "find-generic-password", "-a", ACCOUNT, "-s", service, "-w"],
                    capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
-        return ""
-    if getattr(done, "returncode", 1) != 0:
-        return ""
+        return KEY_UNREAD
+    code = getattr(done, "returncode", 1)
+    if code != 0:
+        return "" if code == NOT_FOUND else KEY_UNREAD
     return unwrap(getattr(done, "stdout", "") or "")
 
 
@@ -88,7 +97,8 @@ def opted_out(environ=None) -> bool:
 
 def gemini_api_key_from_app(agent_id: str = "", run=None, platform: str = None, environ=None,
                             timeout: float = READ_TIMEOUT_S) -> str:
-    """This agent's Gemini API key saved in the app, or ''. macOS only, needs the agent id; never raises."""
+    """This agent's Gemini API key saved in the app, or '' (KEY_UNREAD when `security` failed). macOS only, needs
+    the agent id; never raises."""
     if not agent_id or (platform or sys.platform) != "darwin" or opted_out(environ):
         return ""
     return _read_item(agent_service(agent_id), run or subprocess.run, timeout)
@@ -105,16 +115,22 @@ def restricted(argv) -> bool:
 
 
 def authenticate_with_app_key(client, init, timeout, argv, agent_id="", log=lambda *a: None,
-                              key_source=None) -> bool:
+                              key_source=None, report=lambda outcome: None) -> bool:
     """After `initialize`: send `authenticate` gemini-api-key with the app's key when this is not a restricted
     turn, agy advertises the method and a key is saved. True when agy accepted it. A refusal (agy answers with
     an error) is logged, without the key or agy's message, which could echo it, and the turn goes on on the
     Google sign-in. No answer at all (a timeout, agy gone, a failed send) raises AuthUnconfirmed: that process
-    may or may not be on the key, so no Session is opened or recorded on it."""
+    may or may not be on the key, so no Session is opened or recorded on it. `report` gets the outcome: USED,
+    REJECTED, UNREAD (the key could not be read), NO_KEY or NOT_TRIED."""
     if restricted(argv) or not advertised(init):
+        report(NOT_TRIED)
         return False
     key = (key_source or gemini_api_key_from_app)(agent_id)
     if not key:
+        unread = isinstance(key, _Unread)
+        if unread:
+            log("Gemini API key from the app: it could not be read; staying on the Google sign-in")
+        report(UNREAD if unread else NO_KEY)
         return False
     # Before the key leaves this process: whatever agy writes to stderr from here on is stored without it.
     redact = getattr(client, "redact", None)
@@ -129,6 +145,7 @@ def authenticate_with_app_key(client, init, timeout, argv, agent_id="", log=lamb
         raise AuthUnconfirmed("authenticate: no answer, so this process's account is unknown") from None
     except AcpError as e:   # agy answered with an error: an explicit refusal, and the sign-in still works
         log("Gemini API key from the app not accepted (%s); staying on the Google sign-in" % type(e).__name__)
+        report(REJECTED)
         return False
     except Exception as e:  # noqa: BLE001 - a broken pipe and the like: unknown too
         log("Gemini API key from the app: authenticate failed (%s); this agy is not used" % type(e).__name__)
@@ -136,6 +153,7 @@ def authenticate_with_app_key(client, init, timeout, argv, agent_id="", log=lamb
     finally:
         key = None
     log("using the Gemini API key saved in the app for this agent")
+    report(USED)
     return True
 
 
