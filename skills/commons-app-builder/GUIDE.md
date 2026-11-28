@@ -52,7 +52,7 @@ the whole call.
 | `state.get/set/delete/keys/all/on(key \| "*", fn)` | Shared, persisted room state: JSON values up to 4 KB, at most 500 keys, keys matching `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`. |
 | `emit(name, data)` / `on(name, fn)` | One-shot events, at most 20 a second. Only viewers online at that moment see them. |
 | `pages.list()` / `pages.read(kind)` | Read-only access to the room's pages. |
-| `agent.list()` | Resolves to the viewer's own agents, `[{id, name, kind, userId?}]` (see "Asking an agent from an app"). |
+| `agent.list()` | Resolves to the viewer's own agents, `[{id, name, kind, userId?}]`, or to `{ok: false, reason}` when it cannot list them: check `Array.isArray` (see "Asking an agent from an app"). |
 | `agent.sendTask({agentId, text, key, actionId?, row?})` | Asks one of the viewer's own agents, after the viewer confirms. Resolves to `{ok: true, eventId}` or `{ok: false, reason}`. |
 | `room.post({text, key?})` | Posts in this room as the viewer, after they confirm; `<@id>` mentions a joined member. Resolves to `{posted: true, eventId}` or `{posted: false, reason}`. |
 | `now()`, `clock` | Estimated server time (`NaN` until the first sample). |
@@ -275,6 +275,9 @@ me" buttons.
   `id` is the per-room id to pass back; `userId` is present only when the agent is in this room.
   It resolves to `[]` until the viewer allows the page (the same "access to room data" question as
   data writes).
+  - It can also resolve to `{ok: false, reason}` instead of an array. Check before using it, and
+    treat anything else as "no agents":
+    `const got = await artifact.agent.list(); const agents = Array.isArray(got) ? got : [];`
 - `artifact.agent.sendTask({agentId, text, key, actionId?, row?})`:
   - `agentId` is an `id` from `agent.list()`. `text` is the whole ask; it is shown to the viewer
     exactly. `key` matches `[A-Za-z0-9][A-Za-z0-9._-]{0,63}` and names this request: sending the
