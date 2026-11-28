@@ -225,6 +225,33 @@ def resume_outcome(rc: int) -> int:
     return EXIT_RESUME_NOT_APPLIED
 
 
+def room_tools_session(old: dict, values: dict, session_id: str, kept: str, resume: str, live_server, stop_cmd: str,
+                       mint=None) -> dict:
+    """Which conversation may carry the AG2 Space tools: only one started for them, with no earlier turn of any
+    sender in it. {SESSION_ID?, ROOM_TOOLS_SESSION, EARLIER_SESSION_ID}: an install that turns the tools on
+    starts a new conversation (the earlier one stays on disk, named by EARLIER_SESSION_ID, and is never given
+    the tools); while the old session is not proven gone, or when the owner names a conversation to resume,
+    the tools stay off and the command says so."""
+    earlier = old.get("EARLIER_SESSION_ID") or ""
+    if not (values.get("MCP_PROXY_COMMAND") and values.get("TOKEN_ENV_FILE")):
+        return {"ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": earlier}
+    if kept and kept == (old.get("ROOM_TOOLS_SESSION") or ""):
+        return {"ROOM_TOOLS_SESSION": kept, "EARLIER_SESSION_ID": earlier}
+    if not kept:        # a conversation minted by this install: nobody has spoken in it
+        return {"ROOM_TOOLS_SESSION": session_id, "EARLIER_SESSION_ID": earlier}
+    if resume and kept == resume:
+        print(f"NOTE mcp: the AG2 Space tools are not given to a conversation that already has history ({resume}); "
+              "it runs without them")
+        return {"ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": earlier}
+    if live_server():
+        print(f"NOTE mcp: the AG2 Space tools start with a new conversation, and the old session ({kept}) is not "
+              f"proven gone: it runs on without them; stop the job ({stop_cmd}), then install again")
+        return {"ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": earlier}
+    fresh = (mint or mint_session_id)()
+    print(f"starting a new conversation for the AG2 Space tools; the earlier one ({kept}) is kept, without them")
+    return {"SESSION_ID": fresh, "ROOM_TOOLS_SESSION": fresh, "EARLIER_SESSION_ID": kept}
+
+
 def install(args) -> int:
     _UNAPPLIED.clear()
     return resume_outcome(_install(args))
@@ -296,7 +323,8 @@ def _install(args) -> int:
               inbox.ALLOW_COLLABORATOR: "0" if args.collaborator == "0" else "1", "AGENT_ID": agent_id, "BRIDGE": mode,
               "TOKEN_ENV_FILE": where["token_file"],
               "TOKEN_VAULT_KEY": vault_key(segment) if mode not in (UNIT, EXTERNAL) and not where["token_file"] else "",
-              "BRIDGE_STATE_DIR": str(state), "TMUX": tmux, "MCP_PROXY_COMMAND": proxy}
+              "BRIDGE_STATE_DIR": str(state), "TMUX": tmux, "MCP_PROXY_COMMAND": proxy, "ROOM_TOOLS_SESSION": "",
+              "EARLIER_SESSION_ID": ""}
     if proxy and not where["token_file"]:
         print("NOTE mcp: --mcp-proxy-command acts as the agent through its own token file; this install has none "
               "(--token-env-file), so the session gets no AG2 Space tools")
@@ -334,7 +362,9 @@ def _install(args) -> int:
             kept = resume
             print(f"resuming the existing conversation {resume}")
         session_id = kept or mint_session_id()
-        return dict(values, SESSION_ID=session_id)
+        return dict(values, SESSION_ID=session_id,
+                    **room_tools_session(old or {}, values, session_id, kept, resume, live_server, cm.stop_command(local)))
+
     def installed() -> int:
         rc = cm.install(local, values, root, root_id=getattr(args, "root_identity", None), revise=revise,
                         precheck=lambda r: inbox.root_problem(r) or records.agent_problem(r, agent_id),

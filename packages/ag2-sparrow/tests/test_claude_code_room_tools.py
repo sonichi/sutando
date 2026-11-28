@@ -71,7 +71,8 @@ class RoomToolsArgv(unittest.TestCase):
         self.config_dir.mkdir()
         self.token = token_file(self.d)
         self.cfg = {"MCP_PROXY_COMMAND": PROXY, "TOKEN_ENV_FILE": self.token, "AGENT_ID": AGENT,
-                    "CLAUDE_CONFIG_DIR": str(self.config_dir), "ROOT": str(self.root)}
+                    "CLAUDE_CONFIG_DIR": str(self.config_dir), "ROOT": str(self.root),
+                    "SESSION_ID": SESSION_ID, "ROOM_TOOLS_SESSION": SESSION_ID}
         self.runs, self.lines = [], []
         self.desc = dict(DESC, env_file=self.token)
         self.rc = 0
@@ -135,6 +136,52 @@ class RoomToolsArgv(unittest.TestCase):
         self.assertEqual(Path(self.state / hold_mod.MCP_CONFIG_NAME).read_text(), first, "the same server entry")
         self.assertNotEqual((self.state / mcp_stdio.SHIM_NAME).read_text(), shim, "a fresh turn id for the shim")
         self.assertEqual(len(self.runs), 2)
+
+    def test_only_the_conversation_started_for_the_tools_gets_them(self):
+        other = "11111111-2222-4333-8444-555555555555"
+        for cfg in (dict(self.cfg, ROOM_TOOLS_SESSION=""), dict(self.cfg, ROOM_TOOLS_SESSION=other),
+                    {k: v for k, v in self.cfg.items() if k != "ROOM_TOOLS_SESSION"}):
+            self.assertEqual(self.argv(cfg), [], cfg.get("ROOM_TOOLS_SESSION"))
+            self.assertIn("this conversation was not started for them", self.lines[-1])
+        self.assertEqual(self.runs, [], "an older, shared conversation never reaches the token exchange")
+        with mock.patch.object(hold_mod, "exchange_run", self.exchange):
+            started_as_another = hold_mod.room_tools_argv(self.cfg, str(self.root), str(self.root / "tasks"),
+                                                          log=self.lines.append, session_id=other)
+        self.assertEqual(started_as_another, [], "the pane's own session id is the one checked")
+        self.assertTrue(hold_mod.tools_session(self.cfg) and hold_mod.tools_session(self.cfg, SESSION_ID))
+
+    def test_install_starts_a_new_conversation_for_the_tools_and_keeps_the_earlier_one_without_them(self):
+        from ag2_sparrow.adapters.claude_code import cli as cc
+        on = {"MCP_PROXY_COMMAND": PROXY, "TOKEN_ENV_FILE": self.token}
+        old_id, new_id = SESSION_ID, "99999999-2222-4333-8444-555555555555"
+
+        def decide(old, values, session_id, kept, resume="", live=None):
+            said = io.StringIO()
+            with contextlib.redirect_stdout(said):
+                got = cc.room_tools_session(old, values, session_id, kept, resume, lambda: live, "stop it",
+                                            mint=lambda: new_id)
+            return got, said.getvalue()
+        # No proxy, or no token file of the agent's own: no tools session.
+        for values in ({}, {"MCP_PROXY_COMMAND": PROXY}, {"TOKEN_ENV_FILE": self.token}):
+            self.assertEqual(decide({}, values, old_id, old_id)[0], {"ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": ""})
+        # A first install: the conversation it minted is the tools'.
+        self.assertEqual(decide({}, on, old_id, "")[0], {"ROOM_TOOLS_SESSION": old_id, "EARLIER_SESSION_ID": ""})
+        # The tools turned on for an agent that already has a conversation: a new one, the earlier kept.
+        got, said = decide({"SESSION_ID": old_id}, on, old_id, old_id)
+        self.assertEqual(got, {"SESSION_ID": new_id, "ROOM_TOOLS_SESSION": new_id, "EARLIER_SESSION_ID": old_id})
+        self.assertIn("the earlier one (%s) is kept, without them" % old_id, said)
+        # Installed again: the tools' conversation stays, and so does the record of the earlier one.
+        again = {"SESSION_ID": new_id, "ROOM_TOOLS_SESSION": new_id, "EARLIER_SESSION_ID": old_id}
+        self.assertEqual(decide(again, on, new_id, new_id)[0], {"ROOM_TOOLS_SESSION": new_id, "EARLIER_SESSION_ID": old_id})
+        # The old session not proven gone: it runs on, without the tools, and the command says what to do.
+        got, said = decide({"SESSION_ID": old_id}, on, old_id, old_id, live=4242)
+        self.assertEqual(got, {"ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": ""})
+        self.assertIn("not proven gone", said)
+        self.assertIn("stop it", said)
+        # A conversation the owner names to resume has history: never given the tools.
+        got, said = decide({}, on, old_id, old_id, resume=old_id)
+        self.assertEqual(got, {"ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": ""})
+        self.assertIn("already has history", said)
 
     def test_a_recorded_proxy_whose_executable_is_gone_is_said_and_offers_nothing(self):
         gone = shlex.join([str(self.d / "moved" / "node"), "/app/ag2-mcp-proxy.mjs"])
@@ -282,6 +329,8 @@ class HoldLaunch(ConnectBase):
         self.token = token_file(self.home)
 
     def started(self, rc=0, **over):
+        if over.get("MCP_PROXY_COMMAND"):
+            over.setdefault("ROOM_TOOLS_SESSION", SESSION_ID)      # the conversation install started for the tools
         self.configure(TOKEN_ENV_FILE=self.token, AGENT_ID=AGENT, **over)
         code, _, err = self.hold_cmd(patch=HOLD_PATCH % (DESC, self.token, rc))
         self.assertEqual(code, 0, err)
@@ -337,19 +386,25 @@ class IsolatedTurnHasNoMcp(ConnectBase):
         self.assertFalse((self.work / "state" / "room-tools").exists(), "nothing of the room tools was built")
 
 
-class CollaboratorTurnsGetNoRoomTools(ConnectBase):
-    """The owner and attested collaborators share the one session, so its tools are gated at the shim, per call:
-    while a collaborator's task is in flight in the live session, no `tools/call` reaches the server."""
+class OnlyTheOwnersSessionHasRoomTools(ConnectBase):
+    """The tools belong to a session started for them, which only the owner's tasks enter. A collaborator's task
+    is answered outside it, with no session and no tools; a session from before (other senders' turns in its
+    history) never gets them; and each call still needs a task of the owner's in flight."""
 
     CALL = {"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "room_action_execute"}}
 
     def setUp(self):
         super().setUp()
-        self.configure(MCP_PROXY_COMMAND=PROXY, TOKEN_ENV_FILE=token_file(self.home), AGENT_ID=AGENT)
+        self.stub = write_isolated_stub(self.home)
+        self.install(ROOM_TOOLS_SESSION=SESSION_ID)
         self.root = str(self.work)
         self.assertEqual(inbox.prepare_root(self.root), "")
         self.holder, _ = hold_consumer(self.work)
         self.addCleanup(unhold, self.holder)
+
+    def install(self, **over):
+        self.configure(CLAUDE=str(self.stub), MCP_PROXY_COMMAND=PROXY, TOKEN_ENV_FILE=token_file(self.home),
+                       AGENT_ID=AGENT, **over)
 
     def claim(self, task_id, tier, extra=""):
         (self.inbox / (task_id + ".txt")).write_text("id: %s\n%saccess_tier: %s\ntask: post in the room\n"
@@ -367,53 +422,71 @@ class CollaboratorTurnsGetNoRoomTools(ConnectBase):
         forward, reply = mcp_name_shim.to_server(json.dumps(self.CALL) + "\n", names, set())
         return forward is not None, (json.loads(reply)["error"]["message"] if reply else "")
 
-    def test_an_owner_turn_calls_the_tools_and_a_collaborator_turn_is_refused_at_the_shim(self):
+    def test_the_owner_calls_the_tools_and_a_collaborator_never_reaches_the_session_that_has_them(self):
         self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_NO_OWNER),
-                         "nothing in flight: finding no collaborator is not the owner's authorization")
+                         "nothing in flight: finding nobody else is not the owner's authorization")
         rc, out = self.claim("task-o", "owner")
         self.assertEqual((rc, out.get("admission")), (0, "owner"), out)
-        self.assertEqual(inbox.room_tools_refusal(self.root), "")
         self.assertEqual(self.call(), (True, ""), "the owner's own turn")
 
+        # A collaborator's task: answered on its own turn, never submitted to the session with the tools.
         rc, out = self.claim("task-c", "team", "collaborator: true\n")
-        self.assertEqual((rc, out.get("admission")), (0, "collaborator"), out)
-        self.assertEqual(inbox.room_tools_refusal(self.root), inbox.ROOM_TOOLS_OWNER_ONLY)
-        forwarded, why = self.call()
-        self.assertEqual((forwarded, why), (False, inbox.ROOM_TOOLS_OWNER_ONLY),
-                         "the same session, the same granted tool: refused while the collaborator's task is in flight")
+        self.assertEqual((rc, "admission" in out), (1, False), out)
+        self.assertIn("never submitted to this session", out["refused"])
+        run, = isolated_runs(self.home)
+        self.assertEqual(run["argv"], list(inbox.isolated.TURN_ARGV))
+        self.assertIn("--strict-mcp-config", run["argv"])
+        self.assertNotIn("--mcp-config", run["argv"])
+        self.assertFalse({k for k in run["env"] if k.startswith("AG2_MCP")}, "nothing of the tools reaches its turn")
+        self.assertTrue((self.results / "task-c.txt").exists(), "and it is answered")
+        self.assertEqual(self.call(), (True, ""), "the owner's turn, still in flight, is not closed by it")
 
-        # Its task answered (the claim settled): the owner's turn, still in flight, calls the tools again.
+        # Once the owner's own task is answered, nothing authorizes a call any more.
         lc = inbox._lifecycle(self.root)
-        lc.claims.save(dict(lc.claims.load("task-c"), phase=lifecycle.SETTLED))
-        self.assertEqual(self.call(), (True, ""))
-        # And once the owner's own task is answered, nothing authorizes a call any more.
         lc.claims.save(dict(lc.claims.load("task-o"), phase=lifecycle.PUBLISHED))
         self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_NO_OWNER))
 
-    def test_a_collaborator_alone_is_refused_as_a_collaborator_not_as_no_owner(self):
+    def test_a_collaborator_alone_authorizes_nothing(self):
         rc, out = self.claim("task-c", "team", "collaborator: true\n")
-        self.assertEqual((rc, out.get("admission")), (0, "collaborator"), out)
-        self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_OWNER_ONLY))
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_NO_OWNER))
 
-    def test_a_restricted_senders_isolated_turn_does_not_close_the_owners_tools(self):
-        stub = write_isolated_stub(self.home)
-        self.configure(CLAUDE=str(stub), MCP_PROXY_COMMAND=PROXY, TOKEN_ENV_FILE=token_file(self.home), AGENT_ID=AGENT)
+    def test_a_session_from_before_the_tools_keeps_its_collaborators_and_never_gets_a_call_through(self):
+        for recorded in ("", "11111111-2222-4333-8444-555555555555"):
+            with self.subTest(recorded=recorded):
+                self.install(ROOM_TOOLS_SESSION=recorded)
+                self.assertFalse(inbox.owner_only_session())
+                tag = "new" if recorded else "old"
+                rc, out = self.claim("task-c-" + tag, "team", "collaborator: true\n")
+                self.assertEqual((rc, out.get("admission")), (0, "collaborator"), "as before: in the shared session")
+                rc, out = self.claim("task-o-" + tag, "owner")
+                self.assertEqual((rc, out.get("admission")), (0, "owner"), out)
+                self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_NOT_OWNERS),
+                                 "even on the owner's turn: this session may hold other senders' history")
+                cfg = cli.read_config(cli.config_path())
+                self.assertEqual(hold_mod.room_tools_argv(cfg, self.root, str(self.inbox), log=lambda line: None), [])
+        self.assertEqual(isolated_runs(self.home), [], "no collaborator was moved off the shared session")
+
+    def test_a_restricted_sender_authorizes_nothing_and_does_not_close_the_owners_turn(self):
         rc, out = self.claim("task-g", "guest")
         self.assertEqual(rc, 1, out)
-        self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_NO_OWNER), "a restricted sender authorizes nothing")
+        self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_NO_OWNER))
         rc, out = self.claim("task-o", "owner")
         self.assertEqual(rc, 0, out)
-        self.assertEqual(self.call(), (True, ""), "and its isolated turn never closes the owner's own")
+        self.assertEqual(self.call(), (True, ""))
 
     def test_what_cannot_be_checked_refuses(self):
-        rc, out = self.claim("task-c", "team", "collaborator: true\n")
+        rc, out = self.claim("task-o", "owner")
         self.assertEqual(rc, 0, out)
-        (self.inbox / "task-c.txt").unlink()
+        (self.inbox / "task-o.txt").unlink()
         self.assertEqual(inbox.room_tools_refusal(self.root), inbox.ROOM_TOOLS_NO_OWNER,
-                         "a task file already gone is an answered task: not a collaborator's turn, and no owner's")
-        (self.inbox / "task-c.txt").mkdir()
+                         "a task file already gone is an answered task")
+        (self.inbox / "task-o.txt").mkdir()
         self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_UNREAD))
-        (self.inbox / "task-c.txt").rmdir()
+        (self.inbox / "task-o.txt").rmdir()
+        cli.config_path().write_text("not a config\n")
+        self.assertFalse(inbox.owner_only_session(), "an unreadable config is not the tools' session")
+        self.install(ROOM_TOOLS_SESSION=SESSION_ID)
         unhold(self.holder)
         self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_NO_SESSION), "no live session holds the root")
 
@@ -426,8 +499,6 @@ class CollaboratorTurnsGetNoRoomTools(ConnectBase):
         self.assertEqual(verb(), (0, {"allowed": False, "why": inbox.ROOM_TOOLS_NO_OWNER}))
         self.claim("task-o", "owner")
         self.assertEqual(verb(), (0, {"allowed": True, "why": ""}))
-        self.claim("task-c", "team", "collaborator: true\n")
-        self.assertEqual(verb(), (0, {"allowed": False, "why": inbox.ROOM_TOOLS_OWNER_ONLY}))
 
     def test_a_gate_that_cannot_answer_refuses(self):
         def gated(raw, run):
@@ -453,7 +524,6 @@ class CollaboratorTurnsGetNoRoomTools(ConnectBase):
 
     def test_a_shim_without_the_gate_is_unchanged_for_the_other_connectors(self):
         self.assertIsNone(mcp_name_shim.turn_gate({}))
-        self.claim("task-c", "team", "collaborator: true\n")
         names = mcp_name_shim.Names({"room.action.execute"})
         names.rename_tools([{"name": "room.action.execute"}])
         forward, reply = mcp_name_shim.to_server(json.dumps(self.CALL) + "\n", names, set())

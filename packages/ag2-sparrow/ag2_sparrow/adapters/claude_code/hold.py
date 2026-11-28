@@ -179,8 +179,8 @@ def claude_argv(cfg: dict, session_id: str) -> list:
 # `--mcp-config` file live in one directory of the root's state (task_lifecycle.STATE_OPTIONAL_DIRS names it).
 ROOM_TOOLS_DIR = ("state", "room-tools")
 MCP_CONFIG_NAME = "ag2-mcp-config.json"
-# What the shim grants the session. Collaborators' turns run in it too, so the shim's turn gate (GATE_ENV)
-# refuses every call while a collaborator's task is in flight: the tools are the owner's turns' only.
+# What the shim grants the session started for the tools (tools_session): only the owner's tasks enter it, and
+# the shim's turn gate (GATE_ENV) still forwards a call only while one of them is in flight.
 ROOM_TOOLS = mcp_auth.OWNER_TOOLS
 # The descriptor's token exchange runs before the session starts: well inside the launcher's wait for its
 # consumer (launcher.CONSUMER_WAIT_S, 30 s), so a slow relay costs the tools, never the session.
@@ -240,7 +240,14 @@ def gate_argv(root: str) -> list:
     return [sys.executable, "-I", "-c", code, "inbox", "--root", root, "room-tools"]
 
 
-def room_tools_argv(cfg: dict, root: str, cwd: str, entry=None, log=None) -> list:
+def tools_session(cfg: dict, session_id=None) -> bool:
+    """Whether `session_id` (default: the configured one) is the conversation install started for the room
+    tools: only the owner's tasks ever enter it (inbox.claim), and it has no history from before."""
+    mine = cfg.get("SESSION_ID") or "" if session_id is None else session_id
+    return bool(mine) and mine == (cfg.get("ROOM_TOOLS_SESSION") or "") and mine == (cfg.get("SESSION_ID") or "")
+
+
+def room_tools_argv(cfg: dict, root: str, cwd: str, entry=None, log=None, session_id=None) -> list:
     """`--mcp-config <file>` adding the ag2-space MCP server as this agent to the session, or []: with no
     MCP_PROXY_COMMAND (an install from before it, or the desktop passed none), no TOKEN_ENV_FILE of the agent's
     own, an `ag2-space` server the agent's Claude Code config already has (kept; ours would shadow or merge
@@ -252,6 +259,10 @@ def room_tools_argv(cfg: dict, root: str, cwd: str, entry=None, log=None) -> lis
         return []
     if not token_file:
         log("ag2-space MCP tools not offered: no TOKEN_ENV_FILE (the agent's own token file)")
+        return []
+    if not tools_session(cfg, session_id):
+        log("ag2-space MCP tools not offered: this conversation was not started for them (it may hold other "
+            "senders' turns); install again with --mcp-proxy-command once the job is stopped")
         return []
     try:
         # Recorded at install: an app update can move the bundled node, and the server would then fail to
@@ -276,8 +287,8 @@ def room_tools_argv(cfg: dict, root: str, cwd: str, entry=None, log=None) -> lis
         if got is None:
             log("ag2-space MCP tools not offered: " + why)
             return []
-        # The session is shared with attested collaborators: the shim runs `inbox room-tools` before every call
-        # and forwards none while a collaborator's task is in flight.
+        # Defence in depth beside the owner-only session: the shim runs `inbox room-tools` before every call and
+        # forwards it only while a task of the owner's is in flight here.
         gate = {"name": mcp_name_shim.GATE_ENV, "value": json.dumps(gate_argv(os.path.abspath(root)))}
         got = dict(got, env=list(got["env"]) + [gate])
         path = write_mcp_config(state, got)
@@ -386,7 +397,8 @@ def _held(root, cfg, session_id, nonce, env, popen, state) -> int:
         if picked:
             print("hold: starting on %s, the model picked while the session could not switch" % picked, file=sys.stderr)
         # Last: --mcp-config takes every word after it, and nothing positional follows.
-        argv = claude_argv(cfg, session_id) + room_tools_argv(cfg, root, os.path.join(root, "tasks"))
+        argv = claude_argv(cfg, session_id) + room_tools_argv(cfg, root, os.path.join(root, "tasks"),
+                                                                session_id=session_id)
         child, pipe["go_w"] = spawn_shim(argv, child_env(env, inode), popen)
         return child
 
