@@ -166,7 +166,8 @@ class ConnectorTest(unittest.TestCase):
         sent = []
         connector_cards.Poster(self.bridge_state(), lambda p: sent.append(p) or {"ok": True, "event_id": event},
                                log=lambda line: None).sweep()
-        return sent
+        # A tapped card left pointing to its answer below is not a card shown: only the answers are.
+        return [p for p in sent if p["extra_content"]["space.ag2.card"].get("text") != connector_cards.ANSWERED_BELOW]
 
     def set_model_calls(self):
         return [r["params"] for r in self.w.records() if r.get("method") == "session/set_model"]
@@ -221,11 +222,11 @@ class ConnectorTest(unittest.TestCase):
         self.w.serve()
         self.assertEqual(self.post_queued(), [], "told once")
         self.assertNotIn("model_switch", self.w.metrics()[-1])
-        # One card: the answer to the tap and the outcome are each shown in place of the menu tapped.
-        self.assertEqual([(c["op"], c.get("event_id")) for c in (coming, told)], [("edit", "$card1")] * 2)
+        # The answer to the tap is posted under it; the outcome then replaces that answer, not a second card.
+        self.assertEqual([(c["op"], c.get("event_id")) for c in (coming, told)], [("message", None), ("edit", "$card2")])
         self.assertEqual((waiting["id"], done["id"], card["id"]), (model_switch.NOTE, model_switch.NOTE, model_switch.CARD))
         # The menu's buttons are gone from that card: a tap from a client still showing them switches
-        # nothing and shows a fresh menu in the same place, and that menu acts.
+        # nothing and shows a fresh menu where its answer went, and that menu acts.
         again = card["buttons"][0]["reply"]
         self.dm_task("task-5", again, reply_to="$card1", click=again)
         self.w.serve()
@@ -233,14 +234,14 @@ class ConnectorTest(unittest.TestCase):
                          ("[no-send] the model card answers\n", "model-card-expired"))
         (fresh,) = self.post_queued("$card4")
         self.assertEqual(((fresh["op"], fresh["event_id"]), fresh["extra_content"]["space.ag2.card"]["id"],
-                          len(fresh["extra_content"]["space.ag2.card"]["buttons"])), (("edit", "$card1"), model_switch.CARD, 2))
+                          len(fresh["extra_content"]["space.ag2.card"]["buttons"])), (("edit", "$card2"), model_switch.CARD, 2))
         self.assertEqual(json.loads((self.w.root / "state" / "model.json").read_text())["wanted"], "claude-opus-4-6-thinking")
-        self.dm_task("task-6", again, reply_to="$card1", click=again)
+        self.dm_task("task-6", again, reply_to="$card2", click=again)
         self.w.serve()
         self.assertEqual(self.w.metrics()[-1]["card"], "model-picked")
         self.assertEqual(json.loads((self.w.root / "state" / "model.json").read_text())["wanted"], "gemini-3.8-flash-medium")
         (back,) = self.post_queued("$card5")
-        self.assertEqual((back["op"], back["event_id"]), ("edit", "$card1"))
+        self.assertEqual((back["op"], back.get("event_id")), ("message", None), "answered under the tap")
         self.assertIn("Switching to Gemini 3.8 Flash on your next message", back["extra_content"]["space.ag2.card"]["text"])
         # A newer menu is a new card; with the bridge down a tap on the old one is answered in words, and
         # another sender's tap is refused as before and gets no card.
