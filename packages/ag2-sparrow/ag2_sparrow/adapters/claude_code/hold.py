@@ -299,6 +299,25 @@ def room_tools_argv(cfg: dict, root: str, cwd: str, entry=None, log=None, sessio
     return ["--mcp-config", path]
 
 
+TOOLS_MARK = ROOM_TOOLS_DIR + ("session.json",)
+
+
+def mark_tools_generation(root, pid=None, session_id="", start_time=None) -> bool:
+    """Record that the session process `pid` (with its start time) was started with the room tools, so admission
+    and the gate read it from the running generation, never from a config that may have changed since. With no
+    pid: remove the mark (this start has no tools). False when it could not be written or removed."""
+    path = Path(root).joinpath(*TOOLS_MARK)
+    try:
+        if pid is None:
+            path.unlink(missing_ok=True)
+            return True
+        start = (start_time or task_io.start_time)(pid)
+        cm._write(path, json.dumps({"pid": pid, "start": start, "session_id": session_id}) + "\n", 0o600)
+        return True
+    except OSError:
+        return False
+
+
 TITLE_OFF_VAR = "CLAUDE_CODE_DISABLE_TERMINAL_TITLE"
 
 
@@ -397,9 +416,20 @@ def _held(root, cfg, session_id, nonce, env, popen, state) -> int:
         if picked:
             print("hold: starting on %s, the model picked while the session could not switch" % picked, file=sys.stderr)
         # Last: --mcp-config takes every word after it, and nothing positional follows.
-        argv = claude_argv(cfg, session_id) + room_tools_argv(cfg, root, os.path.join(root, "tasks"),
-                                                                session_id=session_id)
-        child, pipe["go_w"] = spawn_shim(argv, child_env(env, inode), popen)
+        plain = claude_argv(cfg, session_id)
+        tools = room_tools_argv(cfg, root, os.path.join(root, "tasks"), session_id=session_id)
+        child, pipe["go_w"] = spawn_shim(plain + tools, child_env(env, inode), popen)
+        # The gated child has not run yet: its generation is marked owner-only before its go byte, or it is
+        # replaced by one without the tools. A start without them clears an older mark.
+        if tools and not mark_tools_generation(root, child.pid, session_id):
+            print("hold: ag2-space MCP tools not offered: the session's owner-only mark could not be written",
+                  file=sys.stderr)
+            reap(child, pipe["go_w"])
+            tools = []
+            child, pipe["go_w"] = spawn_shim(plain, child_env(env, inode), popen)
+        if not tools and not mark_tools_generation(root):
+            print("hold: an older owner-only mark could not be removed; collaborators' tasks stay outside this "
+                  "session until it is", file=sys.stderr)
         return child
 
     def started(child):

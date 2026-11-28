@@ -130,15 +130,25 @@ def _installed_on(key, environ=None) -> bool:
         return False
 
 
-def owner_only_session(environ=None) -> bool:
-    """Whether the installed session is the one started for the AG2 Space tools (ROOM_TOOLS_SESSION is its
-    SESSION_ID): then only the owner's tasks are submitted to it. Unreadable reads as no."""
+TOOLS_MARK = ("state", "room-tools", "session.json")    # hold.mark_tools_generation writes it
+
+
+def tools_generation(root, generation) -> "bool | None":
+    """Whether the live session process `generation` ({pid, start}) was started with the AG2 Space tools: True
+    when hold's mark names exactly it, False when there is no mark or it names another process (an earlier
+    start), None when the mark is there but cannot be read. Read from the running generation, never from the
+    install config, which can change or be unreadable while the session runs on."""
+    path = os.path.join(root, *TOOLS_MARK)
     try:
-        cfg = cm.read_config(_installed_config(environ))
-    except (OSError, ValueError):
+        with open(path, encoding="utf-8") as f:
+            mark = json.load(f)
+    except FileNotFoundError:
         return False
-    mine = cfg.get("SESSION_ID") or ""
-    return bool(mine) and mine == (cfg.get("ROOM_TOOLS_SESSION") or "")
+    except (OSError, ValueError):
+        return None
+    if not isinstance(mark, dict) or not isinstance(mark.get("pid"), int):
+        return None
+    return (mark["pid"], mark.get("start")) == (generation.get("pid"), generation.get("start"))
 
 
 def allow_non_owner(environ=None) -> bool:
@@ -453,9 +463,10 @@ def claim(root, task_id) -> dict:
                 # A tap on the model card, or the owner's /model: answered here, never submitted to the session.
                 outcome = lc.complete_without_call(task_id, body, "card: %s" % carded)
                 raise Refused("%s answered by its card (%s); its answer is %s" % (task_id, carded, outcome))
-            # A session started for the room tools takes the owner's tasks only: a collaborator's is answered
-            # outside it, on the turn with no session and no tools.
-            outside = kind == task_io.RESTRICTED or (kind == task_io.COLLABORATOR and owner_only_session())
+            # A session running with the room tools takes the owner's tasks only: a collaborator's is answered
+            # outside it. A mark that cannot be read is taken as "with the tools" (never admitted on a doubt).
+            outside = kind == task_io.RESTRICTED or (kind == task_io.COLLABORATOR
+                                                     and tools_generation(root, generation) is not False)
             try:
                 attempt = lc.prepare(task_id, INTERRUPTED_BODY, mode=lifecycle.LOCAL, generation=generation)
                 if outside:
@@ -694,26 +705,27 @@ def inflight(root) -> dict:
     return {"tasks": tasks}
 
 
-ROOM_TOOLS_NO_OWNER = "no task of the owner's is in flight in this session, so no room tool is called"
-ROOM_TOOLS_NOT_OWNERS = "this session was not started for the AG2 Space tools, so no room tool is called"
+ROOM_TOOLS_NO_OWNER = "no turn of the owner's is running in this session, so no room tool is called"
+ROOM_TOOLS_NOT_OWNERS = "this session was not started with the AG2 Space tools, so no room tool is called"
 ROOM_TOOLS_NO_SESSION = "no live session holds this root, so no room tool is called"
-ROOM_TOOLS_UNREAD = "a claimed task could not be read, so no room tool is called"
+ROOM_TOOLS_UNREAD = "the session's records could not be read, so no room tool is called"
 
 
 def room_tools_refusal(root) -> str:
     """Why a room-tool call is refused right now, '' when it may go on (the name shim's turn gate runs
     `inbox room-tools` before every `tools/call`). A call needs the owner's own authorization, read from the
-    records, never assumed from finding nobody else: the installed session is the one started for the tools
-    (owner_only_session: no other sender's task is submitted to it), and a task of the owner's (its attested
-    tier) is claimed by the live generation and not yet published or settled. A claim or task that cannot be
-    read refuses; a task file already gone is an answered task. Read under claims.lock, changing nothing."""
-    if not owner_only_session():
-        return ROOM_TOOLS_NOT_OWNERS
+    records, never assumed from finding nobody else: the live session process is the one hold started with
+    the tools (tools_generation), and a turn of the owner's (the task's attested tier) is confirmed in it and
+    its answer not yet staged: TURN_CONFIRMED. A claim only prepared, being sent or already answered is not
+    that. A mark, claim or task that cannot be read refuses. Read under claims.lock, changing nothing."""
     lc = _lifecycle(root)
     try:
         generation = _generation(root)
     except Refused:
         return ROOM_TOOLS_NO_SESSION
+    marked = tools_generation(root, generation)
+    if marked is not True:
+        return ROOM_TOOLS_UNREAD if marked is None else ROOM_TOOLS_NOT_OWNERS
     live = (generation["pid"], generation.get("start"))
     with records.flocked(records.claims_lock_path(root)):
         for task_id in lc.claims.ids():
@@ -723,7 +735,7 @@ def room_tools_refusal(root) -> str:
                 return ROOM_TOOLS_UNREAD
             gen = (rec or {}).get("generation") or {}
             if not rec or rec.get("claim_mode") != lifecycle.LOCAL or (gen.get("pid"), gen.get("start")) != live \
-                    or rec.get("phase") in (lifecycle.PUBLISHED, lifecycle.SETTLED):
+                    or rec.get("phase") != lifecycle.TURN_CONFIRMED:
                 continue
             try:
                 headers, _, _ = task_io.parse_task(os.path.join(root, "tasks", task_id + ".txt"))

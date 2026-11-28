@@ -31,7 +31,8 @@ isolate_os_environ()
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from claude_code_fixtures import (  # noqa: E402
-    cli, cm, ConnectBase, hold_consumer, hold_mod, inbox, isolated_runs, SESSION_ID, unhold, write_isolated_stub,
+    AgentRootBase, cli, cm, ConnectBase, hold_consumer, hold_mod, inbox, isolated_runs, SESSION_ID, unhold,
+    write_isolated_stub,
 )
 from ag2_sparrow import mcp_auth, mcp_name_shim, mcp_stdio, task_lifecycle as lifecycle  # noqa: E402
 
@@ -367,6 +368,9 @@ class HoldLaunch(ConnectBase):
                                                "bypassPermissions", "--session-id", SESSION_ID,
                                                "--mcp-config", str(state / hold_mod.MCP_CONFIG_NAME)])
         self.assertNotIn("--strict-mcp-config", session["argv"], "the agent's own servers keep working")
+        mark = json.loads((self.work / "state" / "room-tools" / "session.json").read_text())
+        self.assertEqual((mark["pid"], mark["session_id"]), (session["pid"], SESSION_ID),
+                         "the session process itself is marked owner-only, before it runs")
         self.assertIn("ag2-space MCP tools offered", err)
         server = json.loads((state / hold_mod.MCP_CONFIG_NAME).read_text())["mcpServers"]["ag2-space"]
         self.assertEqual(server["env"]["AG2_MCP_DESCRIPTOR"], str(state / mcp_stdio.DESCRIPTOR_NAME))
@@ -411,24 +415,27 @@ class IsolatedTurnHasNoMcp(ConnectBase):
 
 
 class OnlyTheOwnersSessionHasRoomTools(ConnectBase):
-    """The tools belong to a session started for them, which only the owner's tasks enter. A collaborator's task
-    is answered outside it, with no session and no tools; a session from before (other senders' turns in its
-    history) never gets them; and each call still needs a task of the owner's in flight."""
+    """The tools belong to a session started with them, which only the owner's tasks enter. Which session that
+    is, is read from the running process (hold's mark), never from the install config. A collaborator's task is
+    answered outside it; a session started without the tools never gets a call through; and each call still
+    needs a turn of the owner's confirmed in the session."""
 
     CALL = {"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "room_action_execute"}}
 
     def setUp(self):
         super().setUp()
         self.stub = write_isolated_stub(self.home)
-        self.install(ROOM_TOOLS_SESSION=SESSION_ID)
+        self.configure(CLAUDE=str(self.stub), MCP_PROXY_COMMAND=PROXY, TOKEN_ENV_FILE=token_file(self.home),
+                       AGENT_ID=AGENT, ROOM_TOOLS_PREVIEW="1", ROOM_TOOLS_SESSION=SESSION_ID)
         self.root = str(self.work)
         self.assertEqual(inbox.prepare_root(self.root), "")
         self.holder, _ = hold_consumer(self.work)
         self.addCleanup(unhold, self.holder)
 
-    def install(self, **over):
-        self.configure(CLAUDE=str(self.stub), MCP_PROXY_COMMAND=PROXY, TOKEN_ENV_FILE=token_file(self.home),
-                       AGENT_ID=AGENT, **over)
+    def with_tools(self):
+        """The live session process, marked as hold marks one it started with the tools."""
+        gen = inbox._generation(self.root)
+        self.assertTrue(hold_mod.mark_tools_generation(self.root, gen["pid"], SESSION_ID, start_time=lambda pid: gen["start"]))
 
     def claim(self, task_id, tier, extra=""):
         (self.inbox / (task_id + ".txt")).write_text("id: %s\n%saccess_tier: %s\ntask: post in the room\n"
@@ -437,6 +444,10 @@ class OnlyTheOwnersSessionHasRoomTools(ConnectBase):
         with contextlib.redirect_stdout(out):
             rc = cli.main(["inbox", "--root", self.root, "claim", task_id])
         return rc, json.loads(out.getvalue())
+
+    def phase(self, task_id, phase):
+        lc = inbox._lifecycle(self.root)
+        lc.claims.save(dict(lc.claims.load(task_id), phase=phase))
 
     def call(self):
         """(forwarded?, the error message) for one room-tool call through the shim, gated on this root."""
@@ -447,11 +458,16 @@ class OnlyTheOwnersSessionHasRoomTools(ConnectBase):
         return forward is not None, (json.loads(reply)["error"]["message"] if reply else "")
 
     def test_the_owner_calls_the_tools_and_a_collaborator_never_reaches_the_session_that_has_them(self):
+        self.with_tools()
         self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_NO_OWNER),
-                         "nothing in flight: finding nobody else is not the owner's authorization")
+                         "nothing running: finding nobody else is not the owner's authorization")
         rc, out = self.claim("task-o", "owner")
         self.assertEqual((rc, out.get("admission")), (0, "owner"), out)
-        self.assertEqual(self.call(), (True, ""), "the owner's own turn")
+        self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_NO_OWNER), "claimed, not yet a turn: a queued task is not it")
+        self.phase("task-o", lifecycle.CALLING)
+        self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_NO_OWNER), "being sent: not yet confirmed in the session")
+        self.phase("task-o", lifecycle.TURN_CONFIRMED)
+        self.assertEqual(self.call(), (True, ""), "the owner's own turn, confirmed in the session")
 
         # A collaborator's task: answered on its own turn, never submitted to the session with the tools.
         rc, out = self.claim("task-c", "team", "collaborator: true\n")
@@ -463,54 +479,94 @@ class OnlyTheOwnersSessionHasRoomTools(ConnectBase):
         self.assertNotIn("--mcp-config", run["argv"])
         self.assertFalse({k for k in run["env"] if k.startswith("AG2_MCP")}, "nothing of the tools reaches its turn")
         self.assertTrue((self.results / "task-c.txt").exists(), "and it is answered")
-        self.assertEqual(self.call(), (True, ""), "the owner's turn, still in flight, is not closed by it")
+        self.assertEqual(self.call(), (True, ""), "the owner's turn is not closed by it")
 
-        # Once the owner's own task is answered, nothing authorizes a call any more.
-        lc = inbox._lifecycle(self.root)
-        lc.claims.save(dict(lc.claims.load("task-o"), phase=lifecycle.PUBLISHED))
-        self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_NO_OWNER))
+        # The owner's answer staged: the turn is over, and nothing authorizes a call any more.
+        for over in (lifecycle.RESULT_STAGED, lifecycle.PUBLISHED, lifecycle.SETTLED):
+            self.phase("task-o", over)
+            self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_NO_OWNER), over)
 
     def test_a_collaborator_alone_authorizes_nothing(self):
+        self.with_tools()
         rc, out = self.claim("task-c", "team", "collaborator: true\n")
         self.assertEqual(rc, 1, out)
         self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_NO_OWNER))
 
-    def test_a_session_from_before_the_tools_keeps_its_collaborators_and_never_gets_a_call_through(self):
-        for recorded in ("", "11111111-2222-4333-8444-555555555555"):
-            with self.subTest(recorded=recorded):
-                self.install(ROOM_TOOLS_SESSION=recorded)
-                self.assertFalse(inbox.owner_only_session())
-                tag = "new" if recorded else "old"
-                rc, out = self.claim("task-c-" + tag, "team", "collaborator: true\n")
-                self.assertEqual((rc, out.get("admission")), (0, "collaborator"), "as before: in the shared session")
-                rc, out = self.claim("task-o-" + tag, "owner")
-                self.assertEqual((rc, out.get("admission")), (0, "owner"), out)
-                self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_NOT_OWNERS),
-                                 "even on the owner's turn: this session may hold other senders' history")
-                cfg = cli.read_config(cli.config_path())
-                self.assertEqual(hold_mod.room_tools_argv(cfg, self.root, str(self.inbox), log=lambda line: None), [])
-        self.assertEqual(isolated_runs(self.home), [], "no collaborator was moved off the shared session")
+    def test_admission_follows_the_running_session_not_the_install_config(self):
+        # The config says tools, the running session was started without them: collaborators stay in it, as
+        # before, and no call gets through even on the owner's confirmed turn.
+        self.assertIs(inbox.tools_generation(self.root, inbox._generation(self.root)), False)
+        rc, out = self.claim("task-c1", "team", "collaborator: true\n")
+        self.assertEqual((rc, out.get("admission")), (0, "collaborator"), out)
+        rc, out = self.claim("task-o1", "owner")
+        self.phase("task-o1", lifecycle.TURN_CONFIRMED)
+        self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_NOT_OWNERS))
+        self.assertEqual(isolated_runs(self.home), [])
+
+        # The session runs with the tools; the config is then changed, and then cannot be read at all: a
+        # collaborator is still kept out of it, because the running process is what is asked.
+        self.with_tools()
+        changed = cli.config_path().read_text().replace("ROOM_TOOLS_SESSION=%s" % SESSION_ID, "ROOM_TOOLS_SESSION=''")
+        self.assertNotEqual(changed, cli.config_path().read_text())
+        cli.config_path().write_text(changed)
+        rc, out = self.claim("task-c2", "team", "collaborator: true\n")
+        self.assertEqual((rc, "admission" in out), (1, False), out)
+        self.assertIn("never submitted to this session", out["refused"])
+        self.assertEqual(len(isolated_runs(self.home)), 1)
+        cli.config_path().write_text("not a config\n")
+        rc, out = self.claim("task-c3", "team", "collaborator: true\n")
+        self.assertEqual((rc, "admission" in out), (1, False), "an unreadable config admits nobody: %s" % out)
+
+    def test_a_mark_that_cannot_be_read_keeps_collaborators_out_and_refuses_every_call(self):
+        mark = Path(self.root).joinpath(*inbox.TOOLS_MARK)
+        mark.parent.mkdir(parents=True, exist_ok=True)
+        for text in ("not json", "[]", '{"pid": "seven"}'):
+            mark.write_text(text)
+            self.assertIsNone(inbox.tools_generation(self.root, inbox._generation(self.root)), text)
+        rc, out = self.claim("task-c", "team", "collaborator: true\n")
+        self.assertEqual((rc, "admission" in out), (1, False), "never admitted on a doubt: %s" % out)
+        rc, out = self.claim("task-o", "owner")
+        self.phase("task-o", lifecycle.TURN_CONFIRMED)
+        self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_UNREAD))
+        # A mark naming an earlier process is plainly not this session's.
+        mark.write_text(json.dumps({"pid": 1, "start": "long ago", "session_id": SESSION_ID}))
+        self.assertIs(inbox.tools_generation(self.root, inbox._generation(self.root)), False)
+        self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_NOT_OWNERS))
+
+    def test_hold_marks_only_a_session_it_started_with_the_tools(self):
+        gen = inbox._generation(self.root)
+        mark = Path(self.root).joinpath(*hold_mod.TOOLS_MARK)
+        self.assertEqual(hold_mod.TOOLS_MARK, inbox.TOOLS_MARK)
+        self.with_tools()
+        self.assertEqual(stat.S_IMODE(mark.stat().st_mode), 0o600)
+        self.assertEqual(json.loads(mark.read_text()), {"pid": gen["pid"], "start": gen["start"], "session_id": SESSION_ID})
+        self.assertTrue(hold_mod.mark_tools_generation(self.root), "a start without the tools clears it")
+        self.assertFalse(mark.exists())
+        self.assertTrue(hold_mod.mark_tools_generation(self.root), "and clearing nothing is fine")
+        with mock.patch.object(hold_mod.cm, "_write", side_effect=OSError(28, "No space left on device")):
+            self.assertFalse(hold_mod.mark_tools_generation(self.root, gen["pid"], SESSION_ID), "said, never assumed")
 
     def test_a_restricted_sender_authorizes_nothing_and_does_not_close_the_owners_turn(self):
+        self.with_tools()
         rc, out = self.claim("task-g", "guest")
         self.assertEqual(rc, 1, out)
         self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_NO_OWNER))
         rc, out = self.claim("task-o", "owner")
         self.assertEqual(rc, 0, out)
+        self.phase("task-o", lifecycle.TURN_CONFIRMED)
         self.assertEqual(self.call(), (True, ""))
 
     def test_what_cannot_be_checked_refuses(self):
+        self.with_tools()
         rc, out = self.claim("task-o", "owner")
         self.assertEqual(rc, 0, out)
+        self.phase("task-o", lifecycle.TURN_CONFIRMED)
         (self.inbox / "task-o.txt").unlink()
         self.assertEqual(inbox.room_tools_refusal(self.root), inbox.ROOM_TOOLS_NO_OWNER,
                          "a task file already gone is an answered task")
         (self.inbox / "task-o.txt").mkdir()
         self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_UNREAD))
         (self.inbox / "task-o.txt").rmdir()
-        cli.config_path().write_text("not a config\n")
-        self.assertFalse(inbox.owner_only_session(), "an unreadable config is not the tools' session")
-        self.install(ROOM_TOOLS_SESSION=SESSION_ID)
         unhold(self.holder)
         self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_NO_SESSION), "no live session holds the root")
 
@@ -520,8 +576,10 @@ class OnlyTheOwnersSessionHasRoomTools(ConnectBase):
             with contextlib.redirect_stdout(out):
                 rc = cli.main(["inbox", "--root", self.root, "room-tools"])
             return rc, json.loads(out.getvalue())
+        self.with_tools()
         self.assertEqual(verb(), (0, {"allowed": False, "why": inbox.ROOM_TOOLS_NO_OWNER}))
         self.claim("task-o", "owner")
+        self.phase("task-o", lifecycle.TURN_CONFIRMED)
         self.assertEqual(verb(), (0, {"allowed": True, "why": ""}))
 
     def test_a_gate_that_cannot_answer_refuses(self):
@@ -529,8 +587,8 @@ class OnlyTheOwnersSessionHasRoomTools(ConnectBase):
             check = mcp_name_shim.turn_gate({mcp_name_shim.GATE_ENV: raw}, run=run)
             return check()
 
-        def answers(stdout):
-            return lambda argv, **kw: mock.Mock(stdout=stdout)
+        def answers(stdout, returncode=0):
+            return lambda argv, **kw: mock.Mock(stdout=stdout, returncode=returncode)
 
         def raises(error):
             def run(argv, **kw):
@@ -541,6 +599,9 @@ class OnlyTheOwnersSessionHasRoomTools(ConnectBase):
         self.assertEqual(gated(ok, answers('{"allowed": false, "why": "not now"}')), "not now")
         for stdout in ("", "not json", "[]", '{"allowed": "yes"}', '{"allowed": false}', '{"allowed": false, "why": 7}'):
             self.assertEqual(gated(ok, answers(stdout)), mcp_name_shim.GATE_UNCHECKED, stdout)
+        for code in (1, 2, -9):
+            self.assertEqual(gated(ok, answers('{"allowed": true}', code)), mcp_name_shim.GATE_UNCHECKED,
+                             "a gate that exited %s allowed nothing, whatever it printed" % code)
         for error in (OSError(2, "no such file"), subprocess.TimeoutExpired("gate", 10)):
             self.assertEqual(gated(ok, raises(error)), mcp_name_shim.GATE_UNCHECKED, error)
         for raw in ("not json", "{}", "[]", '["gate", 7]'):
@@ -552,6 +613,51 @@ class OnlyTheOwnersSessionHasRoomTools(ConnectBase):
         names.rename_tools([{"name": "room.action.execute"}])
         forward, reply = mcp_name_shim.to_server(json.dumps(self.CALL) + "\n", names, set())
         self.assertEqual((json.loads(forward)["params"]["name"], reply), ("room.action.execute", None))
+
+
+class PreviewThroughInstall(AgentRootBase):
+    """The install entry point, for an agent already installed and stopped: the proxy command alone changes
+    nothing, and the preview starts the tools' conversation, keeping the earlier one."""
+
+    def test_the_preview_starts_a_new_conversation_and_the_proxy_alone_changes_nothing(self):
+        from ag2_sparrow.adapters.claude_code import cli as cc
+        engine = self.home / "Application Support" / "engine"
+        engine.mkdir(parents=True)
+        node = engine / "node"
+        node.write_text("#!/bin/sh\n")
+        node.chmod(0o755)
+        proxy = shlex.join([str(node), str(engine / "ag2-mcp-proxy.mjs")])
+        fake = self.bridged()
+        rc, out, err = self.install_default(fake)
+        self.assertEqual(rc, 0, out + err)
+        first = self.cfg()
+        self.assertTrue(first["TOKEN_ENV_FILE"], "the agent's own token file")
+        self.assertEqual((first["ROOM_TOOLS_PREVIEW"], first["ROOM_TOOLS_SESSION"]), ("", ""))
+
+        # What an app update passes: the same conversation, no tools, nothing said about them.
+        rc, out, err = self.install_default(fake, "--mcp-proxy-command", proxy)
+        self.assertEqual(rc, 0, out + err)
+        quiet = self.cfg()
+        self.assertEqual((quiet["SESSION_ID"], quiet["ROOM_TOOLS_SESSION"], quiet["EARLIER_SESSION_ID"]),
+                         (first["SESSION_ID"], "", ""))
+        self.assertNotIn("NOTE mcp", out)
+
+        # The owner turns the preview on: a new conversation for the tools, the earlier one kept by its id.
+        rc, out, err = self.install_default(fake, "--mcp-proxy-command", proxy, "--room-tools-preview")
+        self.assertEqual(rc, 0, out + err)
+        on = self.cfg()
+        self.assertNotEqual(on["SESSION_ID"], first["SESSION_ID"])
+        self.assertTrue(cc.SESSION_ID_RE.match(on["SESSION_ID"]))
+        self.assertEqual((on["ROOM_TOOLS_SESSION"], on["EARLIER_SESSION_ID"], on["ROOM_TOOLS_PREVIEW"]),
+                         (on["SESSION_ID"], first["SESSION_ID"], "1"))
+        self.assertIn(cc.PREVIEW_NOTE, out)
+        self.assertTrue(hold_mod.tools_session(on))
+
+        # Installed again: the tools' conversation stays the session.
+        rc, out, err = self.install_default(fake, "--mcp-proxy-command", proxy, "--room-tools-preview")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.cfg()["SESSION_ID"], on["SESSION_ID"])
+        self.assertEqual(self.cfg()["ROOM_TOOLS_SESSION"], on["SESSION_ID"])
 
 
 if __name__ == "__main__":

@@ -54,7 +54,7 @@ def granted(environ=None):
 def turn_gate(environ=None, run=subprocess.run):
     """None, or the check every `tools/call` passes first: '' to forward it, else why it is refused. GATE_ENV
     holds a command (a JSON list of words) that prints one JSON object: {"allowed": true}, or `why` it is not.
-    A command that cannot run, times out or prints anything else refuses (fail closed)."""
+    A command that cannot run, times out, exits non-zero or prints anything else refuses (fail closed)."""
     raw = (os.environ if environ is None else environ).get(GATE_ENV)
     if not raw:
         return None
@@ -65,6 +65,8 @@ def turn_gate(environ=None, run=subprocess.run):
             if not (isinstance(argv, list) and argv and all(isinstance(a, str) for a in argv)):
                 raise ValueError("not a command")
             done = run(argv, capture_output=True, text=True, timeout=GATE_TIMEOUT_S, stdin=subprocess.DEVNULL)
+            if done.returncode != 0:    # whatever it printed: a gate that failed allowed nothing
+                raise ValueError("exit %s" % done.returncode)
             out = json.loads(done.stdout)
         except (OSError, ValueError, subprocess.TimeoutExpired) as e:
             note("the turn gate could not run (%s)" % type(e).__name__)

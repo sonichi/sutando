@@ -372,8 +372,11 @@ def _install(args) -> int:
             kept = resume
             print(f"resuming the existing conversation {resume}")
         session_id = kept or mint_session_id()
-        return dict(values, SESSION_ID=session_id,
-                    **room_tools_session(old or {}, values, session_id, kept, resume, live_server, cm.stop_command(local)))
+        revised = dict(values, SESSION_ID=session_id)
+        # Merged once: the tools' own conversation, when one is started, replaces the session id above.
+        revised.update(room_tools_session(old or {}, values, session_id, kept, resume, live_server,
+                                          cm.stop_command(local)))
+        return revised
 
     def installed() -> int:
         rc = cm.install(local, values, root, root_id=getattr(args, "root_identity", None), revise=revise,
