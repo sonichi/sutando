@@ -190,6 +190,23 @@ never stamps envelopes, so there is no signature to check: an `invalid`/`unsigne
 submitted like any other, and the attested tier is the only gate — hence the refusal by default and the
 hard isolation above for whoever is admitted.
 
+## Room tools (`mcp_servers.ag2-space`)
+
+With `--mcp-proxy-command` and the agent's own `--token-env-file`, the owner's DM thread gets the AG2 Space
+room tools: the desktop's stdio proxy under the name shim, acting as the agent. They, and every tool result,
+live only on a thread no collaborator's turn is ever routed to:
+
+- Tools are attached only when an owner turn (`turn_policy`'s `owner_dm`) arrives with `channel_kind: dm` in
+  the attested headers, and the channel's thread is `owner-only`. A new DM thread is written `owner-only`, so
+  a collaborator turn in that channel gets `<key>.shared` instead.
+- An owner turn on a `shared` thread (a room, or an older DM thread a collaborator may join) runs without the
+  tools: no `ag2-space` entry, no grant, no prompt hint. A thread file with no readable class line counts as
+  shared here too. Collaborator, team and guest threads never get them.
+- A collaborator turn whose channel thread is live with the tools on this server gets its own thread.
+- Defence in depth: the shim forwards a call only under a live per-turn grant (`state/ag2-mcp-grant.json`),
+  written for an owner turn on a tools thread and removed when the turn ends. A resume Codex refuses with the
+  entry is retried without it, and a start refused with it is started again without it.
+
 ## Three shapes
 
 | | 1. own app-server thread (`--server stdio`) | 2. `--push` → `codex queue` into a live TUI | 3. `codex exec resume <id> "<prompt>"` |

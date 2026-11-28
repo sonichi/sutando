@@ -57,7 +57,7 @@ NO_INTEGRATIONS = {"web_search": "disabled",
                                               "browser_use_external", "computer_use", "in_app_browser"), False)}
 
 
-# The tools the ag2-space server's shim grants a thread with integrations (owner, attested collaborator):
+# The tools the ag2-space server's shim grants the owner's DM thread, the one thread no collaborator runs on:
 # Codex keeps a thread's MCP servers for its life, so this grant must be the same for every turn on it.
 ROOM_TOOLS = mcp_auth.OWNER_TOOLS
 ROOM_TOOLS_STARTUP_S = 30       # the proxy discovers and mints before it lists; Codex's default (10 s) is tight
@@ -853,14 +853,14 @@ class Connector:
         return self.rpc.request("thread/resume", params, timeout=self.args.turn_timeout), {}
 
     def start_thread(self, caps, ephemeral, tools=None):
-        """`tools`: room_tools' answer when the caller already has it (else it is asked for here). A thread/start
+        """`tools`: room_tools' answer for the owner's DM thread (open_owner_thread), else none. A thread/start
         refused with the room tools is started again without them: they never cost the turn its thread."""
         params = dict(self.thread_params(caps), ephemeral=ephemeral)
         if not caps.integrations:
             params["config"] = self.no_integrations(params["cwd"])
             tools = {}
         else:
-            tools = self.room_tools(caps, params["cwd"]) if tools is None else tools
+            tools = tools or {}
             if tools:
                 params["config"] = tools
         if self.args.developer_instructions:
@@ -909,6 +909,8 @@ class Connector:
         or bound by --thread-id), or a thread whose file does not say it is shared."""
         if key in self.owner_only_keys or bound_thread_id(self.args.thread_id, channel_id):
             return True
+        if self.launches.get(self.live.get(key)):      # a thread opened with the room tools is never handed over
+            return True
         return os.path.exists(path) and saved_thread(path)[1] != SHARED
 
     def open_owner_thread(self, channel_id, kind="", caps=OWNER_CAPABILITIES):
@@ -926,7 +928,8 @@ class Connector:
             return
         wanted, cls = saved_thread(path)
         bound = bound_thread_id(self.args.thread_id, channel_id) if caps.owner_dm else None
-        if carried or (bound and not wanted):
+        owner_dm = caps.owner_dm and kind == "dm"      # from the attested headers: no collaborator turn is routed here
+        if carried or (bound and not wanted) or (owner_dm and not wanted):
             cls = OWNER_ONLY
         elif not wanted:
             cls = SHARED
@@ -934,8 +937,9 @@ class Connector:
         if carried:
             # Taken once whatever the resume answers: a failed one is not retried on every task.
             write_atomic(os.path.join(self.args.state, RESUME_MARKER), carried + "\n")
-        # The thread's MCP servers start when it is started or resumed on this server, with this config.
-        tools = self.room_tools(caps, self.turn_cwd(caps))
+        # The thread's MCP servers start when it is started or resumed on this server, with this config. Only the
+        # owner's DM thread kept owner-only gets them; a shared, legacy or unknown thread never does (#6915).
+        tools = self.room_tools(caps, self.turn_cwd(caps)) if owner_dm and cls == OWNER_ONLY else {}
         if wanted and not self.args.ephemeral:
             try:
                 res, tools = self.resume_thread(caps, wanted, tools)
@@ -1305,6 +1309,8 @@ class Connector:
             self.open_for(headers, caps)
             self.last_thread = self.thread_id
             turn_prompt = prompt
+            if self.launches.get(self.thread_id):        # told of the tools only on a thread that has them
+                turn_prompt += "\n\n" + mcp_stdio.ROOM_TOOLS_HINT
             if caps.workspace == "isolated":
                 # The turn reads its own folder only: this task's own attachments are copied into it.
                 staged = stage_own_attachments(headers, self.scratch_cwd, getattr(self.args, "media_root", None))
@@ -1537,8 +1543,6 @@ class Connector:
             prompt = wrap_untrusted(task_id, headers, message, operator_lines, self.note, caps=policy.capabilities)
             if headers["access_tier"] == "owner" and self.desk.hint():
                 prompt += "\n\n" + self.desk.hint()
-            if policy.capabilities.integrations and self.args.mcp_proxy_command and self.args.token_env_file:
-                prompt += "\n\n" + mcp_stdio.ROOM_TOOLS_HINT
             log("turn ->", task_id, headers["access_tier"], repr(message[:60]))
             if self.view:
                 self.view.turn("%s, %s" % (headers.get("sender_name") or headers["access_tier"], policy.kind), message)
@@ -1695,8 +1699,8 @@ def build_parser():
     ap.add_argument("--ephemeral", action="store_true", help="owner threads too: do not persist to the Codex home")
     ap.add_argument("--developer-instructions", default=None)
     ap.add_argument("--token-env-file", default=None,
-                    help="the agent's own token .env (its bridge's): with --mcp-proxy-command, the owner's and an "
-                         "attested collaborator's threads get the ag2-space MCP tools as this agent")
+                    help="the agent's own token .env (its bridge's): with --mcp-proxy-command, the owner's DM thread "
+                         "(owner-only) gets the ag2-space MCP tools as this agent")
     ap.add_argument("--agent-id", default=None, help="the agent's Matrix ID, which its token file must name")
     ap.add_argument("--mcp-proxy-command", default=None,
                     help="the stdio ag2-mcp-proxy command line (node and the desktop app's ag2-mcp-proxy.mjs) "

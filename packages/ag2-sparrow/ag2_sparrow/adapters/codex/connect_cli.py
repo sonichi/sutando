@@ -445,8 +445,8 @@ def session_options(p) -> None:
                    help="continue this Codex conversation (saved under --codex-home's sessions/) in the owner's "
                         "DM with the agent, as `codex resume <id>` does; every other room starts a new one")
     p.add_argument("--mcp-proxy-command", help="the stdio ag2-mcp-proxy command line ('<node> <the desktop app's "
-                   "engine/ag2-mcp-proxy.mjs>'), each path quoted when it has a space: the owner's and an attested "
-                   "collaborator's turns get the AG2 Space tools as this agent (needs --token-env-file; default: none)")
+                   "engine/ag2-mcp-proxy.mjs>'), each path quoted when it has a space: the owner's DM thread, which no "
+                   "collaborator uses, gets the AG2 Space tools as this agent (needs --token-env-file; default: none)")
 
 
 def agent_option(p):

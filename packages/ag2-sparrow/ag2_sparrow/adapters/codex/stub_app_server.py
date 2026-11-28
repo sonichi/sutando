@@ -11,7 +11,8 @@ same with no rate-limit window; `[[limit-words]]` fails it on another error whos
 reasoning item and part of a reply come first.
 
 `thread/resume` fails for a thread id starting `stale-`, never answers for `hang-`, and fails for `nomcp-` only
-when its config adds `mcp_servers` (a runtime refusing that override at resume).
+when its config adds `mcp_servers` (a runtime refusing that override at resume). `[[toolcall]]` records an
+ag2-space tool call and its result on the turn's thread; `[[history]]` echoes the thread's id and recorded items.
 
 `account/rateLimits/read` answers as `stub-limits` under CODEX_HOME says ("out": a window used up; "ok": usage
 left); with no such file the method is unknown.
@@ -170,7 +171,8 @@ for line in sys.stdin:
             continue
         if meth == "thread/resume" and tid.startswith("hang-"):
             continue   # never answers: the client's timeout must fall back
-        THREADS[tid] = {"cwd": p.get("cwd", "/"), "params": p, "emptied": THREADS.get(tid, {}).get("emptied")}
+        THREADS[tid] = {"cwd": p.get("cwd", "/"), "params": p, "emptied": THREADS.get(tid, {}).get("emptied"),
+                        "items": THREADS.get(tid, {}).get("items", [])}
         send({"jsonrpc": "2.0", "id": rid, "result": {"thread": thread_obj(tid), "model": p.get("model") or "stub-model",
                                                       "modelProvider": "stub", "cwd": THREADS[tid]["cwd"],
                                                       "approvalPolicy": "never", "sandbox": "read-only", "approvalsReviewer": None,
@@ -201,6 +203,11 @@ for line in sys.stdin:
             reply = "[model-card]"
         if "[[askaccount]]" in text:
             reply = "[account-card]"
+        if "[[toolcall]]" in text:
+            THREADS[tid]["items"].append({"type": "mcpToolCall", "server": "ag2-space", "tool": "room_list",
+                                          "result": "TOOL-RESULT-" + turn_id[:8]})
+        if "[[history]]" in text:
+            reply += " thread=%s history=%s" % (tid, json.dumps(THREADS[tid]["items"], sort_keys=True))
         if "[[config]]" in text:      # what the thread was started with, for a test to pin its overrides
             reply += " config=" + json.dumps(tp.get("config"), sort_keys=True)
         if "[[empty]]" in text:
