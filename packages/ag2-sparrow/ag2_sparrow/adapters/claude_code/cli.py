@@ -241,17 +241,24 @@ def room_tools_session(old: dict, values: dict, session_id: str, kept: str, resu
     earlier = old.get("EARLIER_SESSION_ID") or ""
     # A preview the owner turns on (--room-tools-preview): the proxy command alone, which the desktop app
     # records at every install and update, changes nothing.
+    was = old.get("ROOM_TOOLS_SESSION") or ""
     if not (values.get("ROOM_TOOLS_PREVIEW") == "1" and values.get("MCP_PROXY_COMMAND") and values.get("TOKEN_ENV_FILE")):
-        if not (earlier and kept and kept != earlier and not resume):
+        if not (kept and kept == was):
             return {"ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": earlier}
-        # The preview is turned off: back to the conversation from before it, once the tools' one is gone.
+        # The preview is turned off while the tools' conversation is the session: it must never become the
+        # one collaborators share, so the session leaves it, once its process is proven gone.
         if live_server():
             print(f"NOTE mcp: the room tools preview is off, and the session that had the tools ({kept}) is not "
-                  f"proven gone: it runs on without them; stop the job ({stop_cmd}), then install again to go "
-                  f"back to the earlier conversation ({earlier})")
-            return {"ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": earlier}
-        print(f"the room tools preview is off: back to the earlier conversation ({earlier}), without the tools")
-        return {"SESSION_ID": earlier, "ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": ""}
+                  f"proven gone: it stays the owner's alone, without the tools; stop the job ({stop_cmd}), then "
+                  "install again to leave it")
+            return {"ROOM_TOOLS_SESSION": was, "EARLIER_SESSION_ID": earlier}
+        if earlier:
+            print(f"the room tools preview is off: back to the earlier conversation ({earlier}), without the tools")
+            return {"SESSION_ID": earlier, "ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": ""}
+        fresh = (mint or mint_session_id)()
+        print("the room tools preview is off: a new conversation, without the tools (there was none before the "
+              f"preview); the one that had them ({kept}) is kept")
+        return {"SESSION_ID": fresh, "ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": ""}
     if kept and kept == (old.get("ROOM_TOOLS_SESSION") or ""):
         return {"ROOM_TOOLS_SESSION": kept, "EARLIER_SESSION_ID": earlier}
     print(PREVIEW_NOTE)

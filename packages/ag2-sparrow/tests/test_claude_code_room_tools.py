@@ -73,7 +73,7 @@ class RoomToolsArgv(unittest.TestCase):
         self.token = token_file(self.d)
         self.cfg = {"MCP_PROXY_COMMAND": PROXY, "TOKEN_ENV_FILE": self.token, "AGENT_ID": AGENT,
                     "CLAUDE_CONFIG_DIR": str(self.config_dir), "ROOT": str(self.root),
-                    "SESSION_ID": SESSION_ID, "ROOM_TOOLS_SESSION": SESSION_ID}
+                    "SESSION_ID": SESSION_ID, "ROOM_TOOLS_SESSION": SESSION_ID, "ROOM_TOOLS_PREVIEW": "1"}
         self.runs, self.lines = [], []
         self.desc = dict(DESC, env_file=self.token)
         self.rc = 0
@@ -150,6 +150,10 @@ class RoomToolsArgv(unittest.TestCase):
                                                           log=self.lines.append, session_id=other)
         self.assertEqual(started_as_another, [], "the pane's own session id is the one checked")
         self.assertTrue(hold_mod.tools_session(self.cfg) and hold_mod.tools_session(self.cfg, SESSION_ID))
+        # The preview off on the tools' own conversation: no tools, and still the owner's alone.
+        off = dict(self.cfg, ROOM_TOOLS_PREVIEW="")
+        self.assertEqual(self.argv(off), [])
+        self.assertEqual((hold_mod.tools_session(off), hold_mod.tools_conversation(off)), (False, True))
 
     def test_install_starts_a_new_conversation_for_the_tools_and_keeps_the_earlier_one_without_them(self):
         from ag2_sparrow.adapters.claude_code import cli as cc
@@ -171,22 +175,31 @@ class RoomToolsArgv(unittest.TestCase):
         for kept in (old_id, ""):
             self.assertEqual(decide({"SESSION_ID": old_id}, quiet, old_id, kept),
                              ({"ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": ""}, ""), kept)
-        # Turning the preview off goes back to the conversation from before it, without the tools.
+        # Turning the preview off leaves the tools' conversation: back to the one from before it.
         was_on = {"SESSION_ID": new_id, "ROOM_TOOLS_SESSION": new_id, "EARLIER_SESSION_ID": old_id}
         got, said = decide(was_on, quiet, new_id, new_id)
         self.assertEqual(got, {"SESSION_ID": old_id, "ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": ""})
         self.assertIn("back to the earlier conversation (%s), without the tools" % old_id, said)
-        # While the session that had the tools is not proven gone, it runs on without them, and the way back
-        # is said; the install after it is stopped then goes back.
+        # With none from before it (the agent was first installed with the preview): a new one, never the
+        # tools' conversation handed to everyone.
+        third = "77777777-2222-4333-8444-555555555555"
+        said = io.StringIO()
+        with contextlib.redirect_stdout(said):
+            got = cc.room_tools_session({"SESSION_ID": new_id, "ROOM_TOOLS_SESSION": new_id}, quiet, new_id, new_id, "",
+                                        lambda: None, "stop it", mint=lambda: third)
+        self.assertEqual(got, {"SESSION_ID": third, "ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": ""})
+        self.assertIn("a new conversation, without the tools", said.getvalue())
+        # While the session that had the tools is not proven gone, it stays the tools' conversation on record
+        # (so it stays the owner's alone), and the install after it is stopped leaves it.
         got, said = decide(was_on, quiet, new_id, new_id, live=4242)
-        self.assertEqual(got, {"ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": old_id})
+        self.assertEqual(got, {"ROOM_TOOLS_SESSION": new_id, "EARLIER_SESSION_ID": old_id})
+        self.assertIn("stays the owner's alone", said)
         self.assertIn("stop it", said)
-        waiting = {"SESSION_ID": new_id, "ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": old_id}
-        self.assertEqual(decide(waiting, quiet, new_id, new_id)[0],
+        self.assertEqual(decide(dict(was_on), quiet, new_id, new_id)[0],
                          {"SESSION_ID": old_id, "ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": ""})
-        # A conversation the owner names to resume is theirs to pick: it is not replaced by the earlier one.
-        self.assertEqual(decide(was_on, quiet, old_id, "33333333-2222-4333-8444-555555555555",
-                                resume="33333333-2222-4333-8444-555555555555")[0],
+        # A conversation the owner names to resume is theirs to pick.
+        named = "33333333-2222-4333-8444-555555555555"
+        self.assertEqual(decide(was_on, quiet, named, named, resume=named)[0],
                          {"ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": old_id})
         # A first install: the conversation it minted is the tools'.
         self.assertEqual(decide({}, on, old_id, "")[0], {"ROOM_TOOLS_SESSION": old_id, "EARLIER_SESSION_ID": ""})
@@ -370,6 +383,7 @@ class HoldLaunch(ConnectBase):
     def started(self, rc=0, **over):
         if over.get("MCP_PROXY_COMMAND"):
             over.setdefault("ROOM_TOOLS_SESSION", SESSION_ID)      # the conversation install started for the tools
+            over.setdefault("ROOM_TOOLS_PREVIEW", "1")
         self.configure(TOKEN_ENV_FILE=self.token, AGENT_ID=AGENT, **over)
         code, _, err = self.hold_cmd(patch=HOLD_PATCH % (DESC, self.token, rc))
         self.assertEqual(code, 0, err)
@@ -392,6 +406,21 @@ class HoldLaunch(ConnectBase):
         self.assertNotIn(SECRET, env, "the agent's token file is not read into the session")
         self.assertFalse({k for k in session["env"] if k.startswith("AG2_MCP")}, "the proxy's env is the shim's only")
         self.assertEqual(inbox.prepare_root(str(self.work)), "", "the root starts again with state/room-tools")
+
+    def test_the_tools_conversation_with_the_preview_off_starts_without_tools_and_stays_the_owners_alone(self):
+        session, err = self.started(MCP_PROXY_COMMAND=PROXY, ROOM_TOOLS_PREVIEW="")
+        self.assertNotIn("--mcp-config", session["argv"])
+        mark = json.loads((self.work / "state" / "room-tools" / "session.json").read_text())
+        self.assertEqual(mark["pid"], session["pid"], "marked owner-only: it holds the tools' results")
+
+    def test_a_tools_conversation_that_cannot_be_marked_is_not_started(self):
+        self.configure(TOKEN_ENV_FILE=self.token, AGENT_ID=AGENT, MCP_PROXY_COMMAND=PROXY, ROOM_TOOLS_PREVIEW="1",
+                       ROOM_TOOLS_SESSION=SESSION_ID)
+        patch = HOLD_PATCH % (DESC, self.token, 0) + "hold.mark_tools_generation = lambda *a, **k: False\n"
+        code, _, err = self.hold_cmd(patch=patch)
+        self.assertNotEqual(code, 0, err)
+        self.assertIn("owner-only mark could not be written", err)
+        self.assertIsNone(self.session(), "no session ran without its mark")
 
     def test_no_proxy_command_no_mcp_config_and_a_failed_exchange_starts_without_tools(self):
         session, err = self.started()
@@ -673,6 +702,12 @@ class PreviewThroughInstall(AgentRootBase):
         self.assertEqual(self.cfg()["SESSION_ID"], on["SESSION_ID"])
         self.assertEqual(self.cfg()["ROOM_TOOLS_SESSION"], on["SESSION_ID"])
 
+        # A room tool's result lands in the tools' conversation while the preview is on.
+        transcript = Path(on["CLAUDE_CONFIG_DIR"]) / "projects" / "-tasks" / (on["SESSION_ID"] + ".jsonl")
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text(json.dumps({"type": "tool_result", "content": "room.action.execute: owner-only page"}) + "\n")
+        self.assertEqual(hold_mod.claude_argv(on, on["SESSION_ID"])[-2:], ["--resume", on["SESSION_ID"]])
+
         # The preview turned off (what the app's next update passes): the original conversation is the session
         # again, and it has no tools.
         rc, out, err = self.install_default(fake, "--mcp-proxy-command", proxy)
@@ -682,8 +717,35 @@ class PreviewThroughInstall(AgentRootBase):
                          (first["SESSION_ID"], "", "", ""))
         self.assertIn("back to the earlier conversation (%s)" % first["SESSION_ID"], out)
         self.assertFalse(hold_mod.tools_session(off))
+        self.assertFalse(hold_mod.tools_conversation(off))
+        self.assertNotEqual(off["SESSION_ID"], on["SESSION_ID"],
+                            "the conversation collaborators share again is not the one that had the tools")
+        started = hold_mod.claude_argv(off, off["SESSION_ID"])
+        self.assertNotIn(on["SESSION_ID"], started, "the session collaborators enter never resumes the preview's history")
+        self.assertEqual(started[-1], first["SESSION_ID"])
+        self.assertIn("owner-only page", transcript.read_text(), "the preview's conversation is kept on disk, untouched")
         self.assertEqual(hold_mod.room_tools_argv(off, off["ROOT"], str(Path(off["ROOT"]) / "tasks"),
                                                   log=lambda line: None), [], "started again, it gets no tools")
+
+    def test_an_agent_first_installed_with_the_preview_gets_a_new_conversation_when_it_is_turned_off(self):
+        engine = self.home / "Application Support" / "engine"
+        engine.mkdir(parents=True)
+        node = engine / "node"
+        node.write_text("#!/bin/sh\n")
+        node.chmod(0o755)
+        proxy = shlex.join([str(node), str(engine / "ag2-mcp-proxy.mjs")])
+        fake = self.bridged()
+        rc, out, err = self.install_default(fake, "--mcp-proxy-command", proxy, "--room-tools-preview")
+        self.assertEqual(rc, 0, out + err)
+        on = self.cfg()
+        self.assertEqual((on["ROOM_TOOLS_SESSION"], on["EARLIER_SESSION_ID"]), (on["SESSION_ID"], ""))
+        rc, out, err = self.install_default(fake, "--mcp-proxy-command", proxy)
+        self.assertEqual(rc, 0, out + err)
+        off = self.cfg()
+        self.assertNotEqual(off["SESSION_ID"], on["SESSION_ID"], "never the tools' conversation, shared")
+        self.assertEqual((off["ROOM_TOOLS_SESSION"], off["EARLIER_SESSION_ID"]), ("", ""))
+        self.assertIn("a new conversation, without the tools", out)
+        self.assertIn(on["SESSION_ID"], out, "the one that had them is named, and kept")
 
 
 if __name__ == "__main__":

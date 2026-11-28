@@ -240,11 +240,16 @@ def gate_argv(root: str) -> list:
     return [sys.executable, "-I", "-c", code, "inbox", "--root", root, "room-tools"]
 
 
-def tools_session(cfg: dict, session_id=None) -> bool:
+def tools_conversation(cfg: dict, session_id=None) -> bool:
     """Whether `session_id` (default: the configured one) is the conversation install started for the room
-    tools: only the owner's tasks ever enter it (inbox.claim), and it has no history from before."""
+    tools. Only the owner's tasks ever enter it, whether or not the tools are on now: it holds their results."""
     mine = cfg.get("SESSION_ID") or "" if session_id is None else session_id
     return bool(mine) and mine == (cfg.get("ROOM_TOOLS_SESSION") or "") and mine == (cfg.get("SESSION_ID") or "")
+
+
+def tools_session(cfg: dict, session_id=None) -> bool:
+    """Whether this start gets the tools: the tools' own conversation, with the preview on."""
+    return cfg.get("ROOM_TOOLS_PREVIEW") == "1" and tools_conversation(cfg, session_id)
 
 
 def room_tools_argv(cfg: dict, root: str, cwd: str, entry=None, log=None, session_id=None) -> list:
@@ -303,9 +308,9 @@ TOOLS_MARK = ROOM_TOOLS_DIR + ("session.json",)
 
 
 def mark_tools_generation(root, pid=None, session_id="", start_time=None) -> bool:
-    """Record that the session process `pid` (with its start time) was started with the room tools, so admission
-    and the gate read it from the running generation, never from a config that may have changed since. With no
-    pid: remove the mark (this start has no tools). False when it could not be written or removed."""
+    """Record that the session process `pid` (with its start time) runs the room tools' conversation, so
+    admission and the gate read it from the running generation, never from a config that may have changed
+    since. With no pid: remove the mark (another conversation). False when it could not be written or removed."""
     path = Path(root).joinpath(*TOOLS_MARK)
     try:
         if pid is None:
@@ -419,15 +424,15 @@ def _held(root, cfg, session_id, nonce, env, popen, state) -> int:
         plain = claude_argv(cfg, session_id)
         tools = room_tools_argv(cfg, root, os.path.join(root, "tasks"), session_id=session_id)
         child, pipe["go_w"] = spawn_shim(plain + tools, child_env(env, inode), popen)
-        # The gated child has not run yet: its generation is marked owner-only before its go byte, or it is
-        # replaced by one without the tools. A start without them clears an older mark.
-        if tools and not mark_tools_generation(root, child.pid, session_id):
-            print("hold: ag2-space MCP tools not offered: the session's owner-only mark could not be written",
-                  file=sys.stderr)
-            reap(child, pipe["go_w"])
-            tools = []
-            child, pipe["go_w"] = spawn_shim(plain, child_env(env, inode), popen)
-        if not tools and not mark_tools_generation(root):
+        # The gated child has not run yet. A session on the tools' conversation is marked owner-only before
+        # its go byte, with or without the tools now (it holds their results); one that cannot be marked is
+        # not started. Any other start clears an older mark.
+        if tools_conversation(cfg, session_id):
+            if not mark_tools_generation(root, child.pid, session_id):
+                reap(child, pipe["go_w"])
+                raise OSError("the session's owner-only mark could not be written, and without it a "
+                              "collaborator's task could enter the conversation that has the room tools' results")
+        elif not mark_tools_generation(root):
             print("hold: an older owner-only mark could not be removed; collaborators' tasks stay outside this "
                   "session until it is", file=sys.stderr)
         return child
