@@ -179,10 +179,8 @@ def claude_argv(cfg: dict, session_id: str) -> list:
 # `--mcp-config` file live in one directory of the root's state (task_lifecycle.STATE_OPTIONAL_DIRS names it).
 ROOM_TOOLS_DIR = ("state", "room-tools")
 MCP_CONFIG_NAME = "ag2-mcp-config.json"
-# What the shim grants the session. Claude Code keeps a session's MCP servers for its life and attested
-# collaborators' turns run in the same session (restricted senders never reach it, inbox.admit), so the grant
-# alone is not per sender: the shim's turn gate (GATE_ENV) refuses every call while a collaborator's task is in
-# flight. The tools are the owner's turns' only.
+# What the shim grants the session. Collaborators' turns run in it too, so the shim's turn gate (GATE_ENV)
+# refuses every call while a collaborator's task is in flight: the tools are the owner's turns' only.
 ROOM_TOOLS = mcp_auth.OWNER_TOOLS
 # The descriptor's token exchange runs before the session starts: well inside the launcher's wait for its
 # consumer (launcher.CONSUMER_WAIT_S, 30 s), so a slow relay costs the tools, never the session.
