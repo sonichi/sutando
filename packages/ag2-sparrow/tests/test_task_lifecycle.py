@@ -2165,6 +2165,23 @@ class BoundaryGuardTest(SpyMixin, unittest.TestCase):
                           "state/thread", "state/.thread.<tmp>", "state/metrics.jsonl",
                           "state/app-server-stub.stderr", "state/live-view.log"})
 
+    def test_the_codex_owner_dm_writes_its_owner_only_thread(self):
+        with tempfile.TemporaryDirectory() as d:
+            work = Path(d) / "work"
+            self.write_task(work, "task-a")
+            dm = work / "tasks" / "task-a.txt"
+            dm.write_text(dm.read_text().replace("priority:", "channel_kind: dm\npriority:"))
+            argv = ["--server", "stub", "--work", str(work), "--once", "1", "--poll", "0.01", "--resume-thread", "o1"]
+            with self.write_spy(work) as seen, contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(cc.main(argv), 0)
+        self.assertEqual(self.by_module(seen, os.path.join("codex", "codex_connector.py")) - LOCK_FILES,
+                         {"state", "results", "tasks", "results/<task>.txt",
+                          "results/.<task>.txt.<tmp>", "state/done", "state/.done.<tmp>", "state/threads",
+                          "state/owner-thread", "state/.owner-thread.<tmp>", "state/resume-thread-taken",
+                          "state/.resume-thread-taken.<tmp>", "state/metrics.jsonl", "state/quota-room.json",
+                          "state/quota-room.json.tmp",
+                          "state/app-server-stub.stderr", "state/live-view.log"})
+
     def strings(self, tree):
         doc = tree.body[0].value if tree.body and isinstance(tree.body[0], ast.Expr) else None
         return [n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)

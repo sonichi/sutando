@@ -455,9 +455,9 @@ def session_options(p) -> None:
     p.add_argument("--model", help="the model for every turn (default: the connector's)")
     # Codex names its rollouts in lowercase: the id is matched and resumed as such.
     p.add_argument("--resume-thread", metavar="UUID", type=str.lower,
-                   help="continue this Codex conversation (saved under --codex-home's sessions/) as the agent's "
-                        "one shared thread, from the owner's first message in any room, as `codex resume <id>` "
-                        "does; collaborators' turns then share it too, unless --no-allow-collaborator")
+                   help="continue this Codex conversation (saved under --codex-home's sessions/) in the owner's "
+                        "DM only, as `codex resume <id>` does, on an owner-only thread; it never becomes the "
+                        "shared thread that collaborators and other rooms use")
 
 
 def agent_option(p):
