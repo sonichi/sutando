@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import urllib.parse
 import uuid
+from pathlib import Path
 
 from . import card_ask, card_desk, connector_cards
 
@@ -45,6 +47,12 @@ CONTROLS = "account_controls"
 ASK_MAX = card_ask.ASK_MAX
 asks_for_card = card_ask.asks_for_account
 ANSWERED = "[no-send] the account card answers\n"
+# The account dropdown (owner 11-27: the phone works as the desktop's menu does): the saved accounts, the one in
+# use checked, then "Add account…"; a saved account's tap verb is its 16-hex key.
+MENU_ROW, ADD_ITEM, ADD_WORDS, CHECK = "Account", "Add account…", "Add account", "✓ "
+NO_ACCOUNT = "Choose an account"
+KEY_RE = re.compile(r"[0-9a-f]{16}")
+UNMATCHED = "I couldn't match that button. Send /account for a new card."
 
 
 def page_ok(url) -> bool:
@@ -93,6 +101,49 @@ def shown(email: str) -> str:
     return "%s@%s" % (name, domain) if name and at and domain and not any(c.isspace() for c in name + domain) else ""
 
 
+def use_words(email: str) -> str:
+    """What a pick of the saved account `email` sends as the owner's reply."""
+    agent_card, _ = connector_cards._core()
+    return ("Use " + email)[:agent_card.LIMITS["label"]]
+
+
+def account_menu(saved: dict, current: str, add_verb: str = "add") -> list:
+    """The card's groups for the account dropdown: one "Account" row whose menu lists `saved` (key -> address)
+    by address, the one in use (`current`) checked and not tappable, then "Add account…" (`add_verb`). At most
+    one item short of the menu's limit are listed, the one in use always among them."""
+    agent_card, _ = connector_cards._core()
+    cap, using = agent_card.LIMITS["label"], (current or "").strip().lower()
+    ranked = sorted(saved.items(), key=lambda kv: (kv[1].lower() != using, kv[1].lower()))
+    items = []
+    for key, email in sorted(ranked[:agent_card.LIMITS["menu_items"] - 1], key=lambda kv: kv[1].lower()):
+        here = bool(using) and email.lower() == using
+        # The one in use is checked and acts as nothing: no command, so no tap on it can switch.
+        items.append(agent_card.button(((CHECK if here else "") + email)[:cap], "reply", reply=use_words(email),
+                                       **({"disabled": True} if here else
+                                          {"command": agent_card.reply("account", "agent", key)})))
+    items.append(agent_card.button(ADD_ITEM, "reply", reply=ADD_WORDS,
+                                   command=agent_card.reply("account", "agent", add_verb)))
+    menu = agent_card.button((current or NO_ACCOUNT)[:cap], "menu", items=items)
+    return [{"rows": [agent_card.row(MENU_ROW, actions=[menu])]}]
+
+
+def menu_items(card) -> list:
+    """The account dropdown's items on `card` ([] for a card without one)."""
+    for grp in (card or {}).get("groups") or []:
+        for row in grp.get("rows") or []:
+            for act in row.get("actions") or []:
+                if row.get("title") == MENU_ROW and act.get("kind") == "menu":
+                    return list(act.get("items") or [])
+    return []
+
+
+def offered_on(root, event: str, key: str) -> bool:
+    """Whether the card at `event` is one this agent posted that offers saved account `key` (its issued record)."""
+    agent_card, issued_cards = connector_cards._core()
+    entry = issued_cards.live(Path(root), event) if event else None
+    return bool(entry) and agent_card.reply("account", "agent", key) in entry["offers"].values()
+
+
 # A login kept on this computer that no longer works, said apart from never having signed in.
 LAPSED = ("My sign-in here no longer works: it was signed out, or the same account was used by another copy of it on "
           "this computer, which ends this one. Sign in again.")
@@ -110,6 +161,10 @@ class AccountSwitch:
         self.remote = None
         # `switch_anywhere`: "Switch account" starts `remote`'s sign-in too, never the browser on this computer.
         self.switch_anywhere = False
+        # `saved()`: {key: address} of the accounts the desktop app saved for this agent that a pick can switch to;
+        # set, the card is the dropdown (`account_menu`) and a key's tap goes to `pick(key, sent, result_file)`.
+        self.saved = self.pick = None
+        self.in_use = ""
         self.state_dir, self.bridge_state, self.name, self.runtime = state_dir, bridge_state, name, runtime
         # `lapsed()`: the runtime itself refused this login (unauthorized even after a restart), not merely read
         # no account; asked again on every card, so an earlier answer is never carried into a later one.
@@ -160,19 +215,45 @@ class AccountSwitch:
 
     def status(self) -> tuple:
         """(the account in use in words, whether the runtime refused its login): read afresh for each card."""
+        self.in_use = ""
         try:
             label = self.read()
         except Exception as e:  # noqa: BLE001 - the card still says what it can
             self.log("account not read:", "%s: %s" % (type(e).__name__, str(e)[:200]))
             return "I could not read which account I'm signed in with.", False
+        self.in_use = label or ""
         if self.lapsed is not None and self.lapsed() is True:
             return LAPSED, True
         return ("I'm using %s." % label if label else "I'm not signed in."), False
 
-    def card(self, state: str, text: str, url: str = "", ask: bool = False, signed_out: bool = False):
+    def menu_current(self) -> str:
+        """The account in use as the dropdown names it (`status` read it); '' when none or unknown."""
+        return self.in_use
+
+    def menu_accounts(self, saved=None):
+        """The dropdown's saved accounts: `saved` when the caller read them already, else `saved()` now; None when
+        there is no dropdown (no `saved`, or it says None: nothing on this computer takes a pick)."""
+        if saved is not None or self.saved is None:
+            return saved
+        try:
+            found = self.saved()
+        except Exception as e:  # noqa: BLE001 - fail closed: the card as it is without the dropdown
+            self.log("saved accounts not read:", "%s: %s" % (type(e).__name__, str(e)[:200]))
+            return None
+        return None if found is None else dict(found)
+
+    def card(self, state: str, text: str, url: str = "", ask: bool = False, signed_out: bool = False, saved=None):
+        """The card; asked for (`ask`) with `saved` set, the dropdown of `menu_accounts(saved)` in place of the
+        "Switch account" and "Add account" buttons."""
         agent_card, _ = connector_cards._core()
-        buttons = []
-        if ask:
+        buttons, groups = [], None
+        menu = self.menu_accounts(saved) if ask else None
+        if menu is not None:
+            groups = account_menu(menu, self.menu_current())
+            if self.remote is not None and self.switch_anywhere:
+                buttons.append(agent_card.button(HERE_LABEL, "reply", reply=HERE_LABEL,
+                                                 command=agent_card.reply("account", "agent", HERE)))
+        elif ask:
             buttons.append(agent_card.button("Switch account", "reply", reply="Switch account",
                                              command=agent_card.reply("account", "agent", "switch")))
             if self.remote is not None:
@@ -186,7 +267,7 @@ class AccountSwitch:
             buttons.append(agent_card.button("Open sign-in page", "url", url=url))
         built = agent_card.build(CARD if ask else NOTE, state, title="Account", body="Account of %s" % self.name,
                                  text="%s %s" % (text, BELOW) if ask else text,
-                                 **({"buttons": buttons} if buttons else {}))
+                                 **({"buttons": buttons} if buttons else {}), **({"groups": groups} if groups else {}))
         return with_controls(built, self.runtime, signed_out=signed_out) if ask else built
 
     def say(self, room, built, result_file=None, edit: str = "") -> None:
@@ -226,6 +307,16 @@ class AccountSwitch:
         is checked, and its card built, before anything is opened or kept: a page that is not a plain
         https address is given up at once, so a retry cannot open a browser again and again."""
         room, tapped = str(sent.get("channel_id") or ""), card_desk.tapped_event(sent)
+        if self.saved is not None and KEY_RE.fullmatch(str(verb or "")):
+            return self.pick(verb, sent, result_file)
+        if self.saved is not None and verb == "switch":
+            # An older card's "Switch account": the dropdown in its place, when it has accounts to pick.
+            text, refused = self.status()
+            saved = self.menu_accounts()
+            if saved:
+                self.say(room, self.card("pending", text, ask=True, signed_out=refused, saved=saved),
+                         result_file, tapped)
+                return "account-picks"
         # A tap does not say its device, and a browser sign-in finishes only here (owner 11-27: the phone's tap
         # opened the Mac's browser): `switch_anywhere` switches with the sign-in finished on any device.
         if self.remote is not None and self.switch_anywhere and verb == "switch":

@@ -85,8 +85,9 @@ def connector_argv(cfg: dict, root: str, root_fd: int) -> list:
     --ephemeral, --developer-instructions, nor the stub or proxy server, none of which belong under a
     manager."""
     argv = [sys.executable, "-m", codex_connector.__name__, "--work", root, "--held", "--root-fd", str(root_fd),
-            "--codex", cfg["CODEX"], "--server", "stdio", "--sandbox", cfg.get("SANDBOX") or "read-only",
-            "--media-root", str(cb.bridge_state(cfg) / "remote-media")]
+            "--codex", cfg["CODEX"], "--server", "stdio",
+            *(["--agent-id", cfg["AGENT_ID"]] if cfg.get("AGENT_ID") else []),
+            "--sandbox", cfg.get("SANDBOX") or "read-only", "--media-root", str(cb.bridge_state(cfg) / "remote-media")]
     if cfg.get("ALLOW_NON_OWNER") == "0":
         argv.append("--no-allow-non-owner")
     if cfg.get("MODEL"):

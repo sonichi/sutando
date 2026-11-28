@@ -33,7 +33,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import subprocess
 import sys
 import time
@@ -43,18 +42,14 @@ from pathlib import Path
 from ... import account_switch, card_desk, claude_local_records as records, connector_cards
 from ...bounded_file_read import read_regular, unreadable
 from ...file_lock import locked_file, try_lock_fd, unlock_fd
+from ...account_request import (CLAIMED, FILE_MAX, NONCE_RE, REQUEST, RESULT, VERSION, _parsed, claim_age,  # noqa: F401
+                                 claimed, claimed_any, claims, one_line, request_nonce, usable, withdraw, write_request)
 
-REQUEST = ".ag2-switch-request.json"
-CLAIMED = ".ag2-switch-claimed-%s.json"
-RESULT = ".ag2-switch-result-%s.json"
-FILE_MAX = 16 << 10
-VERSION = 2
 PENDING = "account-remote"
 UNCLAIMED_S, GIVE_UP_S, POLL_S = 90.0, 600.0, 1.0
 STALE_CLAIM_S = 900.0       # a claim with no result this long after the request: told once as not known yet
 JUNK_REQUEST_S = 120.0      # a request file that is not a whole request, this old: never sparrow's, and stale
 LOG = "account-remote.log"
-NONCE_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
 BUSY = "A switch is already running for this agent."
 UNCLAIMED = "The app on this computer did not pick this up — is it running? Nothing was changed."
 WORKING = "Switching to %s… the app on this computer is still working on it."
@@ -140,45 +135,6 @@ def watcher_alive(root, nonce: str) -> bool:
 
 # ── the app's files ──────────────────────────────────────────────────────────────────────────────────
 
-def request_nonce(config_dir):
-    """The nonce the request file holds; '' for one that cannot be read; None for no request file."""
-    text, why = read_regular(str(Path(config_dir) / REQUEST), FILE_MAX, follow=False)
-    if text is None:
-        return "" if why else None
-    try:
-        data = json.loads(text)
-    except ValueError:
-        return ""
-    return str(data.get("nonce") or "") if isinstance(data, dict) else ""
-
-
-def claimed(config_dir, nonce: str) -> bool:
-    return os.path.lexists(str(Path(config_dir) / (CLAIMED % nonce)))
-
-
-def claim_age(config_dir, nonce: str, now=None):
-    """Seconds since the claim of `nonce` last changed; None when there is none."""
-    try:
-        at = os.lstat(str(Path(config_dir) / (CLAIMED % nonce))).st_mtime
-    except OSError:
-        return None
-    return (time.time() if now is None else now) - at
-
-
-def claims(config_dir) -> list:
-    """The nonces of the claims the app holds (each stays until the app itself answers it)."""
-    try:
-        names = os.listdir(str(config_dir))
-    except OSError:
-        return []
-    return [n[len(".ag2-switch-claimed-"):-len(".json")] for n in names
-            if n.startswith(".ag2-switch-claimed-") and n.endswith(".json")]
-
-
-def claimed_any(config_dir) -> bool:
-    return bool(claims(config_dir))
-
-
 def junk_request(config_dir, now=None):
     """The request file's (inode, mtime) when it is not a whole request (empty, unparseable, unreadable) and
     at least JUNK_REQUEST_S old: sparrow writes requests whole, so it is not one of sparrow's. None otherwise."""
@@ -218,31 +174,6 @@ def clear_junk_request(config_dir, now=None) -> bool:
         aside.unlink(missing_ok=True)
 
 
-def _parsed(text, nonce: str) -> dict:
-    try:
-        data = json.loads(text) if text else None
-    except ValueError:
-        data = None
-    if not isinstance(data, dict) or data.get("nonce") != nonce or not usable(data):
-        return {"nonce": nonce, "unreadable": True}      # not an answer: how the switch ended is not known
-    return {k: data.get(k) for k in ("nonce", "ok", "label", "error", "unknown", "verified") if k in data}
-
-
-def usable(data: dict) -> bool:
-    """Whether a receipt's answer has the contract's shape: `unknown`, when there, a bool, and true is an answer
-    by itself; else `ok` a bool, a success naming its account (`label`, a string), `verified` when there a bool.
-    A success without `verified` (an older app) is usable, and shown as not yet tried."""
-    if "unknown" in data and not isinstance(data["unknown"], bool):
-        return False
-    if data.get("unknown") is True:
-        return True
-    if not isinstance(data.get("ok"), bool):
-        return False
-    if "verified" in data and not isinstance(data["verified"], bool):
-        return False
-    return not data["ok"] or (isinstance(data.get("label"), str) and bool(data["label"].strip()))
-
-
 RETRY = "retry"     # receive(): a receipt there that could not be read or kept just now; both files stay
 
 
@@ -272,55 +203,12 @@ def receive(root, rec: dict):
     return rec
 
 
-def write_request(config_dir, key: str, nonce: str, now: float) -> None:
-    """The request, whole and owner-only, linked in only where there is none (two writers cannot both win)."""
-    path = Path(config_dir) / REQUEST
-    tmp = path.with_name("%s.%s.tmp" % (REQUEST, nonce))
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(json.dumps({"v": VERSION, "key": key, "nonce": nonce, "at": int(now)}))
-            f.flush()
-            os.fsync(f.fileno())
-        os.link(str(tmp), str(path))
-    finally:
-        tmp.unlink(missing_ok=True)
-
-
-def withdraw(config_dir, nonce: str) -> bool:
-    """Take back the request while it is still this nonce's and unclaimed: True when it was taken back."""
-    path = Path(config_dir) / REQUEST
-    aside = path.with_name("%s.withdrawn-%s" % (REQUEST, nonce))
-    try:
-        os.rename(str(path), str(aside))
-    except OSError:
-        return False        # the app claimed it meanwhile
-    try:
-        text, _ = read_regular(str(aside), FILE_MAX, follow=False)
-        try:
-            mine = isinstance(json.loads(text or ""), dict) and json.loads(text).get("nonce") == nonce
-        except ValueError:
-            mine = False
-        if not mine:
-            try:
-                os.link(str(aside), str(path))      # not ours: put back, unless a newer one is there
-            except OSError:
-                pass
-        return mine
-    finally:
-        aside.unlink(missing_ok=True)
-
-
 # ── telling the owner ────────────────────────────────────────────────────────────────────────────────
 
 def note(state: str, text: str):
     """A card with no buttons, shown in place of the account card the owner tapped."""
     agent_card, _ = connector_cards._core()
     return agent_card.build(account_switch.NOTE, state, title="Account", body="Account of Claude Code", text=text)
-
-
-def one_line(text, limit: int = 300) -> str:
-    return " ".join(str(text or "").split())[:limit]
 
 
 def current_account(rec: dict) -> str:
