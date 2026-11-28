@@ -21,6 +21,14 @@ lk = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(lk)
 
 
+def _load_notify_reviewers():
+    spec = importlib.util.spec_from_file_location(
+        "_nr_shapes", Path(lk.__file__).parent / "notify_reviewers.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def store(tmp, yaml_text=None, roster=None):
     d = Path(tmp) / "data" / "collaboration-intelligence"
     d.mkdir(parents=True)
@@ -281,6 +289,68 @@ class StoreShapes(unittest.TestCase):
         out = buf.getvalue()
         self.assertIn("gh:qingyun-wu", out, out)
         self.assertIn("reviewer on the server-PR stack", out, out)
+
+
+class AMigratedDocumentExposesNoMetadataAsAPerson(unittest.TestCase):
+    """The reader is activated on the v2 sidecar, so its reserved block matters."""
+
+    V2 = {"_schema": {"version": 2, "contract": "reserved"},
+          "x": {"github": "gh-x", "human": "X", "stand": "@sutando-x:ag2.space"}}
+
+    def test_the_reserved_schema_block_is_not_a_reviewer(self):
+        with tempfile.TemporaryDirectory() as t:
+            d = store(t, roster=self.V2)
+            ids = [r["entity_id"] for r in lk.load_roster(d)]
+            self.assertNotIn("_schema", ids, "metadata rendered as an addressable person")
+            self.assertEqual(ids, ["x"])
+
+    def test_the_metadata_rule_has_ONE_owner(self):
+        """Pin by BEHAVIOR, not source text (liususan091219 on #3537): a
+        byte-equivalent private copy would pass a text scan but diverge the
+        moment the rule moves. Patch the owner's predicate with a sentinel
+        that rejects an ordinary-looking key ("x", which does not start with
+        "_"); every reader must obey it, which only holds if each one calls
+        the owner instead of carrying its own `startswith("_")` copy."""
+        class _Sentinel:
+            @staticmethod
+            def is_person_key(key):
+                return key != "x"
+
+        roster = {"x": {"github": "gh-x"}, "y": {"github": "gh-y"}}
+        with tempfile.TemporaryDirectory() as t:
+            d = store(t, roster=roster)
+            orig_ri, lk._ri = lk._ri, (lambda: _Sentinel)
+            try:
+                ids = [r["entity_id"] for r in lk.load_roster(d)]
+            finally:
+                lk._ri = orig_ri
+        self.assertNotIn("x", ids, "lookup.py did not call the owner's predicate")
+        self.assertIn("y", ids, "the sentinel must not reject every key")
+
+        nr = _load_notify_reviewers()
+        orig_ri, nr._ri = nr._ri, (lambda: _Sentinel)
+        try:
+            actors = nr._actor_map(roster)
+        finally:
+            nr._ri = orig_ri
+        self.assertNotIn("x", actors,
+                         "notify_reviewers.py did not call the owner's predicate")
+        self.assertIn("y", actors, "the sentinel must not reject every key")
+
+    def test_the_owner_itself_is_the_only_definition(self):
+        # The negative control: the sentinel swap above must not pass because
+        # there is no real rule to delegate to -- pin that the owner defines one.
+        import pathlib as _p
+        owner = (_p.Path(lk.__file__).parent / "roster_identity.py").read_text()
+        self.assertIn("def is_person_key", owner)
+        self.assertIn('startswith("_")', owner,
+                      "the owner is where the rule is allowed to live")
+
+    def test_a_real_person_in_the_same_document_still_loads(self):
+        # The negative control: filtering must not empty the roster.
+        with tempfile.TemporaryDirectory() as t:
+            d = store(t, roster=self.V2)
+            self.assertEqual(len(lk.match(lk.load_roster(d), "gh-x")), 1)
 
 
 if __name__ == "__main__":
