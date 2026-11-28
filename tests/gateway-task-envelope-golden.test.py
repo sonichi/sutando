@@ -54,6 +54,8 @@ def _load(tmp: Path):
     spec.loader.exec_module(mod)
     mod.TASKS_DIR = tmp / "tasks"
     mod.RESULTS_DIR = tmp / "results"
+    # Every envelope renders one message; intake dedupe would fold the copies (gateway-lane-dedupe pins it).
+    mod.TASK_INTAKE_GATE = None
     mod.LOCAL_TIER = "owner"
     mod._load_tier_map = lambda: {}
     mod._reenroll_identity = lambda: "@agent-under-test:ag2.space"

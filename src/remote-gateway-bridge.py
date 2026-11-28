@@ -448,7 +448,7 @@ def _lane_dedupe_gate(task: dict):
     try:
         return lane_dedupe.duplicate_reason(WS / "state", task, GATEWAY_INSTANCE, log=_log,  # noqa: F821
                                             owner_lanes=owners, wait_s=wait_s, defer=mode["defer"],
-                                            group=group)
+                                            group=group, held=_task_held)  # noqa: F821
     except lane_dedupe.OwnerPending:
         return INTAKE_DEFER  # noqa: F821
 
