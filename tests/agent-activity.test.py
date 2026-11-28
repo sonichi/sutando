@@ -259,7 +259,7 @@ class Durable(unittest.TestCase):
         s = json.loads(lines[0])
         first = json.loads(card.log_path(self.ws).read_text().splitlines()[0])["ts"]
         self.assertEqual((s["task"], s["line"], s["room"], s["rows"], s["started"], s["ts"]),
-                         (t, "replied", "!r:s", 3, first, rec["ts"]))
+                         (dict(t, origins=["$ev"]), "replied", "!r:s", 3, first, rec["ts"]))
         self.assertEqual(s["days"], [card.day_of(rec["ts"])])
         self.assertNotIn("task-s1", card.open_task_index(self.ws), "a summarized task leaves the index")
         self.assertIn("task-s2", card.open_task_index(self.ws), "an open task stays in it")

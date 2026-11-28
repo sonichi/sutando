@@ -56,9 +56,12 @@ class Lifecycle(unittest.TestCase):
 
     def test_the_ack_generation_rides_the_turn_file_and_the_result(self):
         self._ack_with_generation(3)
-        self.relay.queue.append(_task())
+        self.relay.queue.append(_task(source_message_id="$origin"))
         proc = self.bridges.start()
         self.bridges.wait_for(lambda: self.relay.acks, proc, "the ack")
+        task_text = (self.bridges.ws / "tasks" / f"{TID}.txt").read_text()
+        self.assertIn("origin_message_ids: $origin\n", task_text)
+        self.assertIn("source_message_id: $origin\n", task_text)
         body = self.relay.ack_bodies[0]
         self.assertEqual(body["protocol_version"], 2)
         worker = body["worker_id"]
