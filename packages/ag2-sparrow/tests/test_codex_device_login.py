@@ -969,8 +969,8 @@ class SavedMenuTest(Home, CardWorld, unittest.TestCase):
         ((_, card),) = self.posted(event)
         return card
 
-    def pick(self, tid, said, event):
-        self.dm(tid, said, reply_to=event, click=said)
+    def pick(self, tid, said, event, **kw):
+        self.dm(tid, said, reply_to=event, click=said, **kw)
         self.assertEqual(run_connector(self.work, once=1, extra=["--codex", str(self.codex), "--agent-id", self.AGENT]), 0)
         return result(self.work, tid)
 
