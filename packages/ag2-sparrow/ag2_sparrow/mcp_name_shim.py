@@ -66,7 +66,9 @@ class Grant:
                 g = json.load(f)
         except (OSError, ValueError):
             return False
-        expires = g.get("expires") if isinstance(g, dict) else None
+        if not isinstance(g, dict):
+            return False
+        expires = g.get("expires")
         return (g.get("launch") == self.launch and isinstance(expires, (int, float))
                 and expires > (time.time() if now is None else now)
                 and isinstance(g.get("tools"), list) and server_name in g["tools"])

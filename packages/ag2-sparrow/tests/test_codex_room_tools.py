@@ -202,9 +202,7 @@ class RoomToolsTest(World, unittest.TestCase):
         owner, collab, guest = self.grants
         launch = mcp_stdio.launch_of(config_of(result(self.work, "task-chat-o")))
         self.assertEqual((owner["launch"], owner["tier"], set(owner["tools"])), (launch, "owner", mcp_auth.OWNER_TOOLS))
-        self.assertEqual((collab["launch"], collab["tier"]),
-                         (mcp_stdio.launch_of(config_of(result(self.work, tid))), "collaborator"))
-        self.assertNotEqual(owner["turn"], collab["turn"], "a grant per turn")
+        self.assertIsNone(collab, "a collaborator's turn gets no grant until its rooms and actions are enforced")
         self.assertGreater(owner["expires"], now)
         self.assertIsNone(guest, "a restricted turn runs with no grant")
         grant = Path(self.state()) / mcp_stdio.GRANT_NAME
@@ -356,6 +354,13 @@ class ShimTurnGrantTest(World, unittest.TestCase):
         self.assertIn("error", call(), "refused again once the turn's grant is retired")
         self.assertEqual(sess.close(), 0)
         self.assertEqual([m for m, _ in sess.got].count("tools/call"), 1, "only the call under the live grant")
+
+    def test_a_grant_that_is_not_an_object_allows_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "grant.json")
+            for data in ("[]", '"x"', "7", "null"):
+                Path(path).write_text(data)
+                self.assertFalse(shim.Grant(path, "launch-a").allows("room.list"), data)
 
     def test_grant_env_set_but_empty_allows_nothing_and_unset_keeps_the_per_launch_grant(self):
         self.assertFalse(shim.grant_of({shim.GRANT_ENV: ""}).allows("room.list"))

@@ -826,9 +826,10 @@ class Connector:
 
     def grant_room_tools(self, caps, tier):
         """This turn's grant, written before turn/start when its thread runs with the tools and the turn has
-        integrations (turn_policy: the owner, an attested collaborator); else any grant is retired. True when written."""
+        integrations and is the owner's; else any grant is retired. True when written. A collaborator's turn gets
+        none until the room tools enforce its rooms and actions downstream (review on #6915)."""
         state = getattr(self.args, "state", None)
-        launch = self.launches.get(self.thread_id) if caps.integrations and state else None
+        launch = self.launches.get(self.thread_id) if caps.integrations and tier == "owner" and state else None
         if not launch:
             if state:
                 mcp_stdio.retire_grant(state)
