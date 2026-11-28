@@ -51,6 +51,7 @@ _spec = importlib.util.spec_from_file_location("account_card", SCRIPT)
 acc = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(acc)
 ac = acc.ac
+REAL_CLAUDE_CORE_DIR = acc.claude_core_dir  # the tests' Base stands in for it; its own test calls this
 
 import connections  # noqa: E402
 
@@ -756,6 +757,53 @@ class ClaudeCoreSwitch(Base):
         rc, out, _ = self.watch({"ok": True, "verified": True}, claim=True, write_at=5.0)
         self.assertEqual((out["status"], out["say"]), ("posted", "Now using bob@work.io."))
         self.assertEqual(len(tries), 3)
+
+    def test_the_cores_claude_folder_is_the_configs_and_none_when_unresolved(self):
+        import sutando_config
+        with mock.patch.object(sutando_config, "resolve_claude_sutando_config_dir", lambda: "/x/.claude-sutando"):
+            self.assertEqual(REAL_CLAUDE_CORE_DIR(), Path("/x/.claude-sutando"))
+        with mock.patch.object(sutando_config, "resolve_claude_sutando_config_dir", side_effect=ValueError("no")):
+            self.assertIsNone(REAL_CLAUDE_CORE_DIR())
+
+    def test_withdraw_and_claims_with_nothing_there_or_a_newer_request_racing_in(self):
+        self.assertFalse(acc.withdraw_core_request(self.cdir, NONCE), "no request: nothing taken back")
+        self.assertFalse(acc.core_claims(self.cdir / "absent"))
+        acc.write_core_request(self.cdir, ckey("bob@work.io"), "other-nonce-1", 100.0)
+        with mock.patch.object(acc.os, "link", side_effect=FileExistsError("a newer one")):
+            self.assertFalse(acc.withdraw_core_request(self.cdir, NONCE))
+        self.assertEqual(sorted(os.listdir(self.cdir)), [acc.CONSUMER], "the aside copy never stays")
+
+    def test_a_request_that_cannot_be_written_changes_nothing_and_frees_the_tap(self):
+        self.post()
+        with mock.patch.object(acc, "write_core_request", side_effect=PermissionError("read-only")):
+            rc, out = self.tap("Use bob@work.io")
+        self.assertEqual((rc, out["status"], out["why"]), (1, "failed", "PermissionError"))
+        self.assertEqual(out["say"], "I couldn't start the switch. Nothing changed.")
+        self.assertEqual(self.launch.calls, [])
+        rc, out = self.tap("Use bob@work.io")
+        self.assertEqual(out["status"], "started", "the same tap may act again")
+
+    def test_a_request_taken_without_a_claim_seen_is_waited_on_for_its_answer(self):
+        # The desktop took the request and its claim came and went between two looks: withdraw finds none.
+        clock = [0.0]
+
+        def sleep(s):
+            clock[0] += s
+            if clock[0] >= 100.0:
+                (self.cdir / (acc.RESULT % NONCE)).write_text(json.dumps({"v": 2, "nonce": NONCE, "ok": True,
+                                                                          "verified": True}))
+        state, words = acc.await_core(self.cdir, NONCE, "bob@work.io", sleep=sleep, clock=lambda: clock[0])
+        self.assertEqual((state, words), ("done", "Now using bob@work.io."))
+        self.assertGreaterEqual(clock[0], 100.0)
+
+    def test_the_watcher_without_the_cores_folder_refuses(self):
+        with mock.patch.object(acc, "claude_core_dir", lambda: None):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = acc.main(["--workspace", str(self.ws), "await-core", "--room", DM, "--key",
+                               ckey("bob@work.io"), "--nonce", NONCE], core=CORE)
+        self.assertEqual((rc, json.loads(out.getvalue())["status"]), (2, "refused"))
+        self.assertEqual(self.fake.calls, [])
 
     def test_the_watcher_refuses_a_malformed_nonce(self):
         out = io.StringIO()
