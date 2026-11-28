@@ -69,6 +69,8 @@ export const HEADER_KEYS: readonly string[] = [
 	'event_type',
 	'agent_trigger_id',
 	'playbook',
+	'edit_of',
+	'edit_ts',
 	'voice_room_id',
 	'ui_origin',
 	'mentions',
