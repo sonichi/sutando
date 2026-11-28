@@ -351,12 +351,12 @@
     }
     const reason = (sent && sent.reason) || 'unknown reason';
     const unknown = /outcome unknown|timed out|unknown reason/i.test(reason);
-    // 'send outcome unknown': a retry sends nothing, so the row offers no "Send again".
+    // 'send outcome unknown' may have been sent, so the row offers no "Send again".
     const maybeSent = /send outcome unknown/i.test(reason);
     unsent.set(rowId, { agent, text, key: unknown ? key : null, reason, maybeSent });
     if (snapshot) await render(snapshot);
     if (maybeSent) {
-      show('warn', 'The task was added. It may already have been sent to ' + agent.name + ': look for it in your private DM with ' + agent.name + '. Sending it again from here would not send it.');
+      show('warn', 'The task was added. It may already have been sent to ' + agent.name + ': look for it in your private DM with ' + agent.name + '.');
       return;
     }
     show('bad', 'The task was added, but not sent to ' + agent.name + ': ' + ((sent && sent.reason) || 'unknown reason') + '. Use "Send to ' + agent.name + ' again" on its row.');

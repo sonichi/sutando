@@ -1773,7 +1773,8 @@ const AGENTS = [
     assert.match(r.text(), /retry the same request/);
   });
 }
-// 'send outcome unknown': a retry sends nothing, so the page points at the original request.
+// 'send outcome unknown' may have been sent: the page points at the original request and does
+// not ask that request again.
 {
   const b = fakeMulti({ dbs: deskDbs([{ id: 'r1', cells: { Finding: 'X', Source: 'https://x.example' } }]), primary: 'd1',
     agents: AGENTS, sendAnswer: { ok: false, reason: 'send outcome unknown' } });
@@ -1783,13 +1784,32 @@ const AGENTS = [
   check('research-desk/send-outcome-unknown-points-at-the-original-request', () => {
     assert.match(r.text(), /may already have been sent/);
     assert.match(r.text(), /private DM with your agent/);
-    assert.ok(!/Not sent|retry the same request/.test(r.text()), r.text());
+    assert.match(r.text(), /do not send it again from here/);
+    assert.ok(!/Not sent|retry the same request|will not send/.test(r.text()), r.text());
   });
   ask().click(); await settle(20);
-  check('research-desk/send-outcome-unknown-never-makes-a-new-key', () => {
-    const keys = b.calls.filter((c) => c[0] === 'sendTask').map((c) => c[1].key);
-    assert.equal(keys.length, 2);
-    assert.equal(keys[0], keys[1]);
+  check('research-desk/send-outcome-unknown-second-press-makes-no-host-call', () => {
+    assert.equal(b.calls.filter((c) => c[0] === 'sendTask').length, 1, JSON.stringify(b.calls.map((c) => c[0])));
+    assert.match(r.text(), /may already have been sent/);
+  });
+}
+// The hold is on that request only: a different topic is a new request with a new key.
+{
+  const b = fakeMulti({ dbs: deskDbs(), primary: 'd1', agents: AGENTS,
+    sendAnswer: [{ ok: false, reason: 'send outcome unknown' }, { ok: true, eventId: 't2' }] });
+  const r = await run('research-desk', { bridge: b });
+  const sends = () => b.calls.filter((c) => c[0] === 'sendTask').map((c) => c[1]);
+  r.byId.get('ask-topic').value = 'Heat pumps';
+  r.byId.get('ask-topic-go').click(); await settle(20);
+  r.byId.get('ask-topic-go').click(); await settle(20);
+  check('research-desk/send-outcome-unknown-holds-the-same-topic', () => assert.equal(sends().length, 1));
+  r.byId.get('ask-topic').value = 'Heat pumps in cold climates';
+  r.byId.get('ask-topic-go').click(); await settle(20);
+  check('research-desk/a-changed-topic-is-a-new-request-with-a-new-key', () => {
+    assert.equal(sends().length, 2);
+    assert.notEqual(sends()[0].key, sends()[1].key);
+    assert.match(sends()[1].text, /cold climates/);
+    assert.match(r.text(), /answer arrives in your private DM/);
   });
 }
 {
@@ -2056,7 +2076,7 @@ const afterFirstWrite = (calls) => (calls.some((c) => c[0] === 'createRow' || c[
     assert.equal(sends[0].key, sends[1].key);
   });
 }
-// 'send outcome unknown': a retry sends nothing, so the row points at the original task.
+// 'send outcome unknown' may have been sent: the row points at the original task.
 {
   const b = fakeMulti({ dbs: boardDbs(), primary: 'd1', agents: AGENTS,
     sendAnswer: [{ ok: false, reason: 'send outcome unknown' }, { ok: true, eventId: 't2' }] });
@@ -2068,7 +2088,7 @@ const afterFirstWrite = (calls) => (calls.some((c) => c[0] === 'createRow' || c[
   check('task-board/send-outcome-unknown-points-at-the-original-task', () => {
     assert.match(r.text(), /may already have been sent to Home Agent/);
     assert.match(r.text(), /private DM with Home Agent/);
-    assert.ok(!/not sent to Home Agent|Use "Send to/i.test(r.text()), r.text());
+    assert.ok(!/not sent to Home Agent|Use "Send to|would not send/i.test(r.text()), r.text());
   });
   b.fire('d1', { id: 'd1', name: 'Task Board — Tasks', props: TASK_PROPS,
     rows: [{ id: 'r1', cells: { Task: 'Maybe sent', Status: 'Requested' } }] });
