@@ -153,6 +153,9 @@ class Sentinels(unittest.TestCase):
                                 "the recorded child was not built from the harness file")
                 self.assertFalse(leaks(record), leaks(record))
                 self.assertEqual({e.get("SUTANDO_TELEMETRY") for e in (child, record["final_env"])}, {"0"})
+                leftovers = [p.name for pattern in ("hermetic-home-*", "hermetic-coverage-*")
+                             for p in harness.glob(pattern)]
+                self.assertEqual(leftovers, [], "the first-child hard exit leaked helper temp directories")
 
     def test_a_suite_that_stops_all_patches_reads_no_outer_selector(self):
         self.check(["tests/core-restart-heartbeat-and-cron-hold.test.py"])

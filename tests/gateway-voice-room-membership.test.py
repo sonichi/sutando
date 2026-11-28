@@ -24,7 +24,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from _helpers.hermetic_env import hermetic_env, isolate_os_environ  # noqa: E402
+from _helpers.hermetic_env import cleanup_hermetic_temp_dirs, hermetic_env, isolate_os_environ  # noqa: E402
 
 # Before anything below reads the environment: no outer credential selector survives.
 isolate_os_environ()
@@ -221,4 +221,5 @@ try:
         _cov.save()
 except Exception:
     pass
+cleanup_hermetic_temp_dirs()
 os._exit(1 if failures else 0)

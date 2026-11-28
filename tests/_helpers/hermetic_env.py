@@ -20,6 +20,7 @@ there would run at startup too.
 """
 from __future__ import annotations
 
+import atexit
 import importlib.metadata
 import json
 import importlib.util
@@ -27,6 +28,8 @@ import os
 import re
 import shutil
 import tempfile
+from multiprocessing import parent_process
+from multiprocessing.util import Finalize
 from pathlib import Path
 
 from _helpers import ORIGINAL_ENVIRON
@@ -51,6 +54,34 @@ HERMETIC_USER = "hermetic-test"
 _HARNESS_SOCKET = os.environ.get("SUTANDO_RUNTIME_SOCKET")
 _process_home: "str | None" = None
 _coverage_dirs: "dict[str, str]" = {}
+_temp_dirs: "dict[int, list[str]]" = {}
+
+
+def _cleanup_temp_dir(creator_pid: int, path: str) -> None:
+    if os.getpid() != creator_pid or path not in _temp_dirs.get(creator_pid, []):
+        return
+    _temp_dirs[creator_pid].remove(path)
+    if not _temp_dirs[creator_pid]:
+        _temp_dirs.pop(creator_pid)
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def cleanup_hermetic_temp_dirs() -> None:
+    """Remove helper-owned temporary directories created by this process."""
+    pid = os.getpid()
+    for path in reversed(tuple(_temp_dirs.get(pid, []))):
+        _cleanup_temp_dir(pid, path)
+
+
+def _temp_dir(prefix: str) -> str:
+    path = tempfile.mkdtemp(prefix=prefix)
+    pid = os.getpid()
+    _temp_dirs.setdefault(pid, []).append(path)
+    atexit.register(_cleanup_temp_dir, pid, path)
+    # Python 3.9 fork workers run multiprocessing finalizers, then os._exit(), skipping atexit.
+    if parent_process() is not None:
+        Finalize(None, _cleanup_temp_dir, args=(pid, path), exitpriority=-100)
+    return path
 
 
 def _package_location(name: str) -> "str | None":
@@ -75,7 +106,7 @@ def coverage_bootstrap(location: str) -> str:
     """A private directory holding a link to the coverage package at `location` and to each
     unconditional dependency it declares; nothing else from their install directory."""
     if location not in _coverage_dirs:
-        d = tempfile.mkdtemp(prefix="hermetic-coverage-")
+        d = _temp_dir("hermetic-coverage-")
         _link(location, d)
         try:
             requires = importlib.metadata.requires("coverage") or []
@@ -114,7 +145,7 @@ def hermetic_env(home: "Path | str | None" = None, **extra: str) -> "dict[str, s
     allowed = HOST_ALLOWLIST + MODULE_PATH_ALLOWLIST + HARNESS_ALLOWLIST + (WINDOWS_ALLOWLIST if os.name == "nt" else ())
     env = {k: v for k, v in os.environ.items() if k in allowed or k.startswith(HARNESS_PREFIX)
            or (_test_control(k) and not CREDENTIAL_NAME.search(k))}
-    env["HOME"] = str(home) if home is not None else (_process_home or tempfile.mkdtemp(prefix="hermetic-home-"))
+    env["HOME"] = str(home) if home is not None else (_process_home or _temp_dir("hermetic-home-"))
     if os.name == "nt":
         env["USERPROFILE"] = env["HOME"]
     env["USER"] = HERMETIC_USER

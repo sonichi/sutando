@@ -241,6 +241,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { $failures += 'gateway-proactive-explicit-room-without-default.test.py failed' }
           python tests/gateway-destined-proactive-not-claimed.test.py
           if ($LASTEXITCODE -ne 0) { $failures += 'gateway-destined-proactive-not-claimed.test.py failed' }
+          python tests/hermetic-env-temp-lifecycle.test.py
+          if ($LASTEXITCODE -ne 0) { $failures += 'hermetic-env-temp-lifecycle.test.py failed' }
           python src/remote-gateway-bridge.test.py
           if ($LASTEXITCODE -ne 0) { $failures += 'remote-gateway-bridge.test.py failed' }
           python tests/sparrow-outbox-claim-protocol.test.py
