@@ -3,6 +3,7 @@
 # once, also when renamed in with an old mtime, never if answered; a stale inbox does not slow it.
 set -uo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+source "$REPO/tests/fixtures/clean-watcher-env.sh"
 pass=0; fail=0
 check() { if [ "$1" = "0" ]; then echo "  ok  $2"; pass=$((pass+1)); else echo "  FAIL $2"; fail=$((fail+1)); fi; }
 
@@ -55,15 +56,20 @@ SUTANDO_WATCHER_CATCHUP_SECONDS="$CATCHUP" \
 bash "$REPO/src/watch-tasks-stream.sh" "$INBOX" --role standby --inbox "$INBOX" > "$OUT" 2>"$ERR" &
 WATCHER_PID=$!
 
-# The sentinel is stamped after the startup sweep, so anything dropped after it
-# can only be found by catch-up.
+# Subscription precedes the asynchronous sweep; wait for both before testing catch-up.
 t0=$SECONDS
 for _ in $(seq 1 1200); do
   compgen -G "$WS/state/watch-tasks-stream*.pid" > /dev/null && break
   sleep 0.1
 done
 compgen -G "$WS/state/watch-tasks-stream*.pid" > /dev/null
-check $? "the watcher subscribed (sentinel stamped after the startup sweep of $STALE stale pointers, $(( SECONDS - t0 ))s)"
+check $? "the watcher subscribed before draining $STALE stale pointers ( $(( SECONDS - t0 ))s)"
+for _ in $(seq 1 1200); do
+  [ "$(grep -c 'already answered, not dispatching again: .*task-stale' "$ERR")" = "$STALE" ] && break
+  sleep 0.1
+done
+[ "$(grep -c 'already answered, not dispatching again: .*task-stale' "$ERR")" = "$STALE" ]
+check $? "the asynchronous startup sweep has refused every stale pointer"
 stale_refusals="$(grep -c 'already answered, not dispatching again: .*task-stale' "$ERR")"
 
 # An answered task: its result is live before its pointer lands.
