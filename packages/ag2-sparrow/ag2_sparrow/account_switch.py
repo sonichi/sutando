@@ -151,8 +151,8 @@ class AccountSwitch:
     def usable(self) -> bool:
         return card_desk.usable(self.bridge_state)
 
-    def post(self, room, built, key: str = "", at_ns: int = 0, edit: str = "") -> bool:
-        return card_desk.post(self.bridge_state, room, built, self.log, key, at_ns, edit)
+    def post(self, room, built, key: str = "", at_ns: int = 0, edit: str = "", below: bool = False) -> bool:
+        return card_desk.post(self.bridge_state, room, built, self.log, key, at_ns, edit, below)
 
     def using(self) -> str:
         """The account in use, in words; a runtime that cannot say reads as unknown, never as signed out."""
@@ -192,7 +192,7 @@ class AccountSwitch:
     def say(self, room, built, result_file=None, edit: str = "") -> None:
         """Post the card (in place of the card `edit` names, when given); where it cannot be posted, a
         task's result carries its words instead."""
-        posted = self.post(room, built, edit=edit)
+        posted = self.post(room, built, edit=edit, below=bool(edit))     # an edit here answers a tap
         if result_file:
             self.publish(result_file, ANSWERED if posted else self.quoted(built[1]["text"]) + "\n")
 
@@ -217,7 +217,7 @@ class AccountSwitch:
     def expired(self, sent, result_file) -> str:
         """A tap on an account card that no longer acts: a fresh card in its place when one can be shown,
         else the words. No sign-in is started by it."""
-        fresh = self.post(sent.get("channel_id"), self.asked(), edit=card_desk.tapped_event(sent))
+        fresh = self.post(sent.get("channel_id"), self.asked(), edit=card_desk.tapped_event(sent), below=True)
         self.publish(result_file, ANSWERED if fresh else self.quoted(EXPIRED_NO_CARD) + "\n")
         return "account-card-expired"
 

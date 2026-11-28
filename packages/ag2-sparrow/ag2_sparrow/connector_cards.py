@@ -12,6 +12,13 @@ shown in place of that card: the bridge sends it as an edit of that event, so th
 whose words change, not a second card. The edit's card is recorded under the original event, the one
 the owner sees and taps. An edit the server refuses is posted as a new card instead.
 
+A card queued with `below` answers a tap: it is posted as a new card under the tap, where the owner is
+looking, and the tapped card is edited down to a line pointing there (no buttons). `moved/` keeps where
+each tapped card went, so a later edit of it (a sign-in that ends, a code withdrawn) lands on the new
+card instead of on the line left behind. The answer's event is noted in its queue entry as soon as it is
+posted, and the move and both cards' records are written before the tapped card is edited: a tap on the
+answer acts while that edit is still on its way, and a sweep that stopped part-way is finished by the next.
+
 What became of a queued card outlives both files: the bridge leaves `outcomes/<queue id>` saying
 `posted`, `dropped` (expired with no send ever tried) or `unsure` (expired after a send that failed or
 did not answer, which may have gone through), kept as long as a key's marker. A connector that looks
@@ -39,6 +46,9 @@ from pathlib import Path
 OUTBOX, POSTED = ("agent-cards", "outbox"), ("agent-cards", "posted")
 KEYS = ("agent-cards", "keys")     # one marker per keyed card ever queued, so a repeat is not a second card
 OUTCOMES = ("agent-cards", "outcomes")     # what became of each queued card: posted, dropped or unsure
+MOVED = ("agent-cards", "moved")       # a tapped card answered below: the event its answer is shown at
+ANSWERED_BELOW = "Answered below."
+POINTER_CARD = "answered-below"     # its own id: a record of it must not retire the answer, which shares the old one
 KEYS_KEEP_S = 7 * 86400.0
 CARD_KEY = "space.ag2.card"
 MAX_QUEUED_S = 600.0
@@ -103,9 +113,10 @@ def _entries(folder: Path) -> list:
 
 
 def queue(bridge_state, room: str, body: str, card: dict, *, now=None, key: str = "", at_ns: int = 0,
-          edit: str = "", again: bool = False) -> str:
+          edit: str = "", again: bool = False, below: bool = False) -> str:
     """Queue `card` for `room`; the queue id. A card the client would not draw is refused here. With
-    `edit` (a posted card's event id) it is shown in place of that card instead of as a new one.
+    `edit` (a posted card's event id) it is shown in place of that card instead of as a new one; with
+    `below` too, it is posted under the tap and the tapped card points to it.
 
     With `key` (and the `at_ns` it was first decided at) the call may be repeated: the id is made of
     those two, and a card already queued under it is not queued again, so a caller that saved its
@@ -131,7 +142,8 @@ def queue(bridge_state, room: str, body: str, card: dict, *, now=None, key: str 
             return qid
     _write(Path(bridge_state).joinpath(*OUTBOX) / (qid + ".json"),
            dict({"room": room, "body": body, "card": card, "queued_at": time.time() if now is None else now},
-                **({"edit": edit} if edit else {}), **({"attempted": True} if key and requeue else {})))
+                **({"edit": edit} if edit else {}), **({"below": True} if edit and below else {}),
+                **({"attempted": True} if key and requeue else {})))
     if key:
         # The marker follows the card: a stop between the two queues it once more, never drops it.
         marker.parent.mkdir(parents=True, exist_ok=True)
@@ -180,6 +192,27 @@ def withdraw(bridge_state, qid: str) -> bool:
     return True
 
 
+def _moved_path(bridge_state, event: str) -> Path:
+    return Path(bridge_state).joinpath(*MOVED) / hashlib.sha256(event.encode("utf-8")).hexdigest()[:32]
+
+
+def moved_to(bridge_state, event: str) -> str:
+    """The event the answer to a tap on `event` was posted at; `event` when it was answered in place. One hop
+    only: a card answered below and then tapped again is its own card, and an edit of the first stays there."""
+    try:
+        nxt = _moved_path(bridge_state, event).read_text(encoding="utf-8").strip()
+    except (OSError, ValueError):
+        return event
+    return nxt if _EVENT_RE.match(nxt) else event
+
+
+def pointer(card: dict) -> dict:
+    """What the tapped card becomes once its answer is posted below: its header, one line, no buttons."""
+    header = {k: v for k, v in (card.get("header") or {}).items() if k != "shuffle"}
+    return {"kind": card["kind"], "v": card["v"], "id": POINTER_CARD, "state": "info", "header": header,
+            "text": ANSWERED_BELOW}
+
+
 def _forget_old_keys(folder: Path) -> None:
     """Drop markers older than KEYS_KEEP_S: long past any restart that could repeat their card."""
     horizon = time.time() - KEYS_KEEP_S
@@ -210,10 +243,18 @@ class Poster:
             # A card waits behind an earlier one of the same card in the same room that is not posted
             # yet: posted out of order, the earlier one would arrive last and replace it.
             target = str(record.get("edit") or "")
-            target = target if _EVENT_RE.match(target) else ""
+            target = moved_to(self.state, target) if _EVENT_RE.match(target) else ""
+            # Answered under the tap: only the first answer to a tapped card moves; later ones edit it there.
+            below = bool(record.get("below")) and target == str(record.get("edit") or "")
             # So does an edit behind an earlier edit of the same event, whatever card each one carries.
             same = {(record["room"], "card", str(card.get("id") or ""))} | ({(record["room"], "event", target)} if target else set())
             if same & held:
+                continue
+            answered = str(record.get("answer") or "") if record.get("below") else ""
+            if _EVENT_RE.match(answered) and outcome(self.state, path.stem) != "posted":
+                # Posted below by a sweep that stopped before it had recorded the move: finished from the note.
+                self.finish_below(path, record, card, answered)
+                posted += 1
                 continue
             # Already posted, by a sweep that then failed to finish: that stands, whatever its age now.
             if outcome(self.state, path.stem) == "posted" or (self.state.joinpath(*POSTED) / path.name).is_file():
@@ -234,7 +275,7 @@ class Poster:
             payload = {"op": "message", "room_id": record["room"], "body": str(record.get("body") or ""),
                        "extra_content": {CARD_KEY: card}, "dedupe_key": "agent-card:" + path.stem}
             try:
-                _, event_id = self.send(payload, target)
+                _, event_id = self.send(payload, "" if below else target)
             except Exception as e:  # noqa: BLE001 - stays queued, retried under the same key
                 self.log("agent-card: post failed (will retry): %s" % type(e).__name__)
                 code = getattr(e, "code", None)
@@ -249,6 +290,13 @@ class Poster:
                 self.log("agent-card: the post returned no event id (will retry)")
                 held |= same
                 continue
+            if below and event_id != target:
+                # Noted in the entry before anything else: whatever stops this sweep, the next one finishes the move.
+                record = dict(record, answer=event_id)
+                _write(path, record)
+                self.finish_below(path, record, card, event_id)
+                posted += 1
+                continue
             _write(self.state.joinpath(*POSTED) / path.name,
                    dict({"event_id": event_id, "room": record["room"], "card": card, "posted_at": self.clock()},
                         **({"edited": True} if target and event_id == target else {})))
@@ -256,6 +304,32 @@ class Poster:
             path.unlink(missing_ok=True)
             posted += 1
         return posted
+
+    def finish_below(self, path: Path, record: dict, card: dict, event_id: str) -> None:
+        """The rest of an answer posted below at `event_id`, each step safe to repeat: where the tapped card
+        went and both cards' records first, so a tap on the answer acts at once; then the tapped card
+        edited down to a line pointing to it (best effort: the answer stands without it); then the outcome."""
+        tapped = str(record.get("edit") or "")
+        moved = _moved_path(self.state, tapped)
+        _private_dirs(moved.parent)
+        tmp = moved.with_name(moved.name + ".tmp")
+        tmp.write_text(event_id, encoding="utf-8")
+        os.replace(tmp, moved)
+        # The tapped card's buttons stop acting, as after an edit in place: its record becomes the pointer.
+        stub = hashlib.sha256((path.stem + ":moved").encode("utf-8")).hexdigest()[:32] + ".json"
+        _write(self.state.joinpath(*POSTED) / stub, {"event_id": tapped, "room": record["room"],
+                                                     "card": pointer(card), "posted_at": self.clock(), "edited": True})
+        _write(self.state.joinpath(*POSTED) / path.name,
+               {"event_id": event_id, "room": record["room"], "card": card, "posted_at": self.clock()})
+        try:
+            said = self.post({"op": "edit", "room_id": record["room"], "event_id": tapped, "body": ANSWERED_BELOW,
+                              "extra_content": {CARD_KEY: pointer(card)}, "dedupe_key": "agent-card-moved:" + path.stem})
+            if edit_verdict(said) != "accepted":
+                self.log("agent-card: the tapped card was not pointed to its answer")
+        except Exception as e:  # noqa: BLE001 - the answer is posted; the old card keeps its words
+            self.log("agent-card: the tapped card was not pointed to its answer (%s)" % type(e).__name__)
+        _settle(self.state, path.stem, "posted")
+        path.unlink(missing_ok=True)
 
     def send(self, payload, target: str = ""):
         """(answer, event id the card now shows at). With `target` the card is sent as an edit of that

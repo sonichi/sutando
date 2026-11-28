@@ -770,7 +770,9 @@ class CardWorld:
         sent = self.sent = []
         connector_cards.Poster(self.bridge, lambda p: sent.append(p) or {"ok": True, "event_id": event},
                                log=lambda line: None).sweep()
-        return [(p["room_id"], p["extra_content"]["space.ag2.card"]) for p in sent]
+        # A tapped card left pointing to its answer below is not a card shown: only the answers are.
+        return [(p["room_id"], p["extra_content"]["space.ag2.card"]) for p in sent
+                if p["extra_content"]["space.ag2.card"].get("text") != connector_cards.ANSWERED_BELOW]
 
     def ops(self):
         """How the cards of the last `posted` were sent: ("message", None) or ("edit", the event shown in place of)."""
@@ -1196,10 +1198,11 @@ class ModelCardTest(CardWorld, unittest.TestCase):
         large = next(b["reply"] for b in menu["buttons"] if b["label"] == "Stub Large")
         self.serve("task-2", large, reply_to="$card1", click=large)
         ((_, coming),) = self.posted("$card2")
-        self.assertEqual(self.ops(), [("edit", "$card1")], "the answer is shown in place of the menu, not as a second card")
+        self.assertEqual(self.ops(), [("message", None), ("edit", "$card1")],
+                         "the answer is posted under the tap, and the tapped menu points to it")
         self.serve("task-3", "hello")
         ((_, done),) = self.posted("$card3")
-        self.assertEqual(self.ops(), [("edit", "$card1")], "and so is the outcome")
+        self.assertEqual(self.ops(), [("edit", "$card2")], "the outcome replaces the answer below, not a second card")
         self.assertEqual((coming["id"], done["id"], done["state"]), (model_switch.NOTE, model_switch.NOTE, "done"))
         # The menu's buttons are gone from that card: a tap from a client still showing them switches
         # nothing and shows a fresh menu in the same place.
@@ -1207,9 +1210,9 @@ class ModelCardTest(CardWorld, unittest.TestCase):
         self.assertEqual(self.serve("task-4", five, reply_to="$card1", click=five), "[no-send] the model card answers\n")
         self.assertEqual((metrics(self.work)[-1]["card"], self.state()["wanted"]), ("model-card-expired", "gpt-6-sol"))
         ((room, fresh),) = self.posted("$card4")
-        self.assertEqual((self.ops(), room, fresh["id"]), ([("edit", "$card1")], self.DM, model_switch.CARD))
+        self.assertEqual((self.ops(), room, fresh["id"]), ([("edit", "$card2")], self.DM, model_switch.CARD))
         # That menu acts.
-        self.assertEqual(self.serve("task-5", five, reply_to="$card1", click=five), "[no-send] the model card answers\n")
+        self.assertEqual(self.serve("task-5", five, reply_to="$card2", click=five), "[no-send] the model card answers\n")
         self.assertEqual((metrics(self.work)[-1]["card"], self.state()["wanted"]), ("model-picked", "gpt-5.6-terra"))
         self.posted("$card5")
         # A pick in words has no card to update: its answer is a new card.
@@ -1311,8 +1314,8 @@ class AccountCardTest(CardWorld, unittest.TestCase):
         self.assertEqual(result(self.work, "task-tap"), "[no-send] the account card answers\n")
         self.assertEqual(self.opened, ["https://stub.invalid/sign-in?id=login-1"], "the page is shown on this computer")
         (_, started), (room, done) = self.posted("$card2")
-        # One card: the sign-in page, then how it ended, are each shown in place of the card tapped.
-        self.assertEqual(self.ops(), [("edit", "$card1"), ("edit", "$card1")])
+        # The sign-in page is posted under the tap (the tapped card points to it); how it ended replaces that page.
+        self.assertEqual(self.ops(), [("message", None), ("edit", "$card1"), ("edit", "$card2")])
         self.assertNotIn("account_controls", started, "a notice is not the account card")
         self.assertEqual((started["state"], [(b["kind"], b["url"]) for b in started["buttons"]]),
                          ("info", [("url", "https://stub.invalid/sign-in?id=login-1")]))
@@ -1587,8 +1590,9 @@ class AccountCardTest(CardWorld, unittest.TestCase):
         said = card["buttons"][0]["reply"]
         self.serve("task-2", said, reply_to="$card1", click=said)
         ((_, link),) = self.posted("$card2")
-        # The sign-in page is shown in place of the card tapped, not as a second card.
-        self.assertEqual((self.ops(), card["id"], link["id"]), ([("edit", "$card1")], account_switch.CARD, account_switch.NOTE))
+        # The sign-in page is posted under the tap; the tapped card points to it and keeps no buttons.
+        self.assertEqual((self.ops(), card["id"], link["id"]),
+                         ([("message", None), ("edit", "$card1")], account_switch.CARD, account_switch.NOTE))
         # Its "Switch account" button is gone: a tap from a client still showing it starts no sign-in and
         # shows a fresh account card in the same place.
         started = len(self.opened)
@@ -1597,8 +1601,8 @@ class AccountCardTest(CardWorld, unittest.TestCase):
                          ("[no-send] the account card answers\n", "account-card-expired", started))
         ((room, fresh),) = self.posted("$card3")
         self.assertEqual((self.ops(), room, fresh["id"], fresh["buttons"][0]["reply"]),
-                         ([("edit", "$card1")], self.DM, account_switch.CARD, said))
-        self.serve("task-4", said, reply_to="$card1", click=said)
+                         ([("edit", "$card2")], self.DM, account_switch.CARD, said))
+        self.serve("task-4", said, reply_to="$card2", click=said)
         self.assertEqual(metrics(self.work)[-1]["card"], "account-started", "the fresh card acts")
         self.posted("$card4")
         # With the card queue down the words say how to get one; anyone else's tap is refused as before.

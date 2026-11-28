@@ -210,12 +210,12 @@ class ModelSwitch:
             self.log("model card not built:", str(e)[:200])
             return None
 
-    def post(self, room, built, key: str = "", at_ns: int = 0, edit: str = "") -> bool:
+    def post(self, room, built, key: str = "", at_ns: int = 0, edit: str = "", below: bool = False) -> bool:
         if built is None or not self.usable():
             return False
         try:
             connector_cards.queue(self.bridge_state, str(room or ""), *built, key=key, at_ns=at_ns,
-                                  edit=edit if str(edit or "").startswith("$") else "")
+                                  edit=edit if str(edit or "").startswith("$") else "", below=below)
             return True
         except (OSError, ValueError) as e:
             self.log("model card not queued:", "%s: %s" % (type(e).__name__, e))
@@ -237,7 +237,7 @@ class ModelSwitch:
         """Answer a tap on a model card that no longer acts: a fresh card in its place when one can be
         shown, else the words."""
         fresh = bool(self.offered(state)) and self.post(sent.get("channel_id"), self.menu(state),
-                                                        edit=card_desk.tapped_event(sent))
+                                                        edit=card_desk.tapped_event(sent), below=True)
         self.publish(result_file, ANSWERED if fresh else self.quoted(EXPIRED_NO_CARD) + "\n")
         return "model-card-expired"
 
@@ -270,7 +270,7 @@ class ModelSwitch:
             self.save(wanted=picked, asked_in=room, told="", card=tapped, refused="")
         same = outcome == "model-same"
         card = self.built(state, picked=picked, same=same)
-        self.publish(result_file, ANSWERED if self.post(room, card, edit=tapped)
+        self.publish(result_file, ANSWERED if self.post(room, card, edit=tapped, below=True)
                      else self.quoted(self.words(state, picked=picked, same=same)) + "\n")
         return outcome
 

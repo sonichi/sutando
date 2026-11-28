@@ -476,10 +476,13 @@ class RemoteCardTest(Home, CardWorld, unittest.TestCase):
         outbox = self.bridge.joinpath(*connector_cards.OUTBOX)
         self.assertEqual({oct(p.stat().st_mode & 0o777) for p in outbox.iterdir()} | {oct(outbox.stat().st_mode & 0o777)},
                          {"0o600", "0o700"}, "the card carrying the code is readable by its owner only")
-        ((room, shown),) = self.posted("$card1")
+        ((room, shown),) = self.posted("$code1")
         posted = self.bridge.joinpath(*connector_cards.POSTED)
         self.assertEqual({oct(p.stat().st_mode & 0o777) for p in posted.iterdir()}, {"0o600"})
-        self.assertEqual(self.ops(), [("edit", "$card1")], "shown in place of the card tapped")
+        self.assertEqual(self.ops(), [("message", None), ("edit", "$card1")],
+                         "posted under the tap, where the owner looks; the tapped card points to it")
+        pointer = self.sent[1]["extra_content"]["space.ag2.card"]
+        self.assertEqual((pointer["text"], pointer.get("buttons")), (connector_cards.ANSWERED_BELOW, None))
         self.assertEqual((room, shown["id"], shown["state"]), (self.DM, dl.DEVICE_CARD, "pending"))
         self.assertIn("open the sign-in page at auth.openai.com", shown["text"])
         self.assertIn("enter this one-time code: %s. It works for 5 minutes." % CODE, shown["text"])
@@ -490,8 +493,8 @@ class RemoteCardTest(Home, CardWorld, unittest.TestCase):
         self.assertNotIn(CODE, result(self.work, "task-add"))
         self.finished()
         self.hello("task-next")
-        ((_, asked),) = self.posted("$card1")
-        self.assertEqual(self.ops(), [("edit", "$card1")], "the link and code are replaced in place")
+        ((_, asked),) = self.posted("$code1")
+        self.assertEqual(self.ops(), [("edit", "$code1")], "the link and code are replaced in place, on the card below")
         self.assertEqual(asked["text"], "Signed in as bob@example.org. Use this account for Codex? I'm using "
                                         "alice@example.com.")
         self.assertNotIn(CODE, json.dumps(asked))
@@ -503,30 +506,33 @@ class RemoteCardTest(Home, CardWorld, unittest.TestCase):
 
     def test_add_account_then_yes_uses_it_and_sign_out_works(self):
         asked = self.confirm()
-        self.assertEqual(self.tap("task-yes", asked, "Yes", "$card1"), account_switch.ANSWERED)
-        ((_, done),) = self.posted("$card1")
+        self.assertEqual(self.tap("task-yes", asked, "Yes", "$code1"), account_switch.ANSWERED)
+        (_, done), (_, gone) = self.posted("$done1")
+        self.assertEqual(self.ops(), [("message", None), ("edit", "$code1"), ("edit", "$code1")],
+                         "the answer goes under the tap; the question it answered is withdrawn where it was")
+        self.assertEqual(gone["id"], dl.WITHDRAWN_CARD)
         self.assertEqual((done["state"], done["text"]), ("done", "Now using bob@example.org for Codex."))
         self.assertEqual([(b["label"], b["command"], b["disabled"]) for b in done["buttons"]],
                          [("Sign out", "card:account:agent:signout", False)])
         self.assertEqual(self.live_email(), "bob@example.org")
         self.assertEqual(metrics(self.work)[-1]["card"], "account-device-used")
-        self.assertEqual(self.tap("task-out", done, "Sign out", "$card1"), account_switch.ANSWERED)
-        ((_, out),) = self.posted("$card1")
+        self.assertEqual(self.tap("task-out", done, "Sign out", "$done1"), account_switch.ANSWERED)
+        ((_, out),) = self.posted("$out1")
         self.assertEqual(out["text"], "Signed out. I'm not signed in. " + account_switch.BELOW)
         self.assertFalse((self.home / "auth.json").exists())
         self.assertEqual(self.calls()[-1], [str(self.home), "logout"])
 
     def test_no_keeps_the_account_in_use_and_a_later_answer_does_nothing(self):
         asked = self.confirm()
-        self.assertEqual(self.tap("task-no", asked, "No", "$card1"), account_switch.ANSWERED)
-        ((_, kept),) = self.posted("$card1")
+        self.assertEqual(self.tap("task-no", asked, "No", "$code1"), account_switch.ANSWERED)
+        (_, kept), _ = self.posted("$kept1")
         self.assertEqual(kept["text"], "Not added: I signed bob@example.org out again. I'm using alice@example.com. "
                          + account_switch.BELOW)
         self.assertEqual(metrics(self.work)[-1]["card"], "account-device-discarded")
         self.assertEqual(self.calls()[-1][1:], ["logout"])
         self.assertNotEqual(self.calls()[-1][0], str(self.home), "the staged login is signed out, never the live one")
         # A second answer on a card that is no longer asking changes nothing.
-        self.assertEqual(dl.answer(self.dir, "$card1", True, str(self.codex), self.env), ("stale", "", []))
+        self.assertEqual(dl.answer(self.dir, "$code1", True, str(self.codex), self.env), ("stale", "", []))
         self.assertFalse((self.home / "auth.json").exists())
 
     def test_a_second_tap_while_one_runs_shows_the_same_code_and_starts_nothing(self):
@@ -567,8 +573,8 @@ class RemoteCardTest(Home, CardWorld, unittest.TestCase):
         ((_, expired),) = self.posted("$card1")
         self.assertEqual(self.ops(), [("edit", "$card1")])
         self.assertEqual((expired["id"], expired["state"]), (account_switch.CARD, "error"))
-        self.assertTrue(expired["text"].startswith("The sign-in expired before it was finished, so I stopped it. Tap "
-                                                   "Add account to start again."))
+        self.assertEqual(expired["text"], "The sign-in code expired before it was used, so I stopped it. "
+                                          + account_switch.BELOW, "one way on: the buttons below")
         self.assertNotIn(CODE, json.dumps(expired))
         self.assertTrue(self.stub_gone())
 
@@ -576,7 +582,8 @@ class RemoteCardTest(Home, CardWorld, unittest.TestCase):
         self.confirm()
         with mock.patch.object(dl, "LOGIN_WAIT_S", -1):
             self.hello("task-later")
-        ((_, gone),) = self.posted("$card1")
+        ((_, gone),) = self.posted("$code1")
+        self.assertEqual(self.ops(), [("edit", "$code1")], "the question below the tap is the one withdrawn")
         self.assertTrue(gone["text"].startswith("You didn't answer within"))
         self.assertEqual(self.calls()[-1][1:], ["logout"])
         self.assertFalse(self.dir.exists())
@@ -746,7 +753,7 @@ class RemoteUnitTest(Home, unittest.TestCase):
         self.mode("hang")
         r = self.remote()
         seen = []
-        r.accounts.post.side_effect = lambda room, built, edit="": seen.append(
+        r.accounts.post.side_effect = lambda room, built, edit="", below=False: seen.append(
             detached_login.read_json(r.dir / "meta.json").get("cards")) or (_ for _ in ()).throw(RuntimeError("stop"))
         with self.assertRaises(RuntimeError):
             r.tapped(dl.ADD, dict(self.OWNER, reply_to_event="$e"), "out")
@@ -876,7 +883,7 @@ class CardInvariantTest(Home, unittest.TestCase):
         r.fresh = lambda sent: True
         return r
 
-    def post(self, room, built, edit=""):
+    def post(self, room, built, edit="", below=False):
         if not self.ok:
             return False
         if CODE in json.dumps(built[1]):
