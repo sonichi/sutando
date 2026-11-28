@@ -44,7 +44,7 @@ LOCAL = Shape(name=SHAPE, command=COMMAND, description="the Codex connector as a
               cli="Codex CLI", min_version=MIN_CODEX, version_anchor=r"^codex",
               version_note="the app-server stdio shape was measured there", required_keys=REQUIRED_KEYS,
               config_keys=CONFIG_KEYS, env_keep=ENV_KEEP,
-              kept="the Codex login (CODEX_HOME) and the work root with state/threads, the owner's thread history",
+              kept="the Codex login (CODEX_HOME) and the work root with state/thread, the shared thread's id",
               run_args=("run", "--launchd"), keep_alive_on_success=False)
 BRIDGE = cb.bridge_shape(LOCAL)      # the agent's own gateway bridge, when install runs it
 SETUP_VENDOR = "codex"      # the served setup list this adapter follows: acp.codex
@@ -429,8 +429,9 @@ def session_options(p) -> None:
     p.add_argument("--model", help="the model for every turn (default: the connector's)")
     # Codex names its rollouts in lowercase: the id is matched and resumed as such.
     p.add_argument("--resume-thread", metavar="UUID", type=str.lower,
-                   help="continue this Codex conversation (saved under --codex-home's sessions/) in the owner's "
-                        "DM with the agent, as `codex resume <id>` does; every other room starts a new one")
+                   help="continue this Codex conversation (saved under --codex-home's sessions/) as the agent's "
+                        "one shared thread, from the owner's first message in any room, as `codex resume <id>` "
+                        "does; collaborators' turns then share it too")
 
 
 def agent_option(p):

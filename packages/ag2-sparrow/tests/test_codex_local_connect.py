@@ -1052,7 +1052,7 @@ class VerifyUninstall(Base):
             rc, out, err = self.main("uninstall")
         self.assertEqual(rc, 0, err)
         self.assertFalse(unit.exists() or cli.config_path().exists())
-        self.assertIn(f"kept: {self.relay} (Sparrow's token) and the Codex login (CODEX_HOME) and the work root with state/threads", out)
+        self.assertIn(f"kept: {self.relay} (Sparrow's token) and the Codex login (CODEX_HOME) and the work root with state/thread, the shared thread's id", out)
         self.assertEqual(self.relay.read_text(), f"REMOTE_TASK_TOKEN={TOKEN}\n")
         self.assertTrue(self.codex_home.is_dir() and (self.work / "tasks").is_dir())
         self.assertEqual(task_io.lock_held(str(self.work)), "free")

@@ -8,7 +8,9 @@ request first and echoes the decision; `[[stall]]` never completes until
 limit (a used-up rate-limit window, an `error` notification, the turn's codexErrorInfo); `[[limit-bare]]` the
 same with no rate-limit window; `[[limit-words]]` fails it on another error whose words speak of a usage limit;
 `[[noaccess]]` fails a turn that names no model as one the account cannot run; `[[fail]]` fails it on another error. A refused turn ends with no item, unless `[[worked]]` is there too: then a
-reasoning item and part of a reply come first.
+reasoning item and part of a reply come first. A prompt that opens with the shared thread's lead paragraph
+(`[shared thread] This turn is from room R, sent by S (access_tier=T, ...`) is echoed from the line after that
+paragraph, with ` room=R from=S tier=T` added, so a test sees which room and sender each turn named.
 
 `account/rateLimits/read` answers as `stub-limits` under CODEX_HOME says ("out": a window used up; "ok": usage
 left); with no such file the method is unknown.
@@ -22,6 +24,7 @@ once a turn is sent, and on every thread start or resume while `stub-touch-on-th
 """
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -184,11 +187,15 @@ for line in sys.stdin:
         text = next((i.get("text", "") for i in p.get("input", []) if i.get("type") == "text"), "")
         if "[[touch-login]]" in text:
             home_file("auth.json", " ")          # the login switched after this turn was sent
+        lead = re.match(r"\[shared thread\] This turn is from room (\S+), sent by (.+?) \(access_tier=(\w+)", text)
+        said = text.split("\n\n", 1)[1] if lead and "\n\n" in text else text
         tp = THREADS[tid]["params"]
         # The echo names the thread's settings, so a test can pin sandbox and lifetime; the cwd is the
         # turn's own when the turn carries one (the turn/start override), else the thread's.
-        reply = "STUB echo: " + (text.strip().split("\n")[0][:80]) + " [sandbox=%s ephemeral=%s cwd=%s]" % (
+        reply = "STUB echo: " + (said.strip().split("\n")[0][:80]) + " [sandbox=%s ephemeral=%s cwd=%s]" % (
             tp.get("sandbox"), tp.get("ephemeral"), p.get("cwd", tp.get("cwd")))
+        if lead:
+            reply += " room=%s from=%s tier=%s" % lead.groups()
         if p.get("model"):
             reply += " model=%s" % p["model"]
         if "[[askmodel]]" in text:
