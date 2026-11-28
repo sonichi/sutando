@@ -33,7 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from claude_code_fixtures import (  # noqa: E402
     cli, cm, ConnectBase, hold_consumer, hold_mod, inbox, isolated_runs, SESSION_ID, unhold, write_isolated_stub,
 )
-from ag2_sparrow import claude_local_gate, mcp_auth, mcp_name_shim, mcp_stdio, task_lifecycle as lifecycle  # noqa: E402
+from ag2_sparrow import mcp_auth, mcp_name_shim, mcp_stdio, task_lifecycle as lifecycle  # noqa: E402
 
 SECRET = "relay-secret-do-not-leak"
 AGENT = "@cl:s.space"
@@ -108,8 +108,10 @@ class RoomToolsArgv(unittest.TestCase):
         descriptor = self.state / mcp_stdio.DESCRIPTOR_NAME
         self.assertEqual(server["env"], {"AG2_MCP_DESCRIPTOR": str(descriptor),
                                          "AG2_MCP_LOG": str(self.state / mcp_stdio.PROXY_LOG_NAME),
-                                         mcp_name_shim.GATE_ENV: str(self.root)},
-                         "the shim is told the root whose claims gate every call")
+                                         mcp_name_shim.GATE_ENV: json.dumps(hold_mod.gate_argv(str(self.root)))},
+                         "the shim is told the command that gates every call")
+        gate = hold_mod.gate_argv(str(self.root))
+        self.assertEqual((gate[0], gate[1], gate[-4:]), (sys.executable, "-I", ["inbox", "--root", str(self.root), "room-tools"]))
         self.assertEqual(stat.S_IMODE(descriptor.stat().st_mode), 0o600)
         desc = json.loads(descriptor.read_text())
         self.assertEqual((desc["env_file"], desc["agent_id"]), (self.token, AGENT), "names the token file, never holds it")
@@ -359,7 +361,8 @@ class CollaboratorTurnsGetNoRoomTools(ConnectBase):
 
     def call(self):
         """(forwarded?, the error message) for one room-tool call through the shim, gated on this root."""
-        names = mcp_name_shim.Names({"room.action.execute"}, mcp_name_shim.turn_gate({mcp_name_shim.GATE_ENV: self.root}))
+        gate = mcp_name_shim.turn_gate({mcp_name_shim.GATE_ENV: json.dumps(hold_mod.gate_argv(self.root))})
+        names = mcp_name_shim.Names({"room.action.execute"}, gate)
         names.rename_tools([{"name": "room.action.execute"}])
         forward, reply = mcp_name_shim.to_server(json.dumps(self.CALL) + "\n", names, set())
         return forward is not None, (json.loads(reply)["error"]["message"] if reply else "")
@@ -399,10 +402,40 @@ class CollaboratorTurnsGetNoRoomTools(ConnectBase):
         (self.inbox / "task-c.txt").mkdir()
         self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_UNREAD))
         (self.inbox / "task-c.txt").rmdir()
-        with mock.patch.object(claude_local_gate, "room_tools_refusal", side_effect=RuntimeError("claims unreadable")):
-            self.assertEqual(self.call(), (False, mcp_name_shim.GATE_UNCHECKED), "fail closed")
         unhold(self.holder)
         self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_NO_SESSION), "no live session holds the root")
+
+    def test_the_gate_verb_answers_as_the_shim_reads_it(self):
+        def verb():
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = cli.main(["inbox", "--root", self.root, "room-tools"])
+            return rc, json.loads(out.getvalue())
+        self.assertEqual(verb(), (0, {"allowed": True, "why": ""}))
+        self.claim("task-c", "team", "collaborator: true\n")
+        self.assertEqual(verb(), (0, {"allowed": False, "why": inbox.ROOM_TOOLS_OWNER_ONLY}))
+
+    def test_a_gate_that_cannot_answer_refuses(self):
+        def gated(raw, run):
+            check = mcp_name_shim.turn_gate({mcp_name_shim.GATE_ENV: raw}, run=run)
+            return check()
+
+        def answers(stdout):
+            return lambda argv, **kw: mock.Mock(stdout=stdout)
+
+        def raises(error):
+            def run(argv, **kw):
+                raise error
+            return run
+        ok = json.dumps(["gate"])
+        self.assertEqual(gated(ok, answers('{"allowed": true}')), "")
+        self.assertEqual(gated(ok, answers('{"allowed": false, "why": "not now"}')), "not now")
+        for stdout in ("", "not json", "[]", '{"allowed": "yes"}', '{"allowed": false}', '{"allowed": false, "why": 7}'):
+            self.assertEqual(gated(ok, answers(stdout)), mcp_name_shim.GATE_UNCHECKED, stdout)
+        for error in (OSError(2, "no such file"), subprocess.TimeoutExpired("gate", 10)):
+            self.assertEqual(gated(ok, raises(error)), mcp_name_shim.GATE_UNCHECKED, error)
+        for raw in ("not json", "{}", "[]", '["gate", 7]'):
+            self.assertEqual(gated(raw, answers('{"allowed": true}')), mcp_name_shim.GATE_UNCHECKED, raw)
 
     def test_a_shim_without_the_gate_is_unchanged_for_the_other_connectors(self):
         self.assertIsNone(mcp_name_shim.turn_gate({}))

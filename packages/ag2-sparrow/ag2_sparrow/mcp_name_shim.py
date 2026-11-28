@@ -8,8 +8,8 @@ answer's tool names become `room_action_execute` and so on (`alias`), and a `too
 on under the server's own name. It also enforces the turn's grant (TOOLS_ENV, the server names the connector
 grants): a `tools/list` answer keeps only granted tools, and a `tools/call` for any other name, or a malformed
 one, is answered with a JSON-RPC error and never forwarded. No grant named means none granted. With GATE_ENV (a
-claude-local work root, whose one session the owner and attested collaborators share), every `tools/call` is
-also checked against the tasks in flight there: while a collaborator's is, none is forwarded. Only METHODS and
+command the connector names, for a session more than one sender's turns share), every `tools/call` also runs
+that command first and is forwarded only when it answers {"allowed": true}. Only METHODS and
 `notifications/*` reach the server, plus the client's answers to the server's own requests; any other request,
 and a line that is not a JSON-RPC object, is answered with an error, any other notification dropped. Server
 lines pass through as they came, and the child's environment is this process's (the proxy scrubs its own).
@@ -36,7 +36,8 @@ _BAD = re.compile(r"[^A-Za-z0-9_-]")
 LOG_ENV = "AG2_MCP_LOG"
 STATUS_ENV, TURN_ENV = "AG2_MCP_SHIM_STATUS", "AG2_MCP_SHIM_TURN"
 TOOLS_ENV = "AG2_MCP_SHIM_TOOLS"
-GATE_ENV = "AG2_MCP_SHIM_CLAUDE_ROOT"
+GATE_ENV = "AG2_MCP_SHIM_GATE"
+GATE_TIMEOUT_S = 10.0
 GATE_UNCHECKED = "the turn's sender could not be checked, so no room tool is called"
 NOT_GRANTED = -32601
 PARSE_ERROR, INVALID_REQUEST = -32700, -32600
@@ -50,20 +51,28 @@ def granted(environ=None):
     return frozenset(n for n in value.split(",") if n)
 
 
-def turn_gate(environ=None):
-    """None, or the check every `tools/call` passes first: '' to forward it, else why it is refused. Set by
-    GATE_ENV, a claude-local work root; a check that cannot run refuses (fail closed)."""
-    root = (os.environ if environ is None else environ).get(GATE_ENV)
-    if not root:
+def turn_gate(environ=None, run=subprocess.run):
+    """None, or the check every `tools/call` passes first: '' to forward it, else why it is refused. GATE_ENV
+    holds a command (a JSON list of words) that prints one JSON object: {"allowed": true}, or `why` it is not.
+    A command that cannot run, times out or prints anything else refuses (fail closed)."""
+    raw = (os.environ if environ is None else environ).get(GATE_ENV)
+    if not raw:
         return None
 
     def check():
         try:
-            from . import claude_local_gate
-            return claude_local_gate.room_tools_refusal(root)
-        except Exception as e:  # noqa: BLE001 - an unreadable record never opens the tools
+            argv = json.loads(raw)
+            if not (isinstance(argv, list) and argv and all(isinstance(a, str) for a in argv)):
+                raise ValueError("not a command")
+            done = run(argv, capture_output=True, text=True, timeout=GATE_TIMEOUT_S, stdin=subprocess.DEVNULL)
+            out = json.loads(done.stdout)
+        except (OSError, ValueError, subprocess.TimeoutExpired) as e:
             note("the turn gate could not run (%s)" % type(e).__name__)
             return GATE_UNCHECKED
+        if isinstance(out, dict) and out.get("allowed") is True:
+            return ""
+        why = out.get("why") if isinstance(out, dict) else None
+        return why[:300] if isinstance(why, str) and why else GATE_UNCHECKED
     return check
 
 

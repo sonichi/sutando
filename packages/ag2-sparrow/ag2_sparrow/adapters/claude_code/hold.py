@@ -231,6 +231,15 @@ def write_mcp_config(state: str, entry: dict) -> str:
     return path
 
 
+def gate_argv(root: str) -> list:
+    """The inbox CLI's `room-tools` verb for `root`, run from this very package, isolated (-I), as mcp_stdio
+    runs its own helpers: what the name shim runs before each room-tool call."""
+    pkg = str(Path(__file__).resolve().parents[3])
+    code = ("import sys; sys.path.insert(0, %r); from ag2_sparrow.adapters.claude_code import cli; "
+            "raise SystemExit(cli.main(sys.argv[1:]))" % pkg)
+    return [sys.executable, "-I", "-c", code, "inbox", "--root", root, "room-tools"]
+
+
 def room_tools_argv(cfg: dict, root: str, cwd: str, entry=None, log=None) -> list:
     """`--mcp-config <file>` adding the ag2-space MCP server as this agent to the session, or []: with no
     MCP_PROXY_COMMAND (an install from before it, or the desktop passed none), no TOKEN_ENV_FILE of the agent's
@@ -267,9 +276,10 @@ def room_tools_argv(cfg: dict, root: str, cwd: str, entry=None, log=None) -> lis
         if got is None:
             log("ag2-space MCP tools not offered: " + why)
             return []
-        # The session is shared with attested collaborators: the shim asks this root's claims before every call
-        # and forwards none while a collaborator's task is in flight (claude_local_gate).
-        got = dict(got, env=list(got["env"]) + [{"name": mcp_name_shim.GATE_ENV, "value": os.path.abspath(root)}])
+        # The session is shared with attested collaborators: the shim runs `inbox room-tools` before every call
+        # and forwards none while a collaborator's task is in flight.
+        gate = {"name": mcp_name_shim.GATE_ENV, "value": json.dumps(gate_argv(os.path.abspath(root)))}
+        got = dict(got, env=list(got["env"]) + [gate])
         path = write_mcp_config(state, got)
     except Exception as e:     # the tools never cost the session its start
         log("ag2-space MCP tools not offered: %s: %s" % (type(e).__name__, str(e)[:200]))
