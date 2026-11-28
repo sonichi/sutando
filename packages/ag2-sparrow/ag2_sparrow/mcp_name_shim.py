@@ -59,8 +59,8 @@ def turn_gate(environ=None):
 
     def check():
         try:
-            from .adapters.claude_code import inbox
-            return inbox.room_tools_refusal(root)
+            from . import claude_local_gate
+            return claude_local_gate.room_tools_refusal(root)
         except Exception as e:  # noqa: BLE001 - an unreadable record never opens the tools
             note("the turn gate could not run (%s)" % type(e).__name__)
             return GATE_UNCHECKED

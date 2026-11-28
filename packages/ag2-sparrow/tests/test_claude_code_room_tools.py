@@ -33,7 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from claude_code_fixtures import (  # noqa: E402
     cli, cm, ConnectBase, hold_consumer, hold_mod, inbox, isolated_runs, SESSION_ID, unhold, write_isolated_stub,
 )
-from ag2_sparrow import mcp_auth, mcp_name_shim, mcp_stdio, task_lifecycle as lifecycle  # noqa: E402
+from ag2_sparrow import claude_local_gate, mcp_auth, mcp_name_shim, mcp_stdio, task_lifecycle as lifecycle  # noqa: E402
 
 SECRET = "relay-secret-do-not-leak"
 AGENT = "@cl:s.space"
@@ -399,7 +399,7 @@ class CollaboratorTurnsGetNoRoomTools(ConnectBase):
         (self.inbox / "task-c.txt").mkdir()
         self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_UNREAD))
         (self.inbox / "task-c.txt").rmdir()
-        with mock.patch.object(inbox, "room_tools_refusal", side_effect=RuntimeError("claims unreadable")):
+        with mock.patch.object(claude_local_gate, "room_tools_refusal", side_effect=RuntimeError("claims unreadable")):
             self.assertEqual(self.call(), (False, mcp_name_shim.GATE_UNCHECKED), "fail closed")
         unhold(self.holder)
         self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_NO_SESSION), "no live session holds the root")

@@ -268,7 +268,7 @@ def room_tools_argv(cfg: dict, root: str, cwd: str, entry=None, log=None) -> lis
             log("ag2-space MCP tools not offered: " + why)
             return []
         # The session is shared with attested collaborators: the shim asks this root's claims before every call
-        # and forwards none while a collaborator's task is in flight (inbox.room_tools_refusal).
+        # and forwards none while a collaborator's task is in flight (claude_local_gate).
         got = dict(got, env=list(got["env"]) + [{"name": mcp_name_shim.GATE_ENV, "value": os.path.abspath(root)}])
         path = write_mcp_config(state, got)
     except Exception as e:     # the tools never cost the session its start

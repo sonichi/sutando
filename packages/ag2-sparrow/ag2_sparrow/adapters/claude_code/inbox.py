@@ -21,6 +21,8 @@ from pathlib import Path
 
 from ... import connect_bridge as cb, connect_common as cm, task_io, task_lifecycle as lifecycle
 from ... import claude_local_records as records, collaborator_turn as isolated, relay_loop
+from ...claude_local_gate import (ROOM_TOOLS_NO_SESSION, ROOM_TOOLS_OWNER_ONLY, ROOM_TOOLS_UNREAD,  # noqa: F401
+                                  room_tools_refusal)
 from . import hmac_policy
 from .shape import LOCAL
 
@@ -678,45 +680,6 @@ def inflight(root) -> dict:
                 tasks[task_id] = {"phase": rec["phase"], "turn_id": rec.get("turn_id") or "",
                                   "attempt": rec.get("attempt")}
     return {"tasks": tasks}
-
-
-ROOM_TOOLS_OWNER_ONLY = ("the AG2 Space tools are the owner's: a collaborator's task is in flight in this session, so "
-                         "no room tool is called until it is answered")
-ROOM_TOOLS_NO_SESSION = "no live session holds this root, so no room tool is called"
-ROOM_TOOLS_UNREAD = "a claimed task could not be read, so no room tool is called"
-
-
-def room_tools_refusal(root) -> str:
-    """Why a room-tool call is refused right now, '' when it may go on. The owner and attested collaborators share
-    the one session, so the session's tools cannot be told apart by turn: while any collaborator's task of the
-    live generation is claimed and not settled, the shim forwards no call (mcp_name_shim's turn gate asks here
-    on every `tools/call`). A claim or task that cannot be read refuses; a task file already gone is answered.
-    Read under claims.lock, changing nothing."""
-    lc = _lifecycle(root)
-    try:
-        generation = _generation(root)
-    except Refused:
-        return ROOM_TOOLS_NO_SESSION
-    live = (generation["pid"], generation.get("start"))
-    with records.flocked(records.claims_lock_path(root)):
-        for task_id in lc.claims.ids():
-            try:
-                rec = lc.claims.load(task_id)
-            except lifecycle.ClaimUnreadable:
-                return ROOM_TOOLS_UNREAD
-            gen = (rec or {}).get("generation") or {}
-            if not rec or rec.get("claim_mode") != lifecycle.LOCAL or (gen.get("pid"), gen.get("start")) != live \
-                    or rec.get("phase") in (lifecycle.PUBLISHED, lifecycle.SETTLED):
-                continue
-            try:
-                headers, _, _ = task_io.parse_task(os.path.join(root, "tasks", task_id + ".txt"))
-            except FileNotFoundError:
-                continue
-            except OSError:
-                return ROOM_TOOLS_UNREAD
-            if task_io.turn_policy(headers, True, True).kind == task_io.COLLABORATOR:
-                return ROOM_TOOLS_OWNER_ONLY
-    return ""
 
 
 def stage(root, task_id, turn_id, body: bytes) -> dict:
