@@ -29,7 +29,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-from ... import account_switch, card_desk, connect_bridge as cb, connector_cards, claude_local_records as records
+from ... import (account_switch, card_desk, connect_bridge as cb, connect_common as cm, connector_cards,
+                 claude_local_records as records)
 from ...acp_host import quoted
 from ...bounded_file_read import read_regular
 from . import account as accounts, account_remote as remote
@@ -183,13 +184,26 @@ def same_dir(mine, other) -> bool:
     return (here.st_dev, here.st_ino) == (there.st_dev, there.st_ino)
 
 
+def own_job(cfg: dict):
+    """The job `cfg` is the config of: the one serving its agent (the agent's own under agents/<key>/, or an
+    earlier install's single job), so its config is never read as another agent's. ValueError when that
+    cannot be told (two jobs serve the agent, or the job records another)."""
+    from .shape import LOCAL
+    agent = cfg.get("AGENT_ID") or ""
+    if not agent:
+        return LOCAL
+    job, problem = cm.agent_job(LOCAL, agent)
+    if job is None:
+        raise ValueError(problem)
+    return job
+
+
 def config_dir_for_switch(cfg: dict) -> str:
     """The agent's own config dir; accounts.Refused when it has none, or it is not this agent's alone, or the
     credential proxy decides the account (the rules of a sign-in, `account.own_dir`)."""
     try:
         from .cli import other_agents_dirs
-        from .shape import LOCAL
-        dirs = other_agents_dirs(LOCAL, strict=True)
+        dirs = other_agents_dirs(own_job(cfg), strict=True)
     except Exception as e:  # noqa: BLE001 - fail closed: a dir shared with another agent cannot be ruled out
         raise accounts.Refused(OTHERS_UNKNOWN) from e
     mine = accounts.own_dir(cfg, dirs)

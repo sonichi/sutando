@@ -489,6 +489,47 @@ class Tap(Remote):
         self.assertIn("won't confirm here", self.queued()[-1]["card"]["text"])
 
 
+class OwnJob(Remote):
+    """Owner 11-27: every "Switch account" was refused as "shares its Claude config dir with another agent". An
+    agent's own job keeps its config under agents/<key>/, and that config was read as another agent's."""
+
+    def own(self, agent, config_dir):
+        """`agent` installed as its own job, on `config_dir`: the config that job runs with."""
+        from ag2_sparrow.adapters.claude_code import cli as cc
+        path = cc.cm.config_path(cc.cm.for_key(cc.LOCAL, cc.cm.agent_key(agent)))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(cli.render_config(dict(self.base, AGENT_ID=agent, CLAUDE_CONFIG_DIR=str(config_dir))))
+        return cli.read_config(path)
+
+    def setUp(self):
+        super().setUp()
+        self.base = self.cfg()
+        cli.config_path().unlink()      # no single-agent job: every agent here has its own
+
+    def test_an_agent_installed_as_its_own_job_switches_in_its_own_folder(self):
+        cfg = self.own(AGENT, self.config)
+        self.assertEqual(ac.config_dir_for_switch(cfg), str(self.config), "its own config is not another agent's")
+        # Another agent on a folder of its own changes nothing.
+        elsewhere = self.home / "another-agents-claude"
+        elsewhere.mkdir()
+        self.own("@other:s.space", elsewhere)
+        self.assertEqual(ac.config_dir_for_switch(cfg), str(self.config))
+
+    def test_two_agents_that_really_share_one_folder_are_refused(self):
+        cfg = self.own(AGENT, self.config)
+        self.own("@other:s.space", self.config)
+        with self.assertRaises(accounts.Refused) as refused:
+            ac.config_dir_for_switch(cfg)
+        self.assertEqual(str(refused.exception), accounts.ANOTHER_AGENTS)
+
+    def test_an_agent_served_by_two_jobs_is_refused_as_not_known(self):
+        cfg = self.own(AGENT, self.config)
+        cli.config_path().write_text(cli.render_config(self.base))      # the older single job names it too
+        with self.assertRaises(accounts.Refused) as refused:
+            ac.config_dir_for_switch(cfg)
+        self.assertEqual(str(refused.exception), ac.OTHERS_UNKNOWN, "which config is its own cannot be told")
+
+
 class Watch(Remote):
     def clock(self, start):
         now = [start]
