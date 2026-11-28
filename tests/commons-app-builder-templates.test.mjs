@@ -1773,6 +1773,25 @@ const AGENTS = [
     assert.match(r.text(), /retry the same request/);
   });
 }
+// 'send outcome unknown': a retry sends nothing, so the page points at the original request.
+{
+  const b = fakeMulti({ dbs: deskDbs([{ id: 'r1', cells: { Finding: 'X', Source: 'https://x.example' } }]), primary: 'd1',
+    agents: AGENTS, sendAnswer: { ok: false, reason: 'send outcome unknown' } });
+  const r = await run('research-desk', { bridge: b });
+  const ask = () => r.byId.get('list').children[0].buttons().find((x) => /Ask my agent/.test(x.textContent));
+  ask().click(); await settle(20);
+  check('research-desk/send-outcome-unknown-points-at-the-original-request', () => {
+    assert.match(r.text(), /may already have been sent/);
+    assert.match(r.text(), /private DM with your agent/);
+    assert.ok(!/Not sent|retry the same request/.test(r.text()), r.text());
+  });
+  ask().click(); await settle(20);
+  check('research-desk/send-outcome-unknown-never-makes-a-new-key', () => {
+    const keys = b.calls.filter((c) => c[0] === 'sendTask').map((c) => c[1].key);
+    assert.equal(keys.length, 2);
+    assert.equal(keys[0], keys[1]);
+  });
+}
 {
   const b = fakeMulti({ dbs: deskDbs([{ id: 'r1', cells: { Finding: 'X', Source: 'https://x.example', 'Created by': ['@me:x'] } }]),
     primary: 'd1', agents: [], consent: false });
@@ -2035,6 +2054,32 @@ const afterFirstWrite = (calls) => (calls.some((c) => c[0] === 'createRow' || c[
     const sends = b.calls.filter((c) => c[0] === 'sendTask').map((c) => c[1]);
     assert.equal(sends.length, 2, JSON.stringify(b.calls.map((c) => c[0])));
     assert.equal(sends[0].key, sends[1].key);
+  });
+}
+// 'send outcome unknown': a retry sends nothing, so the row points at the original task.
+{
+  const b = fakeMulti({ dbs: boardDbs(), primary: 'd1', agents: AGENTS,
+    sendAnswer: [{ ok: false, reason: 'send outcome unknown' }, { ok: true, eventId: 't2' }] });
+  const r = await run('task-board', { bridge: b });
+  r.byId.get('title').value = 'Maybe sent';
+  r.byId.get('who').value = AGENTS[1].id;
+  r.byId.get('add').click();
+  await settle(40);
+  check('task-board/send-outcome-unknown-points-at-the-original-task', () => {
+    assert.match(r.text(), /may already have been sent to Home Agent/);
+    assert.match(r.text(), /private DM with Home Agent/);
+    assert.ok(!/not sent to Home Agent|Use "Send to/i.test(r.text()), r.text());
+  });
+  b.fire('d1', { id: 'd1', name: 'Task Board — Tasks', props: TASK_PROPS,
+    rows: [{ id: 'r1', cells: { Task: 'Maybe sent', Status: 'Requested' } }] });
+  await settle(20);
+  check('task-board/send-outcome-unknown-row-says-it-may-be-sent', () => {
+    assert.match(r.text(), /May already be sent to Home Agent: look in your private DM/);
+    assert.ok(!/Not sent to Home Agent/.test(r.text()), r.text());
+  });
+  check('task-board/send-outcome-unknown-offers-no-send-again', () => {
+    assert.ok(!r.byId.get('cols').buttons().some((x) => /again/.test(x.textContent)), r.text());
+    assert.equal(b.calls.filter((c) => c[0] === 'sendTask').length, 1);
   });
 }
 {

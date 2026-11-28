@@ -231,6 +231,11 @@
       return;
     }
     const reason = (r && r.reason) || 'The request was not sent.';
+    // 'send outcome unknown' keeps its key and is not retried: pressing again sends nothing.
+    if (/send outcome unknown/i.test(reason)) {
+      show('warn', 'Your request may already have been sent. Look for it in your private DM with your agent; pressing again here will not send it.');
+      return;
+    }
     if (!/outcome unknown|timed out/i.test(reason)) pendingKeys.delete(what);
     show('bad', 'Not sent: ' + reason + (/outcome unknown|timed out/i.test(reason) ? ' Press again to retry the same request.' : ''));
   };
