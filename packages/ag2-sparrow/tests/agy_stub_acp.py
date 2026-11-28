@@ -23,6 +23,11 @@ does the same; the `tool_call` update before the request is assumed.
 
 Its first log line reports the agy home it would use (`--gemini-dir`, else $HOME/.gemini), whether that
 home holds a settings.json (and its text) or any global context file, and its process directory.
+Long-lived use (one process, many turns): each process's first log line also carries its pid, so a test counts
+spawns; `refuse-load` under $HOME makes `session/load` fail as a load under another sign-in might (assumed
+wording); with `models` the `session/load` answer carries `models` too (assumed: no signed-in agy load has been
+captured); STUB:DIE answers the prompt and then exits, a process that dies while idle; STUB:ROOM answers with
+the room and sender its prompt's shared-session lead names.
 `session/new` offers the modes default, accept-edits and plan as agy's `--mode` names them (assumed: no
 signed-in agy has listed its ACP modes yet); `no-modes` under $HOME offers none, `set-mode-fails` makes
 `session/set_mode` fail.
@@ -97,14 +102,15 @@ DIRS = os.path.join(HOME, "stub-dirs.json")
 
 
 def media_turn(sid, text):
-    """Ask to read each attachment it was told of (copies in its additional directories, the paths the prompt
+    """Ask to read each attachment it was told of (copies anywhere under its additional directories, the paths the prompt
     names, the bridge's original path in the body), read the copies itself, then ask to change one."""
     try:
         with open(DIRS, encoding="utf-8") as f:
             dirs = json.load(f).get(sid) or []
     except (OSError, ValueError):
         dirs = []
-    paths = [os.path.join(d, n) for d in dirs if os.path.isdir(d) for n in sorted(os.listdir(d))]
+    paths = [os.path.join(top, n) for d in dirs if os.path.isdir(d) for top, _, names in sorted(os.walk(d))
+             for n in sorted(names)]
     paths += [p for p in re.findall(r"read-only copy at (\S+?)(?::|;|$)", text, re.M) if p not in paths]
     paths += re.findall(r"\[(?:File|Photo) attached: ([^\]]+)\]", text)
     for p in paths:
@@ -134,6 +140,10 @@ def prompt(rid, params):
                     for b in params.get("prompt") or []]})
     if "STUB:HANG" in text:
         return
+    if "STUB:DIE" in text:
+        chunk(sid, "answered, then exiting")
+        send({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn"}})
+        sys.exit(0)
     if "STUB:QUOTA" in text:
         # What agy answered on a real host once the account's quota ran out.
         send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32603, "message":
@@ -155,6 +165,10 @@ def prompt(rid, params):
     elif "STUB:ASKMODEL" in text:
         # What agy is told to answer when asked about its model, provided the hint reached it.
         chunk(sid, "[model-card]" if "reply with exactly [model-card]" in text else "no hint")
+    elif "STUB:ROOM" in text:
+        # Names the room and sender its prompt's first paragraph gave, so a test sees where each reply goes.
+        lead = re.match(r"\[shared session\] This turn is from room (\S+), sent by (\S+) ", text)
+        chunk(sid, "room %s for %s" % lead.groups() if lead else "no room lead")
     elif "STUB:NOREPLY" in text:
         chunk(sid, "NO_REPLY")
     elif "STUB:MEDIA" in text:
@@ -284,7 +298,7 @@ def boot_record(argv):
             text = f.read()
     except OSError:
         text = None
-    return {"argv": argv, "agy_home": home, "settings": text, "process_cwd": os.getcwd(),
+    return {"argv": argv, "pid": os.getpid(), "agy_home": home, "settings": text, "process_cwd": os.getcwd(),
             "global_context": [n for n in GLOBAL_CONTEXT if os.path.exists(os.path.join(home, n))]}
 
 
@@ -349,11 +363,15 @@ def main():
             else:
                 send({"jsonrpc": "2.0", "id": rid, "result": {}})
         elif method == "session/load":
-            if params.get("sessionId") in sessions():
+            if os.path.exists(os.path.join(HOME, "refuse-load")):
+                send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32603,
+                                                            "message": "session was created by another account"}})
+            elif params.get("sessionId") in sessions():
                 remember_dirs(params["sessionId"], params)
                 launch(params.get("mcpServers"), loading=True)
                 chunk(params["sessionId"], "replayed history")
-                send({"jsonrpc": "2.0", "id": rid, "result": {}})
+                send({"jsonrpc": "2.0", "id": rid,
+                      "result": {"models": MODELS} if os.path.exists(os.path.join(HOME, "models")) else {}})
             else:
                 send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32603, "message": "session not found"}})
         elif method == "session/prompt":

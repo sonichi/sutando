@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
 """Wake Antigravity CLI (`agy`) over ACP for each task file Sparrow queues.
 
-Transport: the Agent Client Protocol over the stdio of `agy acp`, through acp_host's turn: per task, spawn
-the command, `initialize`, resume the task's Session with `session/load` (else `session/new`), send one
-`session/prompt` and wait for it to stop.
+Transport: the Agent Client Protocol over the stdio of `agy acp`. The owner's and attested collaborators' turns,
+from every room, go to one long-lived `agy acp` process (acp_host.AcpHost: started once, `initialize`, the app
+key's `authenticate`) and one shared Session, as local Claude Code keeps one session: opened once with the AG2
+Space MCP server attached, its id kept in `state/shared-session.json` (0600) and resumed with `session/load` after
+a restart; each turn is one `session/prompt` whose first paragraph names the room, the sender and that the reply
+goes back to that room (acp_host.shared_session_lead); a collaborator's turn carries the same non-owner note.
+The process is restarted when it exited, a request timed out, the turn hit a sign-in or quota error, or the
+app's Gemini API key was saved or removed; a turn whose prompt was not sent yet is tried once more. A shared
+Session opened under the other authentication, or whose load agy refuses, is replaced by a new one (logged).
+`--shared-session-turns N` starts a new shared Session after N turns (default 0: never; agy reports no context
+compaction over ACP). Turns still run one at a time. The per-room Sessions of earlier releases
+(`sessions.json`) are no longer used, and left in place.
 
 `<dir>/tasks/task-*.txt` in, `<dir>/results/<task>.txt` out. The turn's final message is the answer (there is
 no reply command). The owner's text keeps its delivery markers, as a Claude Code or Codex result does
@@ -15,18 +24,21 @@ failed gets a line saying so; an event that failed posts nothing. The gateway's 
 
 The task's own attachments (acp_host.task_media) go with the turn: images as prompt image blocks, for every
 served tier; on the owner's turn (an attested collaborator's included) also a read-only copy of each file in a
-folder of the turn's own, which the policy lets agy read and never change. An isolated turn gets no folder,
+folder of the turn's own (inside `state/acp-media`, the shared Session's additional directory), which the policy
+lets agy read and never change. An isolated turn gets no folder,
 and only the sender's own attachments (`own_attachment_headers`): never a replied-to member's.
 
 Sessions, the permission policy and the framing are acp_host's: the owner may read or edit under the working
 directory, no command is granted; with --allow-owner-shell-web the owner's turns, and an attested collaborator's,
 may also run commands and fetch or search the web (SHELL_AND_WEB_KINDS; never plain team or a guest).
 The tier is task_io.turn_policy's alone, mapped by TURNS: the owner and an attested collaborator (Team) get
-the owner's turn (the working directory, agy's own home, the owner's permission policy, a Session of their
-own per room); a restricted sender (a guest, plain team, any unknown tier) is always served, as Sutando
+the owner's turn (the working directory, agy's own home, the owner's permission policy, the shared Session); a
+restricted sender (a guest, plain team, any unknown tier) is always served, as Sutando
 answers every non-owner in a read-only sandbox, in an isolated turn: a fresh temporary directory per task
 holds its working directory and its own agy home (`--gemini-dir`, with deny-all permission rules and no
-global context), its Session is new and never stored, and it is refused unless agy offers a read-only (plan)
+global context), run by a short `agy acp` process of its own (never the long-lived one: agy's permission rules,
+plan mode and home are per process, and the owner's process may run on the owner's API key), its Session is
+new and never stored, it gets no MCP server, and it is refused unless agy offers a read-only (plan)
 session mode and accepts it; a refused verdict is refused. --allow-non-owner still parses and changes
 nothing. The gateway's Sutando tier
 block is written for a core that writes results/<task>.txt and can run `codex exec`; `tier_block_lines` says
@@ -69,6 +81,8 @@ NO_REPLY = "NO_REPLY"
 HELD_WAIT_S = held_start.WAIT_S
 RETRY_S = 60.0
 STDERR_NAME = "agy-acp.stderr"
+# Said in the owner's model card when the pick is not among the models the shared Session lists.
+MODEL_NOT_OFFERED = "this Antigravity session does not offer it"
 NOT_SIGNED_IN = ("Antigravity is not signed in on this computer (%s): run `agy` once in a terminal and sign in, "
                  "or run `agy acp --login`")
 
@@ -563,14 +577,17 @@ def bridge_text_apart(headers, message, operator_lines):
 
 
 def wake_prompt(task_id, headers, message, operator_lines, cwd, note=NON_OWNER_NOTE, shell_web=False,
-                readable=(), kind=None):
+                readable=(), kind=None, shared=False):
     """The turn's prompt. `cwd` is the working directory the turn may read and edit, None for an isolated turn;
     `shell_web` also grants commands and the web; `readable`, an isolated turn's copies of the sender's own
-    attachments, the only files it may read."""
+    attachments, the only files it may read; `shared`, a turn of the shared Session, which opens with the room,
+    the sender and where the reply goes (acp_host.shared_session_lead)."""
     event, _ = trigger_of(headers)
     message, operator_lines = bridge_text_apart(headers, message, operator_lines)
     out = acp_host.task_framing(task_id, headers, message, tier_block_lines(session_lines(operator_lines)),
                                 "post in your final message", note)
+    if shared:
+        out.insert(0, acp_host.shared_session_lead(headers, task_id))
     out.append("Answer through Sparrow, exactly once for this task: your final message in this turn is what Sparrow "
                "posts%s. Write it as the post itself, with no preamble about tools or steps. To post nothing (an "
                "acknowledgement, thanks or FYI that needs no answer, or an event whose body asks for no post), make "
@@ -628,6 +645,20 @@ class Connector:
         # What a person opening this agent's terminal panel follows (`ag2-sparrow-antigravity-local view`).
         # Written off the ACP reader thread, which also answers permission requests.
         self.view = live_view.Writer(live_view.path_of(self.root), background=True)
+        self.host = None      # the long-lived agy and its shared Session (shared_host), started on the first turn
+
+    def shared_host(self):
+        """The one long-lived agy process and shared Session for the owner's and attested collaborators' turns.
+        Its MCP servers are the AG2 Space tools both get (OWNER_TOOLS: the same grant for the two)."""
+        if self.host is None:
+            state = os.path.abspath(self.args.state)
+            self.host = acp_host.AcpHost(
+                lambda *a, **k: self.client_factory(*a, **k), self.args, STDERR_NAME, NOT_SIGNED_IN, log,
+                os.path.join(state, acp_host.SHARED_NAME), on_initialized=self.use_app_gemini_key,
+                mcp_servers=lambda init: self.sspace_servers(init, mcp_auth.OWNER_TOOLS), on_models=self.models_seen,
+                auth_probe=self.accounts.keyed, turn_cap=getattr(self.args, "shared_session_turns", 0),
+                media_root=os.path.realpath(os.path.join(state, acp_host.MEDIA_ROOT_NAME)))
+        return self.host
 
     def models_seen(self, models: dict):
         """Remember what a Session offered (ACP `models`), for the card."""
@@ -734,23 +765,22 @@ class Connector:
 
     def run_turn(self, task_id, headers, prompt, owner, isolated=None, kind=None, message=""):
         """(status, text, detail, turn): status is completed | cancelled | timeout | gone | failed | refused.
-        With `owner` (TURNS' owner turn: the owner's or a collaborator's) it resumes the sender's Session for the
-        room in the working directory, under the owner's policy; any other runs `isolated` (guest_turn's pair),
-        opening one when not given, where only reads of the staged attachments are granted."""
+        With `owner` (TURNS' owner turn: the owner's or a collaborator's) it runs on the shared Session of the
+        long-lived agy (shared_host), in the working directory, under the owner's policy; any other runs
+        `isolated` (guest_turn's pair) in a short agy process of its own, opening one when not given, where only
+        reads of the staged attachments are granted."""
         if owner:
             cwd, tools = self.args.cwd, shell_web_on(self.args, headers, kind)
-            with acp_host.task_media(headers, readable=True, log=log) as media:
+            host = self.shared_host()
+            with acp_host.task_media(headers, readable=True, log=log, parent=host.media_root) as media:
                 read_only = (media.folder,) if media.folder else ()
-                return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt,
-                                           lambda params: acp_host.decide_permission(params, True, cwd, tools=tools,
+                out = host.run_turn(prompt, lambda params: acp_host.decide_permission(params, True, cwd, tools=tools,
                                                                                       extra_keys=AGY_KEYS,
                                                                                       read_only=read_only,
                                                                                       **self.mcp_grant(headers, kind)),
-                                           self.store, STDERR_NAME, NOT_SIGNED_IN, log, media=media, view=self.view,
-                                           model=self.models.wanted(),
-                                           on_models=self.models_seen,
-                                           mcp_servers=self.mcp_servers_for(headers, kind),
-                                           on_initialized=self.use_app_gemini_key)
+                                    media=media, model=self.models.wanted(), view=self.view)
+            self.agy_pid = host.pid or self.agy_pid
+            return out
         if isolated is None:
             with guest_turn(self.args, headers, message) as pair:
                 return self.run_turn(task_id, headers, prompt, False, pair, message=message)
@@ -839,10 +869,6 @@ class Connector:
         """The policy's MCP grant for this sender: the AG2 Space tools for the owner and Team, else none."""
         return {"mcp_tool_ok": mcp_auth.owner_tool_ok} if sspace_tools_for(headers, kind) else {}
 
-    def mcp_servers_for(self, headers, kind=None):
-        tools = sspace_grant(headers, kind)
-        return (lambda init: self.sspace_servers(init, tools)) if tools else None
-
     def answer_body(self, headers, status, text, detail, turn=None):
         """What Sparrow posts: the turn's own text, the owner's with its markers acting (`acp_host.owner_text`),
         anyone else's quoted so no delivery marker in it acts; NO_REPLY or a
@@ -901,12 +927,11 @@ class Connector:
         switched = ""
         if owner_turn:
             prompt = wake_prompt(task_id, headers, message, operator_lines, self.args.cwd, self.note,
-                                 shell_web=shell_web_on(self.args, headers, kind), kind=kind)
+                                 shell_web=shell_web_on(self.args, headers, kind), kind=kind, shared=True)
             if headers.get("access_tier") == "owner" and self.models.usable():
                 prompt += "\n\n" + model_switch.HINT
             if headers.get("access_tier") == "owner" and self.accounts.usable():
                 prompt += "\n\n" + self.accounts.HINT
-            self.agy_pid = None
             status, text, detail, turn = self.run_turn(task_id, headers, prompt, True, kind=kind)
             switched = self.account_seen() if kind == OWNER and self.in_owner_dm(path) else ""
         else:
@@ -918,11 +943,17 @@ class Connector:
         # The outcome of an earlier pick goes first: a menu asked for in this turn then stays the card in force.
         # The owner's pick runs on every turn, whoever sends it; the outcome is told in the owner's DM only,
         # and only the owner's own turn may settle it as failed (another runtime's refusal is not theirs).
-        told = self.models.tell(turn.live, turn.model, headers.get("channel_id"), may_fail=kind == OWNER)
+        told = self.models.tell(turn.live, turn.model, headers.get("channel_id"), may_fail=kind == OWNER,
+                                **({"why": MODEL_NOT_OFFERED} if turn.model_skipped else {}))
+        if turn.model_skipped and told and kind == OWNER:
+            # The owner was told once; the pick is kept, and applies on a Session that offers it.
+            self.models.save(wanted=turn.model_skipped)
         asked = self.desk.marked(headers.get("access_tier"), path, status, text, result_file)
         # Out of quota: the owner is told by the account card, on each message; the card is the notice, so the room gets
         # no error line while agy is out (or the limit's own words when no card could be sent).
         limited = not asked and agy_account.quota_error(status, text, detail)
+        if owner_turn and limited and self.host is not None:
+            self.host.close()     # the owner may switch account for the limit: the next turn starts agy again
         quota = self.quota_hit(text, detail, task_id, task_text) if limited else (self.quota.cleared() if status == "completed" else "")
         unsaid = "" if asked else quoted(self.models.unsaid()).strip()
         body = self.answer_body(headers, status, text, detail, turn) + (unsaid and unsaid + "\n")
@@ -945,7 +976,12 @@ class Connector:
                 kept = "\n".join(x for x in (quoted(switched).strip() if switched else "", unsaid) if x)
                 body = kept + "\n" if kept else account_switch.ANSWERED
         reason = ""
-        if self.launch is not None:
+        if self.launch is None and owner_turn and turn.session_id and sspace_tools_for(headers, kind):
+            # The shared Session was already open: its tools are the ones its own launch left it with.
+            reason = LaunchLog(self.args.session_store).get(turn.session_id)
+            if reason:
+                log("ag2-space MCP tools: the shared Session's launch:", reason)
+        elif self.launch is not None:
             launches = LaunchLog(self.args.session_store)
             reason, seen = tools_down(self.launch[0], self.launch[1], turn.resumed)
             if reason is None:
@@ -977,6 +1013,8 @@ class Connector:
         try:
             self._serve()
         finally:
+            if self.host is not None:
+                self.host.close()   # the long-lived agy ends with the connector
             self.view.drain()   # lines still queued for the live view reach it before the process ends
 
     def _serve(self):
@@ -1042,6 +1080,8 @@ def build_parser():
     ap.add_argument("--allow-owner-shell-web", action="store_true",
                     help="let the owner's turns, and an attested collaborator's, run shell commands and fetch or "
                          "search the web (never plain Team's or a guest's; default: off)")
+    ap.add_argument("--shared-session-turns", type=count_arg, default=0,
+                    help="start a new shared Session after this many turns (default 0: never)")
     ap.add_argument("--once", type=count_arg, default=0, help="exit after N tasks")
     ap.add_argument("--idle-exit", type=float, default=0, help="exit after S idle seconds")
     ap.add_argument("--poll", type=float, default=0.2)

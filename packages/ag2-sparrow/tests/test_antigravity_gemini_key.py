@@ -112,6 +112,10 @@ class Base(unittest.TestCase):
                                                              environ={}))
         patcher.start()
         self.addCleanup(patcher.stop)
+        # Whether a key is saved (the long-lived agy restarts when that changes): the fake Keychain, never the real one.
+        saved = mock.patch.object(gk, "key_saved", lambda agent_id="": gk.agent_service(agent_id) in self.keychain.items)
+        saved.start()
+        self.addCleanup(saved.stop)
 
     def args(self, *extra):
         a = gc.build_parser().parse_args(["--work", str(self.tmp / "work"), "--cwd", str(self.tmp / "cwd"),
@@ -136,6 +140,9 @@ class Base(unittest.TestCase):
         with contextlib.redirect_stderr(err):
             status, _, detail, _ = conn.run_turn("task-g", headers, "hello", False)
         return status, detail, err.getvalue()
+
+    def shared(self):
+        return acp_host.SharedSessionFile(self.tmp / "work" / "state" / acp_host.SHARED_NAME).read()
 
     @staticmethod
     def authenticates(agy):
@@ -203,13 +210,13 @@ class OwnerTurns(Base):
                 self.assertNotEqual(status, "completed", "not run on a process whose account is unknown")
                 (agy,) = FakeAgy.spawned
                 self.assertEqual(agy.methods_called(), ["initialize", "authenticate"], "no Session on it")
-                self.assertIsNone(conn.store.get(("!r:s.space", "owner")), "and none recorded, under any mode")
+                self.assertIsNone(self.shared(), "and none recorded, under any mode")
                 self.assertIn("this agy is not used", logs)
                 self.assertNotIn(DUMMY_KEY, logs + str(detail))
                 # The next turn is a fresh agy that answers: it runs on the key and records that.
                 status, _, _ = self.owner_turn(conn, task="task-2")
                 self.assertEqual(status, "completed")
-                self.assertEqual(conn.store.get(("!r:s.space", "owner"))["auth"], gk.API_KEY_AUTH)
+                self.assertEqual(self.shared()["auth"], gk.API_KEY_AUTH)
                 self.assertEqual(len(FakeAgy.spawned), 2, "a new process, not the one left in doubt")
 
     def test_the_setup_check_reports_an_unanswered_authenticate_instead_of_calling_it_signed_in(self):
@@ -230,33 +237,46 @@ class SessionsKeepTheirAuth(Base):
     def test_a_sign_in_session_is_not_resumed_on_the_key_and_a_key_session_is(self):
         conn = gc.Connector(self.args())
         self.owner_turn(conn, "task-1")                       # no key yet: on the sign-in
-        rec = conn.store.get(("!r:s.space", "owner"))
+        rec = self.shared()
         self.assertEqual(rec["auth"], acp_host.SIGNED_IN_AUTH)
         first = rec["session_id"]
 
         self.keychain.items[gk.agent_service(AGENT)] = wrapped(DUMMY_KEY)
-        _, _, logs = self.owner_turn(conn, "task-2")          # key saved: a new Session, not session/load
+        _, _, logs = self.owner_turn(conn, "task-2")          # key saved: agy restarted, a new Session, not session/load
+        self.assertEqual(len(FakeAgy.spawned), 2, "the long-lived agy is restarted on the key")
+        self.assertIn("restarting the agent: the authentication changed", logs)
         agy = FakeAgy.spawned[-1]
-        self.assertNotIn("session/load", agy.methods_called())
-        self.assertIn("session/new", agy.methods_called())
-        self.assertIn("not resuming session %s" % first, logs)
-        rec = conn.store.get(("!r:s.space", "owner"))
+        self.assertEqual(agy.methods_called()[:3], ["initialize", "authenticate", "session/new"])
+        self.assertIn("not resuming shared session %s" % first, logs)
+        rec = self.shared()
         self.assertEqual(rec["auth"], gk.API_KEY_AUTH)
         self.assertNotEqual(rec["session_id"], first)
 
-        self.owner_turn(conn, "task-3")                       # still on the key: resumed
+        self.owner_turn(conn, "task-3")                       # still on the key: the same process and Session
+        self.assertEqual(len(FakeAgy.spawned), 2)
+        self.assertEqual([p["sessionId"] for m, p in agy.calls if m == "session/prompt"], [rec["session_id"]] * 2)
+        conn.host.close()
+        self.owner_turn(gc.Connector(self.args()), "task-4")   # a restarted connector, still on the key: resumed
         agy = FakeAgy.spawned[-1]
         self.assertEqual([p["sessionId"] for m, p in agy.calls if m == "session/load"], [rec["session_id"]])
         self.assertNotIn("session/new", agy.methods_called())
 
+        del self.keychain.items[gk.agent_service(AGENT)]
+        conn = gc.Connector(self.args())
+        _, _, logs = self.owner_turn(conn, "task-5")          # the key removed: back on the sign-in, a new Session
+        self.assertIn("not resuming shared session %s" % rec["session_id"], logs)
+        self.assertEqual(self.shared()["auth"], acp_host.SIGNED_IN_AUTH)
+
     def test_a_session_saved_before_this_change_counts_as_sign_in(self):
         conn = gc.Connector(self.args())
-        conn.store.remember(("!r:s.space", "owner"), "old-1", str(self.tmp / "cwd"), 3)   # no auth field
+        store = acp_host.SharedSessionFile(self.tmp / "work" / "state" / acp_host.SHARED_NAME)
+        store.write({"session_id": "old-1", "cwd": str(self.tmp / "cwd"), "turns": 3})   # no auth field
         self.owner_turn(conn)                                   # no key: resumed as before
         self.assertIn("session/load", FakeAgy.spawned[-1].methods_called())
-        conn.store.remember(("!r:s.space", "owner"), "old-2", str(self.tmp / "cwd"), 3)
+        conn.host.close()
+        store.write({"session_id": "old-2", "cwd": str(self.tmp / "cwd"), "turns": 3})
         self.keychain.items[gk.agent_service(AGENT)] = wrapped(DUMMY_KEY)
-        self.owner_turn(conn, "task-2")                         # key: not resumed
+        self.owner_turn(gc.Connector(self.args()), "task-2")   # key: not resumed
         self.assertNotIn("session/load", FakeAgy.spawned[-1].methods_called())
 
 
