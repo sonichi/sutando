@@ -56,7 +56,7 @@ function setup(host) {
   await tick();
   assert.equal(lists, 0);
   assert.equal(d.querySelector('input[value="mobile"]').checked, true);
-  assert.equal($('checklist-progress').max, 9);
+  assert.equal($('checklist-progress').max, 14);
   d.querySelector('input[value="dm"]').click();
   await tick();
   assert.deepEqual(selected, ['dm', 'mobile']);

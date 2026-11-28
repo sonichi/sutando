@@ -28,6 +28,7 @@ Machine-readable ownership and lifecycle metadata lives in
 - [Migration transition window](migration-transition-window.md) — 30-day reader fallback.
 - [Learn from demonstration](learn-from-demonstration.md) — owner-taught preference capture.
 - [Tutorial delivery](tutorial-delivery.md) — the `tutorial` skill: voice walkthrough and the s.space Getting started page.
+- [Tutorial publisher internals](tutorial-publisher.md) — how the Getting started publisher keeps one page per room, and the feature-list format.
 - [Graceful shutdown](graceful-shutdown.md) — which restart path signals the core to exit cleanly.
 - [Proactive loop rationale](proactive-loop-rationale.md) — the measurements and incidents behind each step of `skills/proactive-loop/SKILL.md`, which itself carries only the commands.
 - [Task watcher hosting modes](task-watcher-hosting-modes.md) — session watcher vs the supervisor's standby: the tag, the two per-inbox verdicts, the readiness proof, the handoff contract and its timings, the known gaps.

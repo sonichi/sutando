@@ -126,7 +126,7 @@ def render_guide(head, marker, name, roles, prompts):
     quick = {
         "DM": "What can you do for me today?",
         "COMMONS": "Help me make a team offsite plan in Commons. Ask me which room to use before sharing it.",
-        "TEAMWORK": "Research three note-taking apps for a small team, then ask another agent to review your answer if permitted.",
+        "TEAMWORK": "Set up a demo room with one of my workers. Ask it to review a short answer from you, and show me the thread.",
         "APPS": "Connect my Google Calendar.",
     }
     finale = prompts.get("finale")

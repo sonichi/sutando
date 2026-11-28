@@ -2,7 +2,7 @@
 
 The steps come from a feature list, `feature-list.json` beside this skill's scripts (or one passed
 in): `{schema_version, revision, steps[{id, title, body[what, how], surface, screenshot, since_release,
-paste?, runtime?, watches?, link?}], reviewed_at?}`, the owner-step shape AG2 Space's backend serves. `parse_list` validates it and
+paste?, locate?, runtime?, watches?, link?}], reviewed_at?}`, the owner-step shape AG2 Space's backend serves. `parse_list` validates it and
 `render_page(name, core, ..., features, media)` renders it; the page records the list's `revision` in
 its ownership meta tag, so a later run can tell whether its list is newer. Each screenshot is an
 asset reference `{asset, hd_file?, fallback_file, alt, caption?}`: `hd_file` is the full-resolution capture
@@ -11,7 +11,9 @@ publish uploads to the room's media (room.media.upload); when `media` maps the a
 data: URI. Pure: rendering depends on nothing but its
 arguments. No external resource is loaded (the HTML surface's sandbox may block them), so every
 graphic is inline SVG and every image room media or a data: URI; the one outbound URL is a step's
-optional app-store `link`, a plain anchor to an allowlisted store page. Progress is kept
+optional app-store `link`, a plain anchor to an allowlisted store page. A step's `paste` is what the
+viewer asks their agent; "Do it with your agent" sends it through `window.artifact.sendToMyAgent`
+when the host offers it (Copy stays), and `locate` is the collapsed "Where is it?". Progress is kept
 in the page runtime's `window.artifact.state` under a per-viewer key; when the runtime names no
 viewer it uses this browser's localStorage, then memory, and every storage access is guarded.
 """
@@ -88,6 +90,7 @@ class Section(NamedTuple):
     since_release: str = ""
     watches: Tuple[str, ...] = ()
     link: Optional[Tuple[str, str]] = None
+    locate: Optional[str] = None
 
 
 class FeatureList(NamedTuple):
@@ -150,6 +153,14 @@ ICONS = {
               f'<path {_S} d="M24 16h16a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-9l-5 4v-4h-2a2 2 0 0 1-2-2V18a2 2 0 0 1 2-2z"/>',
     "phone": f'<rect {_S} x="18" y="4" width="28" height="56" rx="6"/><path {_S} d="M28 52h8"/>'
                   f'<path {_S} d="M32 14v22M24 28l8 8 8-8"/>',
+    "workers": f'<circle {_S} cx="22" cy="20" r="8"/><path {_S} d="M8 50c2-12 26-12 28 0"/>'
+               f'<circle {_S} cx="44" cy="24" r="6"/><path {_S} d="M38 40c8-4 18 0 18 10"/>',
+    "schedule": f'<circle {_S} cx="32" cy="34" r="22"/><path {_S} d="M32 20v14l10 6"/><path {_S} d="M14 8l-6 6M50 8l6 6"/>',
+    "memory": f'<path {_S} d="M24 10a10 10 0 0 0-10 10 10 10 0 0 0-4 18 10 10 0 0 0 14 14V10z"/>'
+              f'<path {_S} d="M40 10a10 10 0 0 1 10 10 10 10 0 0 1 4 18 10 10 0 0 1-14 14V10z"/>',
+    "checkin": f'<path {_S} d="M10 44h44"/><path {_S} d="M18 44a14 14 0 0 1 28 0"/>'
+               f'<path {_S} d="M32 12v8M14 20l5 5M50 20l-5 5M6 34h6M52 34h6"/>',
+    "report": f'<path {_S} d="M32 6l26 46H6z"/><path {_S} d="M32 24v12"/><circle cx="32" cy="43" r="2" fill="currentColor"/>',
 }
 DEFAULT_ICON = f'<path {_S} d="M32 6l6 16 16 6-16 6-6 16-6-16-16-6 16-6z"/>'
 
@@ -285,7 +296,11 @@ def _step(raw: object, n: int, assets: Path) -> Section:
         if not isinstance(text, str) or not text.strip() or len(text) > LINK_TEXT_MAX:
             raise ValueError(f"{where}: link text must be 1-{LINK_TEXT_MAX} characters, got {text!r}")
         link = (href, _no_tags(text, f"{where} link text"))
-    return Section(sid, title, what, how, paste, surface, tuple(images), runtime, since, tuple(watches), link)
+    locate = raw.get("locate")
+    if locate is not None:
+        locate = _text(locate, f"{where} locate")
+    return Section(sid, title, what, how, paste, surface, tuple(images), runtime, since, tuple(watches), link,
+                   locate)
 
 
 def parse_list(data: object, assets: Optional[Path] = None) -> FeatureList:
@@ -423,12 +438,16 @@ def _data_uri(filename: str) -> str:
     return f"data:{mime};base64," + base64.b64encode((ASSETS / filename).read_bytes()).decode("ascii")
 
 
-def _prompt(key: str, prompt: str, where: Optional[str]) -> str:
+def _prompt(key: str, prompt: str, where: Optional[str], ask: bool = True) -> str:
+    """The step's request with Copy, and with "Do it with your agent" when `ask`: a request that
+    acts in "this room" is copy-only on a page outside a room, which has no room to act in."""
     esc = html.escape(prompt, quote=True)
     hint = f'<p class="paste">Paste in: {WHERE[where]}</p>' if where else ""
     return (f'<div class="prompt"><code id="p-{key}">{html.escape(prompt)}</code>'
             f'<button type="button" class="copy" data-prompt="{esc}" aria-describedby="p-{key}">Copy</button>'
-            f'</div>{hint}')
+            + (f'</div><p class="ask-row"><button type="button" class="ask" data-ask="{esc}" '
+               f'data-key="tutorial-{key}" hidden>Do it with your agent</button></p>' if ask else '</div>')
+            + hint)
 
 
 def _shots(images: Tuple[Shot, ...], media: Dict[str, str]) -> str:
@@ -489,8 +508,18 @@ def role_labels(roles: object) -> List[str]:
     return list(out.values())[:ROLES_MAX]
 
 
-def _section(sec: Section, index: int, who: str, prompts: Dict[str, str], media: Dict[str, str]) -> str:
-    prompt = _prompt(sec.id, prompts.get(sec.id, sec.prompt), sec.where) if sec.prompt else ""
+def _locate(sec: Section, who: str, media: Dict[str, str]) -> str:
+    """The step's click path and screenshots, collapsed under "Where is it?"; asking comes first."""
+    if not sec.locate:
+        return _shots(sec.images, media)
+    return (f'<details class="locate"><summary>Where is it?</summary><p>{sec.locate.format(name=who)}</p>'
+            f'{_shots(sec.images, media)}</details>')
+
+
+def _section(sec: Section, index: int, who: str, prompts: Dict[str, str], media: Dict[str, str],
+             in_room: bool = False) -> str:
+    ask = sec.where != "room" or in_room
+    prompt = _prompt(sec.id, prompts.get(sec.id, sec.prompt), sec.where, ask) if sec.prompt else ""
     icon = ICONS.get(sec.id, DEFAULT_ICON)
     tone = accent(index)
     return (
@@ -499,7 +528,7 @@ def _section(sec: Section, index: int, who: str, prompts: Dict[str, str], media:
         f'<div class="icon" aria-hidden="true"><svg viewBox="0 0 64 64" focusable="false">{icon}</svg></div>'
         f'<div class="body"><h2 id="h-{sec.id}">{sec.title.format(name=who)}</h2>'
         f'<p>{sec.what.format(name=who)}</p><p class="how">{sec.how.format(name=who)}</p>{_link(sec.link)}{prompt}'
-        f'{_shots(sec.images, media)}'
+        f'{_locate(sec, who, media)}'
         f'<label class="done"><input type="checkbox" data-done="{sec.id}" disabled> Mark done</label>'
         '</div></section>'
     )
@@ -594,6 +623,12 @@ p { margin:0 0 6px; }
 .shots figcaption { color:var(--label); font-size:13px; font-weight:500; line-height:1.2; text-align:center; }
 #s-phone .shot-app-store-qr img { width:132px; border-radius:10px; }
 .store { margin:8px 0 0; }
+.ask-row { margin:8px 0 0; }
+.ask { color:var(--ink); background:radial-gradient(closest-side, var(--orange-in) 70%%, var(--orange-out) 130%%); }
+.ask.sent { color:var(--fg); background:var(--code); }
+.locate { margin:10px 0 0; font-size:13px; color:var(--muted); }
+.locate summary { cursor:pointer; min-height:32px; line-height:32px; }
+.locate p { margin:4px 0 0; }
 .store a { color:var(--brand); font-weight:500; text-underline-offset:3px; }
 .finale { position:relative; isolation:isolate; overflow:hidden; border-top-color:var(--brand); }
 .finale::before { content:""; position:absolute; z-index:-1; width:200px; height:280px; right:-60px; top:-120px; transform:rotate(38deg);
@@ -801,6 +836,56 @@ COPY_SCRIPT = """<script>
 })();
 </script>"""
 
+# The key binds step, agent and text, so no old receipt is reused; only a known decline gets a new
+# attempt key, since the host keeps a decline for its key and replays any other key at most once.
+SEND_SCRIPT = """<script>
+(() => {
+  const host = (() => { try { return window.artifact || null; } catch (e) { return null; } })();
+  if (!host || typeof host.sendToMyAgent !== 'function' || !host.agent || typeof host.agent.list !== 'function') return;
+  const status = document.getElementById('status');
+  const say = (m) => { status.textContent = ''; setTimeout(() => { status.textContent = m; }, 60); };
+  const hash = (s) => { let h = 0x811c9dc5; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; } return ('0000000' + h.toString(16)).slice(-8); };
+  const attempts = new Map();
+  let agent = null;
+  const pick = async () => {
+    if (agent) return agent;
+    try { await host.ready; } catch (e) { /* the list call reports */ }
+    const list = await host.agent.list();
+    if (!Array.isArray(list) || !list.length) return null;
+    agent = list[0];
+    return agent;
+  };
+  document.querySelectorAll('button.ask').forEach((b) => { b.hidden = false; });
+  document.addEventListener('click', async (ev) => {
+    const btn = ev.target.closest && ev.target.closest('button.ask');
+    if (!btn || btn.disabled) return;
+    btn.disabled = true;
+    try {
+      const a = await pick();
+      if (!a) { say('Allow this page to see your agents when asked, then tap again.'); btn.disabled = false; return; }
+      const text = btn.getAttribute('data-ask');
+      const base = btn.getAttribute('data-key') + '-' + hash(a.id + '\\n' + text);
+      const n = attempts.get(base) || 0;
+      const key = n ? base + '-r' + n : base;
+      const r = await host.sendToMyAgent({ agentId: a.id, text, key });
+      if (r && r.ok) {
+        btn.classList.add('sent');
+        btn.textContent = 'Sent to ' + (a.name || 'your agent');
+        say('Sent to ' + (a.name || 'your agent') + '. The reply comes in your DM.');
+        return;
+      }
+      if (r && r.reason === 'declined') {
+        attempts.set(base, n + 1);
+        say('Not sent. Tap to ask again, or copy the line.');
+      } else {
+        say('Not sure it was sent' + (r && r.reason ? ' (' + r.reason + ')' : '') + '. Tap to check; it is never sent twice.');
+      }
+      btn.disabled = false;
+    } catch (e) { say('Not sure it was sent. Tap to check; it is never sent twice.'); btn.disabled = false; }
+  });
+})();
+</script>"""
+
 # Set before the body paints, so a scripted page opens on one step instead of flashing all of them.
 HEAD_SCRIPT = "<script>document.documentElement.classList.add('js');</script>"
 
@@ -820,7 +905,7 @@ SECTIONS = [s for s in FEATURES.steps if s.runtime is None]
 PROMPT_SLOTS = prompt_slots(FEATURES)
 
 
-PAGE_TAIL = f"</main>{SCRIPT}{COPY_SCRIPT}</body></html>\n"
+PAGE_TAIL = f"</main>{SCRIPT}{COPY_SCRIPT}{SEND_SCRIPT}</body></html>\n"
 MARKER = re.compile(r'<meta name="sutando-tutorial" content="([^"]*)"(?: data-revision="([^"]*)")?'
                     r'(?: data-digest="([0-9a-f]{64})")?>')
 DIGEST_SLOT = "f" * 64
@@ -899,7 +984,7 @@ def render_page(name: str, core: str = "unknown", audience: str = "dm", agent: O
             + (f"A quick tour with your personal native agent, {who}. Try one thing in each part."
                if audience == "dm" else "A quick tour. Try one thing in each part."))
     secs = sections_for(core, features)
-    body = "".join(_section(s, i, who, prompts, media) for i, s in enumerate(secs))
+    body = "".join(_section(s, i, who, prompts, media, audience == "room") for i, s in enumerate(secs))
     overview_style, overview_body = overview_parts()
     checklist_header = (f'<header class="hero">{HERO}<div><h1>Getting started with {who}</h1>'
                         f'<p class="lead">{lead}</p>{picked}</div></header>')

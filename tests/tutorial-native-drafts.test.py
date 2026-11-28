@@ -68,11 +68,24 @@ class NativeGuideTest(unittest.TestCase):
 
     def test_keeps_one_mobile_step_and_original_app_store_qr(self):
         self.assertEqual(re.findall(r'type="checkbox" value="([a-z]+)"', self.page),
-                         ["dm", "rooms", "commons", "agents", "teamwork", "calls", "apps", "activity", "mobile"])
+                         ["dm", "rooms", "commons", "workers", "agents", "teamwork", "apps", "schedule", "calls",
+                          "memory", "checkin", "activity", "mobile", "report"])
         self.assertIn('href="https://apps.apple.com/us/app/s-space-human-ai-workspace/id6788541784"', self.page)
         qr = base64.b64decode(re.search(r'data:image/png;base64,([A-Za-z0-9+/=]+)', self.page)[1])
         self.assertEqual(hashlib.sha256(qr).hexdigest(),
                          "0c1c20a57249750a6795c7e29843b1f9ccf6c54d68a3b33f398444552ca1f030")
+
+    def test_every_step_asks_the_agent_and_click_paths_are_collapsed(self):
+        rows = re.findall(r'<details class="check-step">(.*?)</label></div></details>', self.page, re.S)
+        self.assertEqual(len(rows), 14)
+        for row in rows:
+            self.assertRegex(row, r'class="btn-nav primary guide-ask" data-draft="[^"{}]+"', row[:80])
+            body = re.sub(r'<details class="where">.*?</details>', "", row, flags=re.S)
+            for click in ("Press +", "Open Settings", "choose ", "room header"):
+                self.assertNotIn(click, body, row[:80])
+        self.assertIn("Set up a demo room with one of my workers.", self.page)
+        for wrong in ("&rarr; Connected apps", "\u2192 Connected apps", "Plan &amp; usage", "choose Room."):
+            self.assertNotIn(wrong, self.page)
 
     def test_edit_select_confirm_and_no_bridge(self):
         node = shutil.which("node")

@@ -86,9 +86,19 @@ STUB = textwrap.dedent('''
 ''')
 
 
-TOUR = ["Your DM", "Rooms", "Commons", "Connect other agents", "Teamwork", "Calls & voice",
-        "Connect your apps", "Activity & notices", "Get the mobile app", "Mobile"]
+TOUR = ["Your DM", "Rooms", "Commons", "Your workers", "Connect other agents", "Teamwork", "Connect your apps",
+        "Schedule something", "Calls & voice", "Memory", "Morning check-in", "Activity & notices",
+        "Get the mobile app", "Pair your phone", "Something not working?"]
 FINALE = "You\u2019re set. Ask Blue anything"
+ROOMS_PROMPT = [s for s in gs.tour_page.FEATURES.steps if s.id == "rooms"][0].prompt
+
+
+def send_key(step, agent_id, text):
+    """The page's send key: the step, then FNV-1a over agent id, newline and text (UTF-16 units)."""
+    h = 0x811C9DC5
+    for unit in (agent_id + "\n" + text).encode("utf-16-le")[::2]:
+        h = ((h ^ unit) * 0x01000193) & 0xFFFFFFFF
+    return f"tutorial-{step}-{h:08x}"
 # The stub room-commons has no room_media.py: every full-resolution capture stays inlined.
 NO_MEDIA_SUPPORT = {"uploaded": [], "skipped": [], "fallback": list(gs.tour_page.hd_files(gs.tour_page.FEATURES)),
                     "reason": "this room-commons has no room media support (room_media.py)"}
@@ -128,9 +138,9 @@ def steps(page):
 
 
 class RenderTest(unittest.TestCase):
-    def test_tour_has_all_ten_sections_in_order(self):
+    def test_tour_has_all_fifteen_sections_in_order(self):
         for core in gs.CORES:
-            self.assertEqual(steps(gs.render_page("Blue", core))[:10], TOUR)
+            self.assertEqual(steps(gs.render_page("Blue", core)), TOUR)
         self.assertLess(TOUR.index("Connect other agents"), TOUR.index("Teamwork"))
 
     def test_no_core_gets_a_claude_code_import_section(self):
@@ -140,7 +150,7 @@ class RenderTest(unittest.TestCase):
             self.assertNotIn("Import your Claude Code history", page)
             self.assertNotIn("Import my Claude Code history", page)
             self.assertNotIn('id="s-import"', page)
-            self.assertIn("separate local-agent options", page)
+            self.assertIn("are local-agent options there", page)
         self.assertFalse(hasattr(gs, "IMPORT_PROMPT"))
 
     def test_unknown_core_value_is_refused(self):
@@ -152,22 +162,26 @@ class RenderTest(unittest.TestCase):
         self.assertEqual([b for b in parse(page).buttons if b],
                          [gs.tour_page.FINALE_PROMPT] + [s.prompt for s in gs.SECTIONS if s.prompt])
         self.assertIn(gs.CONNECT_PROMPT, parse(page).buttons)
-        self.assertIn("Settings &rarr; Apps &rarr; Connected apps", page)
+        self.assertIn("Open Settings from your avatar at the bottom left, then Integrations.", page)
+        for wrong in ("&rarr; Connected apps", "\u2192 Connected apps"):
+            self.assertNotIn(wrong, page)
         self.assertIn("navigator.clipboard", page)
         self.assertIn("prefers-color-scheme: dark", page)
 
     def test_dm_step_comes_first_and_says_personal_answers_stay_in_the_dm(self):
         dm = gs.SECTIONS[0]
         self.assertEqual((dm.id, dm.title, dm.where), ("dm", "Your DM", "dm"))
-        self.assertIn("unless you explicitly ask to share it", dm.what)
+        self.assertIn("unless you ask to share it", dm.what)
         self.assertEqual(dm.prompt, "What can you do for me today?")
 
     def test_every_prompt_says_where_to_paste_it(self):
         where = {s.id: s.where for s in gs.sections_for("claude") if s.prompt}
-        self.assertEqual(where, {"dm": "dm", "commons": "room", "teamwork": "room", "apps": "dm"})
+        self.assertEqual(where, {**{i: "dm" for i in ("dm", "rooms", "workers", "agents", "teamwork", "apps", "schedule",
+                                                       "calls", "memory", "checkin", "activity", "mobile", "report")},
+                                 "commons": "room"})
         page = gs.render_page("Blue", "claude")
-        self.assertEqual(page.count('<p class="paste">Paste in: a room</p>'), 2)
-        self.assertEqual(page.count('<p class="paste">Paste in: your DM</p>'), 3)  # dm, apps, finale
+        self.assertEqual(page.count('<p class="paste">Paste in: a room</p>'), 1)
+        self.assertEqual(page.count('<p class="paste">Paste in: your DM</p>'), 14)  # 13 steps and the finale
 
     def test_closing_card_is_hidden_until_everything_is_done(self):
         page = gs.render_page("Blue", "claude")
@@ -184,39 +198,72 @@ class RenderTest(unittest.TestCase):
         page = gs.render_page("Blue", "codex")
         self.assertNotRegex(page, r"Step \d+ of \d+")
         self.assertIn('<p class="step-title"><span id="step-title">Your DM</span>'
-                      '<span class="pos" id="step-pos" aria-hidden="true">1/10</span></p>', page)
+                      '<span class="pos" id="step-pos" aria-hidden="true">1/15</span></p>', page)
         self.assertNotRegex(page, r'id="step-title"[^>]*aria-live')  # announced once, by heading focus
         self.assertIn("stepPos.textContent = (cur + 1) + '/' + ids.length", gs.tour_page.SCRIPT)
         self.assertIn("stepTitle.textContent = titles[cur]", gs.tour_page.SCRIPT)
 
+    def test_a_room_only_step_is_copy_only_when_the_page_is_launched_outside_a_room(self):
+        # The Commons ask says "this room": from the owner's DM there is no room to act in, so it
+        # keeps Copy and its "Paste in: a room" hint, and only a room's page offers the send.
+        def commons(page):
+            return page.split('id="s-commons"', 1)[1].split("</section>", 1)[0]
+        dm = commons(gs.render_page("Blue", "claude", "dm"))
+        room = commons(gs.render_page("Blue", "claude", "room"))
+        self.assertNotIn('class="ask"', dm)
+        self.assertIn('class="copy"', dm)
+        self.assertIn("Paste in: a room", dm)
+        self.assertIn('class="ask"', room)
+        rooms = gs.render_page("Blue", "claude", "room")
+        self.assertEqual(rooms.count('<button type="button" class="ask"'), 15)
+        for sec in gs.sections_for("claude"):
+            if sec.prompt and sec.where == "room":
+                self.assertNotIn('data-key="tutorial-%s"' % sec.id, gs.render_page("Blue", "claude", "dm"))
+
     def test_reviewed_wording(self):
         by = {s.id: s for s in gs.sections_for("claude")}
-        self.assertIn("Claude Duet, Dot, Grok Bot, Hermes, Muse or OpenClaw", by["agents"].how)
-        self.assertIn("Mention &amp; Keywords", by["activity"].how)
-        self.assertIn("Activity tab", by["activity"].how)
+        self.assertIn("Claude Duet, Dot, Grok Bot, Hermes, Muse or OpenClaw", by["agents"].what)
+        self.assertIn("Activity tab", by["activity"].locate)
         self.assertNotIn("import", by)
-        self.assertIn("headphone icon in the room header", by["calls"].how)
-        self.assertIn("Bring an agent?", by["calls"].how)
-        self.assertIn("+ at the top of the room list", by["rooms"].how)
+        self.assertIn("headphone icon in the room header", by["calls"].locate)
+        self.assertIn("Bring an agent?", by["calls"].locate)
+        self.assertIn("+ at the top of the room list and choose New room", by["rooms"].locate)
 
-    def test_latest_commons_copy_is_rendered_in_ten_step_tour(self):
+    def test_every_step_asks_the_agent_and_click_paths_are_collapsed(self):
+        # The agent does the step: each step but the app install carries the ask, and every click path
+        # sits under "Where is it?", never in the step's own text.
+        for sec in gs.sections_for("claude"):
+            if sec.id == "phone":
+                self.assertIsNone(sec.prompt)
+                continue
+            self.assertTrue(sec.prompt, sec.id)
+            for click in ("Press ", "Click ", "Open Settings", "choose "):
+                self.assertNotIn(click, sec.how, (sec.id, click))
+        page = gs.render_page("Blue", "claude")
+        # The page is launched in the DM here: the room-only Commons step is copy-only (below).
+        self.assertEqual(page.count('<button type="button" class="ask"'), 14)  # 13 steps and the finale
+        self.assertEqual(page.count("<summary>Where is it?</summary>"),
+                         len([s for s in gs.sections_for("claude") if s.locate]))
+        for wrong in ("&rarr; Connected apps", "\u2192 Connected apps", "choose Room.", "Plan &amp; usage"):
+            self.assertNotIn(wrong, page)
+
+    def test_latest_copy_is_rendered_in_fifteen_step_tour(self):
         # These are intentional emitted-copy pins, not source-code assertions.
         page = gs.render_page("Example", "claude")
-        for phrase in ("Antigravity", "availability depends on the host",
-                       "owner can still access and invoke", "other room members cannot",
-                       "Room-call screen sharing is work in progress",
-                       "supported, configured local session", "authorize the edit",
-                       "confirm the agent received the selection", "paste the passage"):
+        for phrase in ("Antigravity needs its CLI installed and signed in first",
+                       "No teammate yet? Ask Example for a demo with one of your workers",
+                       "Guest (the owner approves first) or No access",
+                       "Voice must be enabled for your agent and allowed in that room",
+                       "Do it with your agent", "Where is it?"):
             self.assertIn(phrase, page)
-        self.assertEqual(len(gs.sections_for("claude")), 10)
+        self.assertEqual(len(gs.sections_for("claude")), 15)
 
     def test_second_review_wording(self):
         by = {s.id: s for s in gs.sections_for("claude")}
         self.assertIn("Docs, HTML pages, PDFs, Figma files, whiteboards, sheets and databases", by["commons"].what)
-        self.assertIn("start the call and pick your agent under &ldquo;Bring an agent?&rdquo;", by["calls"].how)
-        self.assertIn("open the room menu (&#8942;), choose Notifications, and pick Mention &amp; Keywords",
-                      by["activity"].how)
-        self.assertIn(("settings-integrations", "settings-integrations.jpg", "Settings \u2192 Apps \u2192 Connected apps",
+        self.assertIn("pick your agent under &ldquo;Bring an agent?&rdquo;, then Bring into call", by["calls"].locate)
+        self.assertIn("Notification settings are in the room menu (&#8942;)", by["activity"].locate)
+        self.assertIn(("settings-integrations", "settings-integrations.jpg", "Settings, Integrations",
                        "settings-integrations.png", None), by["apps"].images)
 
     def test_room_audience_says_your_agent(self):
@@ -238,8 +285,7 @@ class RenderTest(unittest.TestCase):
 
     def test_local_agents_are_distinguished_from_external_apps(self):
         agents = [s for s in gs.SECTIONS if s.title == "Connect other agents"][0]
-        self.assertIn("Claude Code and Codex are separate local-agent options", agents.how)
-        self.assertIn("not other names for Duet and Dot", agents.how)
+        self.assertIn("Claude Code, Codex and Antigravity are local-agent options there", agents.locate)
 
     def test_render_is_deterministic_and_depends_only_on_name_and_core(self):
         self.assertEqual(gs.render_page("Kai"), gs.render_page("  Kai "))
@@ -283,10 +329,10 @@ class InteractiveTest(unittest.TestCase):
 
     def test_tour_controls_and_progress(self):
         for marker in ('id="back"', 'id="next"', 'id="all"', 'id="dots"', 'aria-pressed="false"',
-                       'role="progressbar"', 'aria-valuemax="10"', "0 of 10 done", 'aria-label="Tour steps"'):
+                       'role="progressbar"', 'aria-valuemax="15"', "0 of 15 done", 'aria-label="Tour steps"'):
             self.assertIn(marker, self.page)
-        self.assertEqual(self.page.count('type="checkbox" data-done='), 10)
-        self.assertEqual(self.page.count("Mark done"), 10)
+        self.assertEqual(self.page.count('type="checkbox" data-done='), 15)
+        self.assertEqual(self.page.count("Mark done"), 15)
         self.assertIn("ArrowRight", self.page)
 
     def test_js_class_is_set_in_head_and_no_js_shows_every_section(self):
@@ -310,8 +356,8 @@ class InteractiveTest(unittest.TestCase):
         self.assertIn("await art.state.set(store.key, v)", gs.tour_page.SCRIPT)
 
     def test_checkboxes_start_disabled_until_progress_loads(self):
-        self.assertEqual(self.page.count('data-done="'), 10)
-        self.assertEqual(len(re.findall(r'type="checkbox" data-done="[a-z]+" disabled>', self.page)), 10)
+        self.assertEqual(self.page.count('data-done="'), 15)
+        self.assertEqual(len(re.findall(r'type="checkbox" data-done="[a-z]+" disabled>', self.page)), 15)
         self.assertIn("b.disabled = false", gs.tour_page.SCRIPT)
 
     def test_show_all_toggle_keeps_one_label(self):
@@ -336,7 +382,7 @@ class InteractiveTest(unittest.TestCase):
         self.assertNotIn('role="img"', self.page)
 
     def test_an_svg_per_section_and_one_overview_banner(self):
-        self.assertEqual(self.page.count('<div class="icon" aria-hidden="true"><svg'), 10)
+        self.assertEqual(self.page.count('<div class="icon" aria-hidden="true"><svg'), 15)
         self.assertEqual(self.page.count("<h1>"), 1)
         self.assertIn('class="brand-mark"', self.page)
         for core in gs.CORES:
@@ -409,7 +455,7 @@ class InteractiveTest(unittest.TestCase):
         if not node:
             self.skipTest("node not installed")
         bodies = re.findall(r"<script>(.*?)</script>", self.page, re.S)
-        self.assertEqual(len(bodies), 4)
+        self.assertEqual(len(bodies), 5)
         for body in bodies:
             with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
                 fh.write(body)
@@ -435,7 +481,31 @@ const dom = new JSDOM(html, { url: 'https://page.test/', runScripts: 'dangerousl
     if (scenario === 'nome') w.artifact = runtime(null, () => ['rooms']);
     if (scenario === 'slow') w.artifact = { ready: new Promise(() => {}), me: null, state: { get: () => undefined, set: () => {}, on: () => {} } };
     if (scenario === 'advance') w.artifact = runtime({ id: 'u7' }, () => []);
-    if (scenario === 'finale') w.artifact = runtime({ id: 'u8' }, () => ['dm', 'rooms', 'commons', 'agents', 'teamwork', 'calls', 'apps', 'activity', 'phone']);
+    if (scenario === 'finale') w.artifact = runtime({ id: 'u8' }, () => ['dm', 'rooms', 'commons', 'workers', 'agents', 'teamwork', 'apps', 'schedule', 'calls', 'checkin', 'activity', 'phone', 'mobile', 'report']);
+    if (scenario === 'ask' || scenario === 'ask-refused') {
+      w.artifact = { ...runtime({ id: 'u9' }, () => []),
+        agent: { list: () => Promise.resolve(scenario === 'ask' ? [{ id: 'ag1', name: 'Ada' }] : []) },
+        sendToMyAgent: (req) => { out.sent = (out.sent || []).concat([req]); return Promise.resolve({ ok: true, eventId: 'e1' }); } };
+    }
+    if (scenario.startsWith('ledger-')) {
+      // The host's receipt ledger: a sent receipt or an explicit decline is kept for its key and
+      // returned for that key again; an unknown outcome records nothing.
+      const ledger = new Map(scenario === 'ledger-old' ? [['tutorial-rooms', { ok: true, eventId: 'old' }]] : []);
+      const outcomes = { 'ledger-declined': ['declined', 'ok'], 'ledger-unknown': ['unknown', 'ok'], 'ledger-old': ['ok'] }[scenario];
+      out.keys = []; out.fresh = [];
+      w.artifact = { ...runtime({ id: 'u10' }, () => []),
+        agent: { list: () => Promise.resolve([{ id: 'ag2', name: 'Bo' }]) },
+        sendToMyAgent: (req) => {
+          out.keys.push(req.key);
+          if (ledger.has(req.key)) return Promise.resolve(ledger.get(req.key));
+          out.fresh.push(req.key);
+          const o = outcomes.shift();
+          if (o === 'unknown') return Promise.resolve({ ok: false, reason: 'request outcome unknown' });
+          const r = o === 'declined' ? { ok: false, reason: 'declined' } : { ok: true, eventId: 'e' + out.fresh.length };
+          ledger.set(req.key, r);
+          return Promise.resolve(r);
+        } };
+    }
     if (scenario === 'copy-ok') Object.defineProperty(w.navigator, 'clipboard', { value: { writeText: () => Promise.resolve() } });
     if (scenario === 'copy-fail') {
       Object.defineProperty(w.navigator, 'clipboard', { value: { writeText: () => Promise.reject(new Error('denied')) } });
@@ -478,7 +548,7 @@ const mark = (i) => { const b = d.querySelectorAll('input[data-done]')[i]; b.che
     all.click();
     out.pressed = all.getAttribute('aria-pressed');
     out.labelAfter = all.textContent;
-    d.querySelectorAll('.dot')[4].click();
+    d.querySelectorAll('.dot')[5].click();
     out.focused = d.activeElement && d.activeElement.id;
     out.mode = d.getElementById('tour').dataset.mode;
   }
@@ -490,6 +560,25 @@ const mark = (i) => { const b = d.querySelectorAll('input[data-done]')[i]; b.che
     out.afterButton = d.querySelector('.sec.cur').id;
     key(d.querySelector('.sec.cur h2'));
     out.afterHeading = d.querySelector('.sec.cur').id;
+  }
+  if (scenario === 'ask' || scenario === 'ask-refused' || scenario === 'me') {
+    out.askHidden = Array.from(d.querySelectorAll('button.ask'), (b) => b.hidden);
+  }
+  if (scenario === 'ask' || scenario === 'ask-refused') {
+    const b = d.querySelector('#s-rooms button.ask');
+    b.click();
+    await sleep(150);
+    out.askLabel = b.textContent;
+    out.askDisabled = b.disabled;
+    out.status = d.getElementById('status').textContent;
+  }
+  if (scenario.startsWith('ledger-')) {
+    const b = d.querySelector('#s-rooms button.ask');
+    b.click();
+    await sleep(150);
+    out.after1 = { label: b.textContent, disabled: b.disabled, status: d.getElementById('status').textContent };
+    if (!b.disabled) { b.click(); await sleep(150); }
+    out.after2 = { label: b.textContent, disabled: b.disabled };
   }
   if (scenario.startsWith('copy')) {
     d.querySelector('button[data-prompt]').click();
@@ -553,7 +642,7 @@ class PageBehaviourTest(unittest.TestCase):
 
     def test_viewer_key_is_used_and_a_thenable_get_is_awaited(self):
         out = self.run_page("me")
-        self.assertEqual(out["progress"], "1 of 10 done")
+        self.assertEqual(out["progress"], "1 of 15 done")
         self.assertEqual(out["sets"], [["gs-done-u42", ["rooms", "commons"]]])
         self.assertIsNone(out["local"])
 
@@ -583,7 +672,49 @@ class PageBehaviourTest(unittest.TestCase):
         out = self.run_page("finale")
         self.assertEqual((out["finaleHiddenBefore"], out["finaleHiddenAfter"], out["focused"]),
                          (True, False, "h-finale"))
-        self.assertEqual(out["progressAfter"], "10 of 10 done")
+        self.assertEqual(out["progressAfter"], "15 of 15 done")
+
+    def test_do_it_with_your_agent_sends_the_steps_fixed_ask_once(self):
+        out = self.run_page("ask")
+        self.assertEqual(out["askHidden"], [False] * 14)  # a DM-launched page: Commons is copy-only
+        rooms = [s for s in gs.sections_for("claude") if s.id == "rooms"][0]
+        self.assertEqual(out["sent"], [{"agentId": "ag1", "text": rooms.prompt, "key": send_key("rooms", "ag1", rooms.prompt)}])
+        self.assertEqual((out["askLabel"], out["askDisabled"]), ("Sent to Ada", True))
+        self.assertIn("The reply comes in your DM.", out["status"])
+
+    def test_after_a_known_decline_the_next_tap_is_a_new_attempt(self):
+        out = self.run_page("ledger-declined")
+        base = send_key("rooms", "ag2", ROOMS_PROMPT)
+        self.assertEqual(out["keys"], [base, base + "-r1"])
+        self.assertEqual(out["fresh"], [base, base + "-r1"])
+        self.assertIn("Not sent. Tap to ask again", out["after1"]["status"])
+        self.assertEqual((out["after2"]["label"], out["after2"]["disabled"]), ("Sent to Bo", True))
+
+    def test_after_an_unknown_outcome_the_same_key_is_asked_again(self):
+        out = self.run_page("ledger-unknown")
+        base = send_key("rooms", "ag2", ROOMS_PROMPT)
+        self.assertEqual(out["keys"], [base, base])
+        self.assertIn("it is never sent twice", out["after1"]["status"])
+        self.assertEqual(out["after2"]["label"], "Sent to Bo")
+
+    def test_a_receipt_for_another_text_or_agent_is_never_reused(self):
+        out = self.run_page("ledger-old")
+        base = send_key("rooms", "ag2", ROOMS_PROMPT)
+        self.assertEqual(out["keys"], [base])
+        self.assertEqual(out["fresh"], [base])  # the old step key's receipt was not returned
+        self.assertNotEqual(send_key("rooms", "ag2", ROOMS_PROMPT + " Now."), base)
+        self.assertNotEqual(send_key("rooms", "ag1", ROOMS_PROMPT), base)
+        self.assertRegex(base, r"^[a-z0-9][a-z0-9._-]{0,63}$")
+
+    def test_no_agent_offered_sends_nothing_and_says_how_to_allow_it(self):
+        out = self.run_page("ask-refused")
+        self.assertNotIn("sent", out)
+        self.assertFalse(out["askDisabled"])
+        self.assertIn("Allow this page to see your agents", out["status"])
+
+    def test_without_the_host_bridge_the_ask_button_stays_hidden(self):
+        out = self.run_page("me")
+        self.assertEqual(out["askHidden"], [True] * 14)
 
     def test_arrow_keys_only_inside_the_tour_and_not_on_controls(self):
         out = self.run_page("keys")
@@ -751,7 +882,7 @@ class FinderTest(unittest.TestCase):
 
 class DocTest(unittest.TestCase):
     def test_skill_md_states_the_real_chunk_size(self):
-        text = (REPO / "skills" / "tutorial" / "SKILL.md").read_text()
+        text = (REPO / "docs" / "tutorial-publisher.md").read_text()
         self.assertIn(f"{gs.CHUNK_BYTES:,} bytes", text)
         self.assertIn("131,072", text)
         self.assertLess(gs.CHUNK_BYTES, 131_072)
@@ -1182,12 +1313,12 @@ class PersonalTest(unittest.TestCase):
         self.assertIn(mine["commons"], buttons)
         self.assertIn(html.escape(mine["dm"]), page)
         self.assertNotIn(gs.SECTIONS[0].prompt, buttons)  # the default dm prompt is replaced
-        self.assertIn(gs.SECTIONS[4].prompt, buttons)  # teamwork kept its default
+        self.assertIn([s for s in gs.SECTIONS if s.id == "teamwork"][0].prompt, buttons)  # kept its default
 
     def test_invalid_entries_fall_back_per_slot(self):
         bad = {"dm": "see https://example.test", "commons": "x" * (gs.tour_page.PROMPT_MAX + 1),
                "teamwork": "line one\nline two", "apps": 42, "finale": "   ",
-               "unknown-slot": "ignored", "mobile": "not a prompt slot", "import": "a removed slot"}
+               "unknown-slot": "ignored", "phone": "not a prompt slot", "import": "a removed slot"}
         self.assertEqual(gs.tour_page.clean_prompts(bad), {})
         self.assertEqual(gs.render_page("Blue", "claude", prompts=bad), gs.render_page("Blue", "claude"))
         self.assertEqual(gs.tour_page.clean_prompts({"dm": " ok ", "apps": "www.example.test",
