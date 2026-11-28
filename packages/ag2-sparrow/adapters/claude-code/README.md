@@ -307,10 +307,12 @@ alone. Resumed later by its id, it runs without the tools. It never becomes the
 session collaborators share.
 
 That record must outlive the install config, which `uninstall` removes while
-the transcripts stay. So each such conversation is also written to
-`ag2-sparrow-owner-only-sessions` (0600) in the Claude config dir, beside the
-transcripts, before it can hold a tool's result; a conversation that cannot be
-recorded there is not given the tools. A later install reads it back, so after
+the transcripts stay. So each such conversation also gets its own empty file,
+named by its id, in the folder `ag2-sparrow-owner-only-sessions` (0700, files
+0600) in the Claude config dir, beside the transcripts, before it can hold a
+tool's result; a conversation that cannot be recorded there is not given the
+tools. One file per conversation, created and never rewritten, so two agents
+sharing a Claude config dir cannot overwrite each other's record. A later install reads it back, so after
 uninstall and reinstall, `--resume-session <that id>` is still the owner's
 alone. If the record is there but cannot be read, a resumed conversation cannot
 be shown never to have had the tools and is treated as the owner's alone.

@@ -15,6 +15,7 @@ import io
 import json
 import os
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
@@ -999,8 +1000,10 @@ class PreviewThroughInstall(AgentRootBase):
         home = on["CLAUDE_CONFIG_DIR"]
         self.assertTrue(hold_mod.tools_session(on))
         store = Path(home) / hold_mod.OWNER_ONLY_STORE
-        self.assertEqual((store.read_text().split(), stat.S_IMODE(store.stat().st_mode)), ([on["SESSION_ID"]], 0o600),
+        self.assertEqual([p.name for p in store.iterdir()], [on["SESSION_ID"]],
                          "recorded beside the transcripts before the conversation holds any tool result")
+        self.assertEqual((stat.S_IMODE((store / on["SESSION_ID"]).stat().st_mode), stat.S_IMODE(store.stat().st_mode)),
+                         (0o600, 0o700))
         transcript = self.fake_transcript(home, on["SESSION_ID"])
         ordinary = "77777777-2222-4333-8444-555555555555"
         self.fake_transcript(home, ordinary, "an ordinary chat")
@@ -1036,8 +1039,8 @@ class PreviewThroughInstall(AgentRootBase):
         # The record cannot be read: a resumed conversation cannot be shown shareable, so it is the owner's alone.
         with mock.patch.object(fx.sm, "_run", side_effect=fake):
             self.assertEqual(self.main("uninstall")[0], 0)
-        store.unlink()
-        store.mkdir()
+        shutil.rmtree(store)
+        store.write_text("not a folder\n")
         self.assertIsNone(hold_mod.owner_only_kept(home))
         rc, out, err = self.install_default(fake, "--resume-session", ordinary)
         self.assertEqual(rc, 0, out + err)
@@ -1052,6 +1055,49 @@ class PreviewThroughInstall(AgentRootBase):
         self.assertEqual(rc, 0, out + err)
         self.assertIn("could not be recorded as the owner's alone", out)
         self.assertFalse(hold_mod.tools_session(self.cfg()))
+
+    def test_two_installs_sharing_a_claude_home_never_lose_each_others_owner_only_mark(self):
+        import threading
+        home = str(self.home / ".claude-shared")
+        values = {"MCP_PROXY_COMMAND": PROXY, "TOKEN_ENV_FILE": token_file(self.home), "ROOM_TOOLS_PREVIEW": "1",
+                  "CLAUDE_CONFIG_DIR": home, **ALONE}
+        rounds, agents = 40, ("a", "b")
+        ids = {who: ["%08x-2222-4333-8444-%012x" % (n, ord(who)) for n in range(rounds)] for who in agents}
+        start, failed = threading.Barrier(len(agents)), []
+
+        def install(who):
+            # One agent's installs, each minting a conversation for the tools, as its own install config sees it.
+            start.wait()
+            old = {}
+            for new_id in ids[who]:
+                try:
+                    old = cli.room_tools_session(old, values, new_id, "", "", lambda: None, "stop it")
+                    if old["ROOM_TOOLS_SESSION"] != new_id:
+                        failed.append((who, new_id, "not given the tools"))
+                    old = dict(old, SESSION_ID=new_id)
+                except Exception as e:  # noqa: BLE001 - reported below, on the test's own thread
+                    failed.append((who, new_id, repr(e)))
+        with contextlib.redirect_stdout(io.StringIO()):
+            threads = [threading.Thread(target=install, args=(who,)) for who in agents]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        self.assertEqual(failed, [])
+        kept = hold_mod.owner_only_kept(home)
+        self.assertEqual(kept, set(ids["a"]) | set(ids["b"]), "every mark of both agents is there")
+        # Both uninstalled (no install config left), then each resumes one of its old preview conversations.
+        for who in agents:
+            resumed = ids[who][0]
+            with contextlib.redirect_stdout(io.StringIO()) as said:
+                back = cli.room_tools_session({}, dict(values, ROOM_TOOLS_PREVIEW="", ALLOW_COLLABORATOR="1",
+                                                       ALLOW_NON_OWNER="1"),
+                                              resumed, resumed, resumed, lambda: None, "stop it")
+            self.assertIn(resumed, back["OWNER_ONLY_SESSIONS"].split(), who)
+            self.assertEqual(back["ROOM_TOOLS_SESSION"], "")
+            self.assertIn("stays the owner's alone", said.getvalue())
+            self.assertTrue(hold_mod.tools_conversation(dict(back, SESSION_ID=resumed)))
+        self.assertFalse(hold_mod.keep_owner_only(home, "../escape"), "only a session id is ever a file name there")
 
     def test_an_agent_first_installed_with_the_preview_gets_a_new_conversation_when_it_is_turned_off(self):
         engine = self.home / "Application Support" / "engine"

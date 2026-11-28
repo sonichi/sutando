@@ -69,35 +69,33 @@ def claude_home(config_dir: str) -> str:
     return config_dir or os.path.join(os.path.expanduser("~"), ".claude")
 
 
-OWNER_ONLY_STORE = "ag2-sparrow-owner-only-sessions"    # under the Claude home, beside the transcripts it names
+SESSION_FILE_RE = re.compile(r"^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$")   # an id that is safe as a file name
+OWNER_ONLY_STORE = "ag2-sparrow-owner-only-sessions"    # a folder under the Claude home, beside the transcripts
 
 
 def owner_only_kept(config_dir: str) -> "set | None":
-    """The conversations recorded beside their transcripts as the owner's alone (one id a line): it outlives an
-    uninstall, as the transcripts do. Empty when there is no record; None when one is there but cannot be read."""
+    """The conversations recorded beside their transcripts as the owner's alone: one empty file each, named by
+    the id, so two agents sharing a Claude home never overwrite each other's. It outlives an uninstall, as the
+    transcripts do. Empty when there is no record; None when one is there but cannot be read."""
     try:
-        with open(os.path.join(claude_home(config_dir), OWNER_ONLY_STORE), encoding="utf-8") as f:
-            return {line.strip() for line in f if line.strip()}
+        return set(os.listdir(os.path.join(claude_home(config_dir), OWNER_ONLY_STORE)))
     except FileNotFoundError:
         return set()
-    except (OSError, ValueError):
+    except OSError:
         return None
 
 
 def keep_owner_only(config_dir: str, session_id: str) -> bool:
-    """Record `session_id` there (0600); True once the record holds it."""
-    kept = owner_only_kept(config_dir)
-    if kept is None:
+    """Record `session_id` there (its own 0600 file, created, never rewritten); True once it is there."""
+    store = os.path.join(claude_home(config_dir), OWNER_ONLY_STORE)
+    if not SESSION_FILE_RE.match(session_id):
         return False
-    if session_id in kept:
-        return True
     try:
-        home = claude_home(config_dir)
-        os.makedirs(home, exist_ok=True)
-        cm._write(Path(home) / OWNER_ONLY_STORE, "".join(i + "\n" for i in sorted(kept | {session_id})), 0o600)
+        os.makedirs(store, mode=0o700, exist_ok=True)
+        os.close(os.open(os.path.join(store, session_id), os.O_WRONLY | os.O_CREAT, 0o600))
     except OSError:
         return False
-    return True
+    return os.path.isfile(os.path.join(store, session_id))
 
 
 def transcript_path(config_dir: str, session_id: str) -> str:
