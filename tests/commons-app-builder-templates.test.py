@@ -47,17 +47,22 @@ check("guide-says-where-the-templates-live", "under `skills/commons-app-builder/
 
 # A Commons write's unknown outcome: resend unchanged with the same id, never ask operation.inspect.
 actions = " ".join(guide.split("**Actions.**", 1)[1].split("\n\n", 1)[0].split())
-check("guide-unknown-outcome-resends-with-the-same-id",
-      "After an unknown outcome, send the identical request again with the same `operation_id`" in actions)
+check("guide-unknown-outcome-resend-is-conditional-on-the-description",
+      "After an unknown outcome, if the Action's description says a repeated `operation_id` is safe,"
+      " send the identical request again with the same `operation_id`" in actions)
 check("guide-unknown-outcome-never-a-new-id", "Never resend it with a new id" in actions)
-check("guide-unknown-outcome-reads-back-otherwise", "read the page or rows back before deciding" in actions)
+check("guide-unknown-outcome-reads-back-otherwise",
+      "Otherwise, or if you cannot resend it unchanged, read the page or rows back before deciding" in actions)
+check("guide-same-key-retry-promises-no-delivery", "delivers it once" not in flat
+      and "That promises no dispatch or receipt: it can still be declined, refused or stay unresolved" in flat)
 check("guide-never-sends-the-reader-to-operation-inspect",
       flat.count("operation.inspect") == flat.count("`operation.inspect` does not know these writes") == 1)
 # The hosted-MCP skill states the same rule: its inspect-first line excepts a Commons write.
 mcp = " ".join((_ROOT / "skills" / "ag2-space-mcp" / "SKILL.md").read_text(encoding="utf-8").split())
 check("mcp-skill-excepts-commons-writes-from-inspect-first",
       "call `operation.inspect` before resending anything, except a `room.commons.*` write, which"
-      " `operation.inspect` does not know: resend that one unchanged with the same `operation_id`" in mcp)
+      " `operation.inspect` does not know: if its description says a reused id is safe, resend that"
+      " one unchanged with the same `operation_id`; otherwise read the page or rows back first" in mcp)
 
 for name in TEMPLATES:
     d = _TPL / name

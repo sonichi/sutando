@@ -13,10 +13,10 @@ This guide uses only the `room.commons.*` Actions and the page's `window.artifac
 arguments vary by room and deployment (for example `databases.mutate` op `summon` and
 `apps.scaffold` template `auto` are not on every server). Every write needs a fresh
 `operation_id`; reuse one only to retry the same call with the same arguments. After an
-unknown outcome, send the identical request again with the same `operation_id`: it applies at
-most once and answers the first result. Never resend it with a new id. If you cannot resend it
-unchanged, or the Action's description does not say a repeated `operation_id` is safe, read the
-page or rows back before deciding. `operation.inspect` does not know these writes.
+unknown outcome, if the Action's description says a repeated `operation_id` is safe, send the
+identical request again with the same `operation_id`: it applies at most once and answers the
+first result. Never resend it with a new id. Otherwise, or if you cannot resend it unchanged,
+read the page or rows back before deciding. `operation.inspect` does not know these writes.
 
 | Want | Action |
 | --- | --- |
@@ -311,11 +311,13 @@ me" buttons.
   include `declined`, `page permission required`, `agent not owned or unavailable`,
   `too many agent requests`, `another request is in progress`, `request outcome unknown` and
   `send outcome unknown`. Both mean it may have been sent, so never make a new `key`. After
-  `request outcome unknown`, retry with the same key: the viewer confirms again and the server
-  delivers it once. After `send outcome unknown`, a retry sends nothing; check for the original
+  `request outcome unknown`, retry with the same key: it reuses the original request and the
+  viewer confirms again. That promises no dispatch or receipt: it can still be declined, refused
+  or stay unresolved. After `send outcome unknown`, a retry sends nothing; check for the original
   task. This holds only while this browser profile's ledger is intact. After a storage reset, or on
   another browser or device, the same key can send again if the original went by DM or the Action
-  is no longer offered; there, check for the original task instead of retrying.
+  is no longer offered; there, leave the outcome unresolved and check for the original task
+  instead of retrying.
 
 **2. `artifact.room.post` asks an agent in the room, as the viewer.** Use it when the ask should
 be seen by the room, or the agent is not the viewer's.
