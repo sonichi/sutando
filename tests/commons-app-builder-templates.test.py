@@ -41,6 +41,18 @@ check("all-templates-present", sorted(p.name for p in _TPL.iterdir() if p.is_dir
 readme = (_TPL / "README.md").read_text(encoding="utf-8")
 guide = (_SKILL / "GUIDE.md").read_text(encoding="utf-8")
 check("guide-references-templates", "templates/" in guide and "README" in guide)
+flat = " ".join(guide.split())
+check("guide-says-where-the-templates-live", "under `skills/commons-app-builder/templates/`" in flat
+      and "it is enough to build without them" in flat)
+
+# A Commons write's unknown outcome: resend unchanged with the same id, never ask operation.inspect.
+actions = " ".join(guide.split("**Actions.**", 1)[1].split("\n\n", 1)[0].split())
+check("guide-unknown-outcome-resends-with-the-same-id",
+      "After an unknown outcome, send the identical request again with the same `operation_id`" in actions)
+check("guide-unknown-outcome-never-a-new-id", "Never resend it with a new id" in actions)
+check("guide-unknown-outcome-reads-back-otherwise", "read the page or rows back before deciding" in actions)
+check("guide-never-sends-the-reader-to-operation-inspect",
+      flat.count("operation.inspect") == flat.count("`operation.inspect` does not know these writes") == 1)
 
 for name in TEMPLATES:
     d = _TPL / name

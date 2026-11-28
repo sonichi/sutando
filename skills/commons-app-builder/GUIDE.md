@@ -13,7 +13,10 @@ This guide uses only the `room.commons.*` Actions and the page's `window.artifac
 arguments vary by room and deployment (for example `databases.mutate` op `summon` and
 `apps.scaffold` template `auto` are not on every server). Every write needs a fresh
 `operation_id`; reuse one only to retry the same call with the same arguments. After an
-unknown outcome, call `operation.inspect` before resending.
+unknown outcome, send the identical request again with the same `operation_id`: it applies at
+most once and answers the first result. Never resend it with a new id. If you cannot resend it
+unchanged, or the Action's description does not say a repeated `operation_id` is safe, read the
+page or rows back before deciding. `operation.inspect` does not know these writes.
 
 | Want | Action |
 | --- | --- |
@@ -447,6 +450,8 @@ and "ask my agent") and a **task board** (a person hands a task to their own age
 reports on the row).
 `templates/README.md` says which to pick and how to create one. Copy and adapt rather than
 starting from an empty file, then still follow steps 2, 6 and 7 for the app you ship.
+These files live in the Sutando repository under `skills/commons-app-builder/templates/`; if
+you have only this guide, it is enough to build without them.
 
 ## Patterns from apps that shipped
 

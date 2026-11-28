@@ -152,10 +152,11 @@ way).
 Every write step carries a fixed `operation_id` (`cab-<request_id>-<step>-<8 hex of its
 arguments>`, so a re-plan with another adaptation is another operation), and `--route cli` passes
 it as `--operation-id`: a step retried after an unknown outcome sends the same id, which
-the server dedupes for an Action that requires one. After `action` exits 3, never run that step
-again before `operation.inspect` says it did not happen. `plan` prints
-the Actions in order; `$db` and `$app` stand for the ids earlier steps answer. Run them in that
-order, and run `scripts/check_page.py` on the page before writing it.
+the server dedupes for an Action that requires one. After `action` exits 3, run that step again
+unchanged, with the same id: it applies at most once and answers the first result. Never run it
+with a new id, and do not wait on `operation.inspect`, which does not know these writes. `plan`
+prints the Actions in order; `$db` and `$app` stand for the ids earlier steps answer. Run them in
+that order, and run `scripts/check_page.py` on the page before writing it.
 
 **Where to run them.** Through the s.space MCP when it reaches the room's homeserver. On one it
 does not reach (it answers `unknown ag2_lane …`, e.g. dev.s.space), `plan --route cli` adds to

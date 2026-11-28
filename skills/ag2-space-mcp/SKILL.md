@@ -80,7 +80,10 @@ Edit Commons pages and databases only through these Actions, never through room
 messages or state events.
 
 **Rules**
-- After `ACTION_OUTCOME_UNKNOWN`, call `operation.inspect` before resending anything.
+- After `ACTION_OUTCOME_UNKNOWN`, call `operation.inspect` before resending anything, except a
+  `room.commons.*` write, which `operation.inspect` does not know: resend that one unchanged
+  with the same `operation_id`, or read the page or rows back first when its description does
+  not say a reused id is safe.
   Reuse the same `operation_id` only where the Action's own description says a reused id
   applies at most once. `room.commons.folders.delete`, `.file` and `.rename` declare
   `idempotency_requirement: none`, and `room.artifact.publish` and `.unpublish` declare
