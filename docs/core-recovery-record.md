@@ -18,6 +18,7 @@ does not write it. `derive()` is pure and folds records other modules already ke
 | `state/quota-state.json` | the credential proxy |
 | the pane's abnormal text | `cli_wedge.frame_abnormal` |
 | `state/session-starts.log` | the core launchers (launches on this host in the last 10 minutes) |
+| `state/core-revive.json` | the desktop app's core revive loop: `{"v": 1, "state": "exhausted", "since", "attempts", "appSessionId"}` once it has spent its revive budget; removed when the core is up again and when the loop starts. Read only as the running app's own: `appSessionId` must equal `supervisor-status.json`'s under a heartbeat at most 60 s old, and `since` must not be in the future. A marker left by an app that quit or was replaced is ignored, and so is one stamped before the monitor last saw the core up (`state/core-last-up.json`, written by `core_recovery_state.note_up` at most once a minute while the core is running or idle): a give-up from an outage that ended, whose removal failed, is never reused by the next crash |
 
 The file is written atomically (`workspace_default.write_status`), at once on a change and every
 60 s while unchanged, so its age says whether the monitor still runs. A reader treats a record
@@ -40,11 +41,16 @@ older than 5 minutes, larger than 4 KiB or outside the schema as absent.
 | `out_of_credits` | the same, when the refusal names an exhausted balance (pane text, the wedge banner, or a recent proxy rejection) |
 | `signed_out` | logged out, or sitting at the sign-in prompt |
 | `blocked_prompt` | any other prompt that needs a person |
-| `crash_loop` | the core is down after 4 launches in 10 minutes, or the backend supervisor spent a service's recovery budget |
+| `crash_loop` | the core is down after 4 launches in 10 minutes, the backend supervisor spent a service's recovery budget, or the app's revive loop gave up on a core that is not up (`reason: revive_exhausted`) |
 | `starting` | the core is down and will be revived |
 | `unknown` | nothing reliable to read (hung, unobserved, gateway down, no monitor record) |
 
 `offline` is never written: the server derives it from missing heartbeats.
+
+`reason` is optional and says why a state holds when one input says more than the state does. Its
+one value is `revive_exhausted`: the desktop app's revive loop has given up on the core
+(`state/core-revive.json`), so the core will not come back by itself. A reader that does not know
+the field ignores it; the state stays `crash_loop`, which every reader already renders.
 
 - `since` stands while the state does and the last record is fresh (at most 5 minutes old);
   `incident` is always derived from the state and `since` (a limit pause: from its hold), never
@@ -76,7 +82,8 @@ older than 5 minutes, larger than 4 KiB or outside the schema as absent.
 | `reset_at`, `account`, `model` | from the hold and the launch identity | not read (no Codex hold or identity record yet) |
 | actions | all five | `switch_runtime`, `restart_core`, `escape_prompt` |
 
-An unknown runtime gets `restart_core` and `escape_prompt` only.
+An unknown runtime gets `restart_core` and `escape_prompt` only (and the crash-loop card's
+`reset_service`, which acts on the app, not the core).
 
 ## On the heartbeat
 
@@ -88,10 +95,11 @@ capability, on the core's lanes only; the wire rules are in
 
 `parse_action_id(action_id, runtime)` is the allowlist for the owner's click (`action.json`:
 `retry_now`, `restart_core`, `escape_prompt`, `switch_model:<alias>`, `switch_runtime:<runtime>`,
-`switch_account:<id>`); the id is matched whole, and an id the runtime cannot carry out, an argument
+`switch_account:<id>`, `reset_service:<service>`); the id is matched whole, and an id the runtime cannot carry out, an argument
 not in the host's own list (aliases, runtimes, stored accounts), or any unknown id parses to None.
 `switch_account` is in `STEP_UP_ACTIONS`: never offered in the record, and confirmed by the owner
-before it runs.
+before it runs. `reset_service` is in `HOST_ACTIONS`: it acts on one of the app's services, not the
+core, so any runtime carries it and the record never offers it; only a crash-loop card does.
 `RECEIPT_OUTCOMES` (`done`, `refused`, `stale`, `failed`) is the receipt's (`receipt.json`).
 The grammar itself lives in `src/hitl/recovery.py` (vendored into ag2-sparrow, since the bridge's
 reply handler parses the click); `parse_action_id` adds the runtime's and the host's lists to it.
@@ -108,7 +116,7 @@ the recovery actions for its state, picked by `recovery_actions.card_controls`:
 | Limit menu (`/rate-limit-options`) | every choice the menu shows, in its own words, but a purchase or a model switch (keystrokes), Refresh options; the core also gets Restart core |
 | Paused by the relaunch hold | Retry now, Switch to <model>, Switch runtime, Refresh options |
 | Other blocked prompt (core) | Refresh options, Restart core |
-| Crash loop (`core_crash_loop`) | the core: Restart core; a stopped service: none (only an app restart clears it) |
+| Crash loop (`core_crash_loop`) | the core: Restart core (titled "Can't recover: core", as a new card, once the app's revive loop gives up); a stopped service: Start <service> again when the supervisor marks its terminal state `resettable` with an incident id, else none (only an app restart clears it) |
 
 No card offers a purchase or an account change: a step-up id (`buy_credits`, `add_account`,
 `switch_account`) is offered only once its confirmed flow exists (`recovery_actions.STEP_UP_READY`,
@@ -142,7 +150,17 @@ runtime carries out, with fixed argv, never what a subprocess printed. It writes
 `state/recovery/receipts/<hitl_id>.json`, one line to `state/recovery/audit.jsonl` (who, what,
 session, outcome) and edits the card in place. A tap on `add_account` or `switch_account` (from
 a card posted before they were withheld) is refused until the confirmed, re-authenticated sign-in
-flow exists; a worker seat's card never runs `switch_model`, `restart_core` or `switch_runtime`.
+flow exists; a worker seat's card never runs `switch_model`, `restart_core` or `switch_runtime`. `reset_service:<service>` is bound to the stop its card was raised on: the card keeps the
+supervisor's app session and the stop's incident id, and the executor writes a request only while
+the fresh status still reports exactly that stop (a newer session or a newer trip makes the tap
+`stale`). The request is `state/control/services/req-<id>.json`
+(`{"schemaVersion": 1, "id", "kind": "reset-service", "service", "appSessionId", "incident", "requestedAtMs"}`).
+The supervisor answers in `res-<id>.json` (`outcome: running`, `failed`, or the word it refused
+with). The card, its receipt and a second audit line take that answer: `done` only on `running`,
+`failed` on any other answer or when none arrives within 5 minutes. A stop marker going away is
+never read as the service running. A stop marker itself raises a card only when it belongs to the
+status file's own session, its trip time (when stamped) is not later than the heartbeat carrying
+it, and the supervisor's lifecycle word for the service does not say it is up.
 
 A tap from anyone but the owner runs nothing, leaves the card as it was and posts nothing in the
 room. On a card this store holds, tapped in the room the card was posted in (its requirement's

@@ -14,6 +14,7 @@ pure: it folds the records other modules already keep into one small dict.
     state/quota-state.json               the credential proxy (only a record of the core's account)
     the pane's abnormal text             cli_wedge.frame_abnormal
     state/session-starts.log             the core launchers (restarts in the last 10 min)
+    state/core-revive.json               the desktop app's core revive loop (it gave up), bound to its app session
 
 The record is what the gateway bridge sends as `health.recovery`, so it carries
 no prompt text, path, token or model output: `state`, times, the model alias,
@@ -58,13 +59,22 @@ RUNTIMES = ("claude", "codex")
 ACTIONS = ("retry_now", "switch_model", "switch_runtime", "restart_core", "escape_prompt", "refresh_options")
 #: A stored-account switch: never offered before such a store exists, and confirmed by the owner.
 STEP_UP_ACTIONS = frozenset({"switch_account"})
-CLICK_VERBS = ACTIONS + tuple(sorted(STEP_UP_ACTIONS))
+#: Act on one of the app's services, whatever the runtime: offered on its crash-loop card, never in the record.
+HOST_ACTIONS = ("reset_service",)
+CLICK_VERBS = ACTIONS + tuple(sorted(STEP_UP_ACTIONS)) + HOST_ACTIONS
 #: Per runtime, what its host side carries out; Codex has no model switch or relaunch hold yet.
 RUNTIME_ACTIONS = {"claude": frozenset(CLICK_VERBS),
-                   "codex": frozenset({"switch_runtime", "restart_core", "escape_prompt", "refresh_options"})}
+                   "codex": frozenset({"switch_runtime", "restart_core", "escape_prompt", "refresh_options",
+                                       *HOST_ACTIONS})}
 #: An unknown runtime gets only what works on any pane.
-NEUTRAL_ACTIONS = frozenset({"restart_core", "escape_prompt"})
+NEUTRAL_ACTIONS = frozenset({"restart_core", "escape_prompt", *HOST_ACTIONS})
 RECEIPT_OUTCOMES = ("done", "refused", "stale", "failed")
+#: Why a state holds, when one input says more than the state does.
+REVIVE_EXHAUSTED = "revive_exhausted"
+REASONS = (REVIVE_EXHAUSTED,)
+REVIVE_FILE = "core-revive.json"
+#: When this monitor last saw the core up: a give-up from before it is an outage that ended.
+LAST_UP_FILE = "core-last-up.json"
 
 MAX_ACTIONS = 8
 MAX_SWITCH_MODELS = 6
@@ -146,6 +156,8 @@ def coerce(record: Any) -> Optional[dict]:
             out[key] = value
     if record.get("runtime") in RUNTIMES:
         out["runtime"] = record["runtime"]
+    if record.get("reason") in REASONS:
+        out["reason"] = record["reason"]
     for key in ("since", "reset_at", "waiting_tasks", "restarts_10m"):
         value = _int(record.get(key))
         if value is not None:
@@ -166,7 +178,7 @@ def coerce(record: Any) -> Optional[dict]:
     return {k: out[k] for k in _ORDER if k in out}
 
 
-_ORDER = ("v", "incident", "state", "since", "reset_at", "runtime", "model", "account",
+_ORDER = ("v", "incident", "state", "reason", "since", "reset_at", "runtime", "model", "account",
           "waiting_tasks", "restarts_10m", "actions", "switch_models", "model_labels", "switch_runtimes", "menu")
 #: A label is the runtime's own words for a choice: printable, bounded, never a purchase.
 _LABEL_MAX = 80
@@ -238,7 +250,7 @@ def _terminal_failure(supervisor_status: Any) -> bool:
 
 
 def _state(supervisor: dict, hold_active: bool, supervisor_status: Any, quota: Any, wedge: Any,
-           restarts: Optional[int], now: float, runtime: Optional[str]) -> str:
+           restarts: Optional[int], now: float, runtime: Optional[str], revive_exhausted: bool = False) -> str:
     sup = supervisor.get("state")
     kind = supervisor.get("kind")
     walled = getattr(wedge, "kind", None) == "provider-limit"
@@ -259,10 +271,10 @@ def _state(supervisor: dict, hold_active: bool, supervisor_status: Any, quota: A
     if sup == "blocked-known":
         return "idle"  # a gate the monitor answers by itself
     if sup == "crashed":
-        if (restarts or 0) >= CRASH_LOOP_RESTARTS or _terminal_failure(supervisor_status):
+        if revive_exhausted or (restarts or 0) >= CRASH_LOOP_RESTARTS or _terminal_failure(supervisor_status):
             return "crash_loop"
         return "starting"
-    return "unknown"
+    return "crash_loop" if revive_exhausted else "unknown"
 
 
 def _incident(state: str, since: int, hold: Optional[dict], hold_active: bool) -> str:
@@ -275,7 +287,8 @@ def derive(supervisor: Optional[dict], hold: Optional[dict], supervisor_status: 
            runtime: Optional[str] = None, model: Optional[str] = None,
            waiting_tasks: Optional[int] = None, restarts_10m: Optional[int] = None,
            runtimes_available: tuple = (), models_offered: Optional[list] = None,
-           model_labels: Optional[list] = None, crash_since: Optional[float] = None) -> dict:
+           model_labels: Optional[list] = None, crash_since: Optional[float] = None,
+           revive_exhausted: bool = False) -> dict:
     """The C1 recovery block for this moment. Pure: every input is passed in.
     `models_offered` is the keys of the runtime's own model list a switch may name
     (runtime_models.offer); without it no model switch is offered.
@@ -283,7 +296,8 @@ def derive(supervisor: Optional[dict], hold: Optional[dict], supervisor_status: 
     `supervisor` is core-supervisor.json's payload, `hold` core-limit-hold.json's, `quota`
     quota-state.json's, `wedge` cli_wedge.frame_abnormal(pane). `prev` is the last record, so
     an unchanged state keeps its `since` and `incident`. `runtime` is the core's (RUNTIMES);
-    `runtimes_available` the runtimes whose CLI this host has. The relaunch hold, the account, the
+    `runtimes_available` the runtimes whose CLI this host has. `revive_exhausted`: the app's revive
+    loop gave up on the core (state/core-revive.json), so a core that is not up is a crash loop. The relaunch hold, the account, the
     model and the proxy's quota record are Claude's, so a Codex core reads none of them. An
     unknown input is left out of the record, never filled with a default."""
     supervisor = supervisor if isinstance(supervisor, dict) else {}
@@ -291,7 +305,8 @@ def derive(supervisor: Optional[dict], hold: Optional[dict], supervisor_status: 
     if runtime == "codex":
         hold, model, quota = None, None, None
     hold_active = _hold_active(hold, now)
-    state = _state(supervisor, hold_active, supervisor_status, quota, wedge, restarts_10m, now, runtime)
+    state = _state(supervisor, hold_active, supervisor_status, quota, wedge, restarts_10m, now, runtime,
+                   revive_exhausted)
     limited = state in ("paused_limit", "out_of_credits")
     prev = coerce(prev)
     started = _int(hold.get("started_at")) if hold_active else None
@@ -305,6 +320,8 @@ def derive(supervisor: Optional[dict], hold: Optional[dict], supervisor_status: 
     # Always derived, never carried: a stored incident names whatever incident wrote it.
     record: dict = {"v": VERSION, "incident": _incident(state, since, hold, hold_active),
                     "state": state, "since": since}
+    if state == "crash_loop" and revive_exhausted:
+        record["reason"] = REVIVE_EXHAUSTED
     if limited and hold_active:
         reset = _int(hold.get("reset_at"))
         if reset is not None:
@@ -486,6 +503,46 @@ def recorded_launch(workspace: Path) -> Optional[dict]:
     return rec if rec and rec.get("runtime") in RUNTIMES else None
 
 
+#: The supervisor rewrites its heartbeat every few seconds; an older one means its app is gone.
+APP_BEAT_FRESH_S = 60.0
+
+
+def revive_exhausted(workspace: Path, now: float, supervisor_status: Optional[dict] = None) -> bool:
+    """Whether the running desktop app's core revive loop has given up (state/core-revive.json).
+    The marker counts only as that app's own: it names an app session, the supervisor's status
+    names the same one under a fresh heartbeat, and it is not stamped in the future. A marker left
+    by an app that quit, crashed or was replaced is not the current app giving up, and neither is
+    one from before this monitor last saw the core up (an outage that ended, its marker left behind)."""
+    rec = _read_json(status_read_path(REVIVE_FILE, Path(workspace)))
+    if not rec or rec.get("v") != VERSION or rec.get("state") != "exhausted":
+        return False
+    session, since = rec.get("appSessionId"), _int(rec.get("since"))
+    status = supervisor_status if supervisor_status is not None else \
+        _read_json(status_read_path("supervisor-status.json", Path(workspace)))
+    beat = status.get("heartbeatAt") if isinstance(status, dict) else None
+    live = isinstance(beat, (int, float)) and not isinstance(beat, bool) and 0 <= now - beat / 1000.0 <= APP_BEAT_FRESH_S
+    up = last_up(workspace)
+    return bool(live and isinstance(session, str) and session and status.get("appSessionId") == session
+                and since is not None and since <= now and (up is None or since > up))
+
+
+def last_up(workspace: Path) -> Optional[int]:
+    """When the monitor last saw the core running or idle (state/core-last-up.json), else None."""
+    rec = _read_json(status_read_path(LAST_UP_FILE, Path(workspace)))
+    return _int(rec.get("at")) if rec and rec.get("v") == VERSION else None
+
+
+def note_up(workspace: Path, record: Optional[dict], now: float) -> bool:
+    """Stamp the core as up when `record` says so, at most once per REFRESH_S; True when written."""
+    if not record or record.get("state") not in ("running", "idle"):
+        return False
+    seen = last_up(workspace)
+    if seen is not None and 0 <= now - seen < REFRESH_S:
+        return False
+    write_status(LAST_UP_FILE, {"v": VERSION, "at": int(now)}, workspace=Path(workspace))
+    return True
+
+
 def runtimes_on_host() -> tuple:
     """The runtimes whose CLI is on PATH: a switch is offered only to one this host can launch."""
     return tuple(r for r in RUNTIMES if shutil.which(r))
@@ -516,6 +573,7 @@ def gather(workspace: Path, supervisor: Optional[dict], *, now: float, runtime: 
         waiting_tasks=core_gate_notice.queued_count(workspace),
         restarts_10m=None if launches is None else len(launches), runtimes_available=runtimes_on_host(),
         crash_since=crash_loop_start(workspace, now) if launches else None,
+        revive_exhausted=revive_exhausted(workspace, now),
         models_offered=[e["key"] for e in offered], model_labels=[e["label"] for e in offered])
 
 
@@ -530,7 +588,9 @@ def update(workspace: Path, supervisor: Optional[dict], *, runtime: Optional[str
     """One monitor tick: gather, derive and publish. Never raises: the monitor must keep ticking."""
     at = time.time() if now is None else now
     try:
-        return publish(workspace, gather(workspace, supervisor, now=at, runtime=runtime, pane=pane), at)
+        record = gather(workspace, supervisor, now=at, runtime=runtime, pane=pane)
+        note_up(workspace, record, at)
+        return publish(workspace, record, at)
     except Exception as exc:  # noqa: BLE001
         print(f"core-recovery record not written: {type(exc).__name__}: {exc}", file=sys.stderr)
         return False

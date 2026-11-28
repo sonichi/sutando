@@ -18,6 +18,10 @@ a click supplies is an id the card itself offered:
     restart_core        core only: src/agent/start-cli.sh --restart, detached (detached_action): it
                         closes the tmux session this monitor runs in, so it never runs as its child
     escape_prompt       one Escape key into the pane
+    reset_service:<s>   core only: one request to the desktop supervisor to clear the crash-loop stop on
+                        service <s> and launch it again, naming the card's own app session and incident
+                        (core_crash_loop.request_reset); a card for an older session or trip is stale.
+                        Its outcome is the supervisor's answer (settle_service_resets), or a timeout
     buy_credits, add_account, switch_account:<id>
                         never offered or run here: each needs a confirmed, re-authenticated step (P1)
 
@@ -354,6 +358,16 @@ def _execute(verb: str, arg: Optional[str], req, target: Target, runner: Runner,
             runtime_models.request_probe(ws, target.session, now)
         return ("done", None, "Reading the current options again; a new card shows what the screen offers now.",
                 {})
+    if verb == recovery.RESET_SERVICE:
+        import core_crash_loop
+        subject = (req.subject or {}) if req is not None else {}
+        rid = core_crash_loop.request_reset(ws, arg, str(subject.get("service_session") or ""),
+                                            str(subject.get("service_incident") or ""), now)
+        if rid is None:
+            why = f"{arg} is no longer stopped by the crash this card is about, so nothing was done. " + NEW_CARD
+            return "stale", why, why, {}
+        return ("done", None, f"Asked the app to start {arg} again; checking that it is running.",
+                {"state": "starting", VERIFY_FIELD: {"service": arg, "request": rid}})
     if verb == recovery.ESCAPE_PROMPT:
         if not target.send_key("Escape"):
             why = "The terminal did not take the key."
@@ -446,9 +460,9 @@ def _answer_card(manager, req, line: str, outcome: str, now: float, check: Optio
         cur.message = f"{cur.message}\n\n{line}"
         subject = {k: v for k, v in (cur.subject or {}).items() if k != "receipt"}
         subject["verify"] = {"at": now, "outcome": outcome, **(check or {})}
-        if not (outcome == "done" and (check or {}).get("detached")):
-            # A detached restart's card carries no receipt until its outcome is known (verify_step):
-            # a client reading the card never sees "done" for a restart that then failed.
+        if not (outcome == "done" and ((check or {}).get("detached") or (check or {}).get("service"))):
+            # A detached restart's or a service reset's card carries no receipt until its outcome is
+            # known: a client reading the card never sees "done" for a start that then failed.
             subject["receipt"] = {"outcome": outcome, "at": int(now)}
         cur.subject = subject
         cur.revision += 1
@@ -460,7 +474,7 @@ def _final_receipt(workspace: Path, req_id: str, check: Dict, outcome: str, reas
                    now: float) -> Dict:
     """A detached restart's observed outcome: the receipt on disk is corrected when it failed, and
     the card's receipt (returned, for the caller's edit) is the observed one."""
-    if check.get("detached") and outcome != "done":
+    if (check.get("detached") or check.get("service")) and outcome != "done":
         prior = recovery.read_receipt(workspace, req_id)
         if prior is not None and prior.get("outcome") == "done":
             recovery.write_receipt(workspace, recovery.receipt(
@@ -527,6 +541,8 @@ def verify_pending(req, now: float) -> bool:
     check = (req.subject or {}).get("verify")
     if not isinstance(check, dict) or check.get("seen") or check.get("outcome") != "done":
         return False
+    if check.get("service"):
+        return True  # until settle_service_resets has the supervisor's answer or its timeout
     try:
         return now - float(check.get("at") or 0) < VERIFY_DEADLINE_S
     except (TypeError, ValueError):
@@ -547,8 +563,8 @@ def verify_step(manager, workspace: Path, session: str, blocked: bool, now: Opti
         subject = r.subject or {}
         check = subject.get("verify")
         if subject.get("session") != session or not subject.get("recovery") or not isinstance(check, dict) \
-                or check.get("seen"):
-            continue
+                or check.get("seen") or check.get("service"):
+            continue  # a service's card is settle_service_resets': the core's state says nothing of it
         if check.get("detached"):
             done = detached_action.status(workspace, check["detached"], at)
             if done.state == detached_action.RUNNING:
@@ -598,6 +614,50 @@ def verify_step(manager, workspace: Path, session: str, blocked: bool, now: Opti
             cur.updated_at = time.time()
             manager.store.save(cur)
         if blocked:
+            _supersede(manager, r.id)
+        edited.append(r.id)
+    return edited
+
+
+def settle_service_resets(manager, workspace: Path, session: str, now: float) -> List[str]:
+    """Close each service-reset card on the supervisor's own answer (core_crash_loop.reset_result):
+    running, failed, or no answer in time. The card, its receipt and the audit say which; a stop
+    marker that went away is never read as success. Returns the edited card ids."""
+    import core_crash_loop
+    edited = []
+    for r in manager.active():
+        subject = r.subject or {}
+        check = subject.get("verify")
+        if subject.get("session") != session or not isinstance(check, dict) or not check.get("service") \
+                or check.get("seen") or check.get("outcome") != "done":
+            continue
+        name = str(check["service"])
+        result = core_crash_loop.reset_result(
+            workspace, str(check.get("request") or ""), name, str(subject.get("service_session") or ""),
+            str(subject.get("service_incident") or ""), float(check.get("at") or 0), now)
+        if result is None:
+            continue
+        ok = result == core_crash_loop.RUNNING
+        line = (f"{name} is running again." if ok else
+                f"The app tried, and {name} did not start. " + NEW_CARD if result == core_crash_loop.FAILED else
+                f"The app did not answer in time, so I can't say {name} started. " + NEW_CARD)
+        outcome = "done" if ok else "failed"
+        receipt = _final_receipt(workspace, r.id, check, outcome, None if ok else line, now)
+        audit(workspace, {"at": int(now), "hitl_id": r.id, "action_id": str(r.chosen_action or ""),
+                          "outcome": outcome, "sender": "", "session": session, "seat": "", "result": result})
+        with manager.store.locked():
+            cur = manager.get(r.id)
+            if cur is None or cur.terminal:
+                continue
+            cur.message = f"{cur.message}\n\n{line}"
+            cur.subject = {**(cur.subject or {}), "receipt": receipt,
+                           "verify": {**check, "seen": "working" if ok else "blocked"}}
+            cur.revision += 1
+            cur.updated_at = time.time()
+            manager.store.save(cur)
+        if ok:
+            manager.resolve(r.id)
+        else:
             _supersede(manager, r.id)
         edited.append(r.id)
     return edited

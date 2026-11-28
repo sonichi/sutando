@@ -34,13 +34,15 @@ class Grammar(unittest.TestCase):
                 for aid, want in (("retry_now", ("retry_now", None)), ("refresh_options", ("refresh_options", None)),
                                   ("switch_model:o4b876be2aaa6", ("switch_model", "o4b876be2aaa6")),
                                   ("switch_runtime:codex", ("switch_runtime", "codex")),
-                                  ("switch_account:acct_3f9a2b", ("switch_account", "acct_3f9a2b"))):
+                                  ("switch_account:acct_3f9a2b", ("switch_account", "acct_3f9a2b")),
+                                  ("reset_service:voice-agent", ("reset_service", "voice-agent"))):
                     self.assertEqual(rec.parse(aid), want, aid)
                     self.assertTrue(rec.is_recovery(aid))
                 for bad in (None, 3, "", "rm -rf /", "switch_model:", "switch_model:Opus", "switch_model:a b",
                             "switch_model:sonnet-5-1m-context", "switch_model:claude-opus-5-5", "switch_model:Opus 5.5",
                             "switch_model:o4b876be2aaa6\n", "switch_model:o4b876be2aaa", "retry_now\n",
-                            "switch_runtime:../x", "switch_account:me@example.com", "open_terminal", "opt1"):
+                            "switch_runtime:../x", "switch_account:me@example.com", "open_terminal", "opt1",
+                            "reset_service:", "reset_service:../etc", "reset_service:a b", "reset_service:x\n"):
                     self.assertIsNone(rec.parse(bad), bad)
                     self.assertFalse(rec.is_recovery(bad))
 
@@ -62,6 +64,7 @@ class Grammar(unittest.TestCase):
                 self.assertEqual(rec.label("switch_runtime:codex"), "Switch to codex")
                 self.assertEqual(rec.label("switch_account:acct_3f9a2b"), "Switch to account acct_3f9a2b")
                 self.assertEqual(rec.label("refresh_options"), "Refresh options")
+                self.assertEqual(rec.label("reset_service:voice-agent"), "Start voice-agent again")
                 with self.assertRaises(ValueError):
                     rec.label("nope")
 

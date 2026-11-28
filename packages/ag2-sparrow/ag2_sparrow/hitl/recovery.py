@@ -32,17 +32,20 @@ SWITCH_RUNTIME = "switch_runtime"
 RESTART_CORE = "restart_core"
 ESCAPE_PROMPT = "escape_prompt"
 REFRESH_OPTIONS = "refresh_options"
+RESET_SERVICE = "reset_service"
 # A model switch names an opaque token of one read of the runtime's own list (runtime_models),
 # never a model or a label; which tokens exist is that list's, checked before anything runs.
 _MODEL_KEY = re.compile(r"o[0-9a-f]{12}")
 # A runtime is named by a slug here; which runtimes exist is the engine's list
 # (core_recovery_state.RUNTIMES), checked before anything runs.
 _RUNTIME_ID = re.compile(r"^[a-z][a-z0-9-]{0,15}$")
+# A stopped service is named by the supervisor's own short id; that it is stopped is checked before anything runs.
+_SERVICE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,39}")
 _BARE = frozenset({RETRY_NOW, RESTART_CORE, ESCAPE_PROMPT, BUY_CREDITS, ADD_ACCOUNT, REFRESH_OPTIONS})
 # An account is named by its opaque digest (core_recovery_state's), never an address or token.
 _ACCOUNT_ID = re.compile(r"^acct_[0-9a-f]{6}$")
 # Act on the core itself, so a worker seat's card never carries them.
-CORE_ONLY = frozenset({RESTART_CORE, SWITCH_RUNTIME})
+CORE_ONLY = frozenset({RESTART_CORE, SWITCH_RUNTIME, RESET_SERVICE})
 OUTCOMES = ("done", "refused", "stale", "failed")
 RECEIPT_VERSION = 1
 AUDIT_FILE = "audit.jsonl"
@@ -73,6 +76,8 @@ def parse(action_id: Any) -> Optional[Tuple[str, Optional[str]]]:
     if verb == SWITCH_RUNTIME and sep and _RUNTIME_ID.fullmatch(arg):
         return verb, arg
     if verb == SWITCH_ACCOUNT and sep and _ACCOUNT_ID.fullmatch(arg):
+        return verb, arg
+    if verb == RESET_SERVICE and sep and _SERVICE_ID.fullmatch(arg):
         return verb, arg
     return None
 
@@ -106,6 +111,8 @@ def label(aid: str, runtime_names: Optional[dict] = None, model_names: Optional[
         return f"Switch to {(runtime_names or {}).get(arg, arg)}"
     if verb == SWITCH_ACCOUNT:
         return f"Switch to account {arg}"
+    if verb == RESET_SERVICE:
+        return f"Start {arg} again"
     return _LABELS[verb]
 
 
