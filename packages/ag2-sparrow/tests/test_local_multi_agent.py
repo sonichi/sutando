@@ -884,7 +884,7 @@ class Round5(MultiBase):
         """What a repair keeps from the job's install: its token file and the flags it was installed with."""
         keys = ("TOKEN_ENV_FILE", claude_cli.inbox.ALLOW_COLLABORATOR, claude_cli.inbox.ALLOW_NON_OWNER) \
             if adapter == CL.name else \
-            ("TOKEN_ENV_FILE", "SANDBOX", "ALLOW_NON_OWNER")
+            ("TOKEN_ENV_FILE", "SANDBOX", "ALLOW_NON_OWNER", "ALLOW_COLLABORATOR")
         cfg = cm.read_config_lenient(cm.config_path(job(adapter, agent)))
         return {k: cfg.get(k) for k in keys}
 
@@ -943,7 +943,7 @@ class Round5(MultiBase):
 
         def lacking(adapter):
             self.installed(adapter, ALPHA)
-            self.installed(adapter, BETA, "--sandbox", "workspace-write", "--allow-non-owner")
+            self.installed(adapter, BETA, "--sandbox", "workspace-write", "--allow-non-owner", "--no-allow-collaborator")
             conf = cm.config_path(job(adapter, BETA))
             conf.write_text(re.sub(r"(?m)^CODEX=.*\n", "", conf.read_text()))
 

@@ -332,6 +332,9 @@ def session_flags(args) -> list:
         if not action.option_strings or action.dest in _NOT_SESSION or value is None or value == action.default:
             continue
         flag = next(o for o in action.option_strings if o.startswith("--"))
+        if action.nargs == 0 and value is not True:     # a store_const pair (--x / --no-x) on one dest: the one set
+            out += [flag] if value == action.const else []
+            continue
         out += [flag] if value is True else [flag, str(value)]
     return out
 
