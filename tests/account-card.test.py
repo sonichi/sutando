@@ -713,6 +713,50 @@ class ClaudeCoreSwitch(Base):
         with self.assertRaises(FileExistsError):
             acc.write_core_request(self.cdir, ckey("bob@work.io"), NONCE, 100.0)
 
+    def test_a_watcher_that_cannot_start_takes_the_request_back(self):
+        self.post()
+
+        def broken(argv, **kw):
+            raise OSError("no fork")
+        self.launch = broken
+        rc, out = self.tap("Use bob@work.io")
+        self.assertEqual((rc, out["status"]), (1, "failed"))
+        self.assertEqual(sorted(os.listdir(self.cdir)), [acc.CONSUMER], "no request left for the desktop")
+        self.launch = Launch()
+        rc, out = self.tap("Use bob@work.io")
+        self.assertEqual(out["status"], "started", "the same tap may act once the start failed")
+
+    def test_an_answer_the_app_could_not_finish_knowing_is_told_as_not_switched(self):
+        rc, out, _ = self.watch({"ok": False, "unknown": True, "error": "the app restarted during the switch"},
+                                claim=True, write_at=5.0)
+        self.assertEqual(out["say"], "Could not switch: the app restarted during the switch")
+        rc, out, _ = self.watch({"ok": False}, claim=True, write_at=5.0)
+        self.assertEqual(out["say"], "Could not switch: the app did not say why")
+
+    def test_an_answer_for_another_nonce_is_not_taken(self):
+        acc.write_core_request(self.cdir, ckey("bob@work.io"), NONCE, 100.0)
+        other = self.cdir / (acc.RESULT % NONCE)
+        other.write_text(json.dumps({"v": 2, "nonce": "someone-else", "ok": True, "verified": True}))
+        clock = [0.0]
+
+        def sleep(s):
+            clock[0] += s
+        state, words = acc.await_core(self.cdir, NONCE, "bob@work.io", sleep=sleep, clock=lambda: clock[0])
+        self.assertEqual((state, words), ("error", acc.UNCLAIMED))
+
+    def test_the_outcome_post_is_retried_after_the_core_restarts(self):
+        real, tries = self.fake.execute, []
+
+        def flaky(*a, **k):
+            tries.append(1)
+            if len(tries) < 3:
+                raise RuntimeError("the core lane is restarting")
+            return real(*a, **k)
+        self.fake.execute = flaky
+        rc, out, _ = self.watch({"ok": True, "verified": True}, claim=True, write_at=5.0)
+        self.assertEqual((out["status"], out["say"]), ("posted", "Now using bob@work.io."))
+        self.assertEqual(len(tries), 3)
+
     def test_the_watcher_refuses_a_malformed_nonce(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
