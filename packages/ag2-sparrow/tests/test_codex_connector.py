@@ -19,6 +19,13 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+sys.path.append(str(Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+from _helpers.subprocess_coverage import covered_code  # noqa: E402
+
+# Before the imports below: codex_connector reaches the agent's token file (the room tools' exchange).
+isolate_os_environ()
+
 PKG_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG_ROOT))
 from ag2_sparrow import (account_switch, card_desk, connector_cards, local_task_protocol, model_switch,  # noqa: E402
@@ -44,11 +51,15 @@ ACCOUNT_BUTTONS = ["Switch account", "Add account"]
 
 
 def covered_server_argv(server, codex="codex"):
-    """Under the coverage gate the stub child is traced too; its fragment lands in the
-    cwd, where the gate's `coverage combine` picks it up."""
+    """Under the coverage gate the stub child is traced too, through covered_code: the connector starts it
+    with only PATH and HOME (child_env), and HOME is this isolated process's temp one, where no user-site
+    coverage is installed, so `-m coverage` would not import there."""
     argv = REAL_SERVER_ARGV(server, codex)
     if server == "stub" and os.environ.get("SUTANDO_TEST_SUBPROCESS_COVERAGE") == "1":
-        return [sys.executable, "-m", "coverage", "run", "--rcfile=%s" % (REPO_ROOT / ".coveragerc")] + argv[1:]
+        stub = argv[1]
+        code = ("import runpy, sys; sys.argv = [%r]; sys.path[0] = %r; runpy.run_path(%r, run_name='__main__')"
+                % (stub, os.path.dirname(stub), stub))
+        return [sys.executable, "-c", covered_code(code)]
     return argv
 
 

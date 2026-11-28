@@ -7,7 +7,9 @@ were not offered). This shim sits between agy and that proxy and changes nothing
 answer's tool names become `room_action_execute` and so on (`alias`), and a `tools/call` for an alias is sent
 on under the server's own name. It also enforces the turn's grant (TOOLS_ENV, the server names the connector
 grants): a `tools/list` answer keeps only granted tools, and a `tools/call` for any other name, or a malformed
-one, is answered with a JSON-RPC error and never forwarded. No grant named means none granted. Only METHODS and
+one, is answered with a JSON-RPC error and never forwarded. No grant named means none granted. With GRANT_ENV set
+(codex-local, whose server outlives a turn), a call is forwarded only while that file holds a live per-turn grant
+naming this server's launch (LAUNCH_ENV) and the tool: between turns, or with none, it is refused. Only METHODS and
 `notifications/*` reach the server, plus the client's answers to the server's own requests; any other request,
 and a line that is not a JSON-RPC object, is answered with an error, any other notification dropped. Server
 lines pass through as they came, and the child's environment is this process's (the proxy scrubs its own).
@@ -34,6 +36,7 @@ _BAD = re.compile(r"[^A-Za-z0-9_-]")
 LOG_ENV = "AG2_MCP_LOG"
 STATUS_ENV, TURN_ENV = "AG2_MCP_SHIM_STATUS", "AG2_MCP_SHIM_TURN"
 TOOLS_ENV = "AG2_MCP_SHIM_TOOLS"
+GRANT_ENV, LAUNCH_ENV = "AG2_MCP_SHIM_GRANT", "AG2_MCP_SHIM_LAUNCH"
 NOT_GRANTED = -32601
 PARSE_ERROR, INVALID_REQUEST = -32700, -32600
 # The client methods forwarded; any other request is answered with an error, any other notification dropped.
@@ -44,6 +47,37 @@ def granted(environ=None):
     """The server tool names this turn may list and call (TOOLS_ENV, comma-separated); none when unset."""
     value = (os.environ if environ is None else environ).get(TOOLS_ENV) or ""
     return frozenset(n for n in value.split(",") if n)
+
+
+class Grant:
+    """The per-turn grant the connector writes when a turn with integrations starts and removes when it ends
+    (GRANT_ENV): a call is allowed only while it names this server's launch (LAUNCH_ENV), is unexpired and lists
+    the tool. Read on every call; anything unreadable, missing or malformed allows nothing."""
+
+    def __init__(self, path, launch):
+        self.path, self.launch = path, launch
+
+    def allows(self, server_name, now=None):
+        if not self.path or not self.launch:
+            return False
+        try:
+            fd = os.open(self.path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(fd, encoding="utf-8") as f:
+                g = json.load(f)
+        except (OSError, ValueError):
+            return False
+        if not isinstance(g, dict):
+            return False
+        expires = g.get("expires")
+        return (g.get("launch") == self.launch and isinstance(expires, (int, float))
+                and expires > (time.time() if now is None else now)
+                and isinstance(g.get("tools"), list) and server_name in g["tools"])
+
+
+def grant_of(environ=None):
+    """The Grant every call must pass when GRANT_ENV is set (even empty: then none passes); None when unset."""
+    env = os.environ if environ is None else environ
+    return Grant(env.get(GRANT_ENV) or "", env.get(LAUNCH_ENV) or "") if GRANT_ENV in env else None
 
 
 class Status:
@@ -92,9 +126,10 @@ class Names:
     """The aliases handed out so far: alias -> server name (a later tools/list may add or change them), and the
     server names this turn grants (`allowed`)."""
 
-    def __init__(self, allowed=frozenset()):
+    def __init__(self, allowed=frozenset(), grant=None):
         self.to_server = {}
         self.allowed = frozenset(allowed)
+        self.grant = grant      # a Grant every call must also pass, or None
         self.lock = threading.Lock()
 
     def rename_tools(self, tools):
@@ -120,6 +155,10 @@ class Names:
     def call_ok(self, name):
         """A `tools/call` name (an alias or a server name) that resolves to a granted tool."""
         return isinstance(name, str) and self.server_name(name) in self.allowed
+
+    def turn_ok(self, name):
+        """A granted call that the live per-turn grant also allows (always, when no Grant is set)."""
+        return self.grant is None or self.grant.allows(self.server_name(name))
 
 
 def _messages(line):
@@ -155,6 +194,9 @@ def _refused(m, names):
         params = m.get("params")
         if not names.call_ok(params.get("name") if isinstance(params, dict) else None):
             return NOT_GRANTED, "tool not granted on this turn"
+        if not names.turn_ok(params["name"]):
+            note("refused a call with no live turn grant")
+            return NOT_GRANTED, "no live turn grant: tools act only during the turn that granted them"
     return None
 
 
@@ -232,7 +274,7 @@ def main(argv=None, stdin=None, stdout=None, popen=subprocess.Popen):
         note("the server did not start (%s)" % type(e).__name__)
         status.exited(127)
         return 127
-    names, pending, out_lock = Names(granted()), set(), threading.Lock()
+    names, pending, out_lock = Names(granted(), grant_of()), set(), threading.Lock()
 
     def pump_out():
         for line in child.stdout:
