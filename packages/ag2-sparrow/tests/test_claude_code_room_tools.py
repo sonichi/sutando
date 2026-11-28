@@ -33,11 +33,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from claude_code_fixtures import (  # noqa: E402
     cli, cm, ConnectBase, hold_consumer, hold_mod, inbox, isolated_runs, SESSION_ID, unhold, write_isolated_stub,
 )
-from ag2_sparrow import mcp_auth, mcp_stdio, task_lifecycle as lifecycle  # noqa: E402
+from ag2_sparrow import mcp_auth, mcp_name_shim, mcp_stdio, task_lifecycle as lifecycle  # noqa: E402
 
 SECRET = "relay-secret-do-not-leak"
 AGENT = "@cl:s.space"
-PROXY = shlex.join(["/app/node", "/app/ag2-mcp-proxy.mjs"])
+# Its first word must be an executable that exists (hold checks it at every start): this interpreter stands in.
+PROXY = shlex.join([sys.executable, "/app/ag2-mcp-proxy.mjs"])
 DESC = {"version": 1, "lane": "primary", "env_key": "REMOTE_TASK_TOKEN",
         "mint_url": "https://relay.s.space/api/v1/mcp/agent-access-tokens", "mcp_url": "https://mcp.s.space/mcp",
         "relay": "https://relay.s.space"}
@@ -106,7 +107,9 @@ class RoomToolsArgv(unittest.TestCase):
                          ("stdio", str(self.state / mcp_stdio.SHIM_NAME), shlex.split(PROXY)))
         descriptor = self.state / mcp_stdio.DESCRIPTOR_NAME
         self.assertEqual(server["env"], {"AG2_MCP_DESCRIPTOR": str(descriptor),
-                                         "AG2_MCP_LOG": str(self.state / mcp_stdio.PROXY_LOG_NAME)})
+                                         "AG2_MCP_LOG": str(self.state / mcp_stdio.PROXY_LOG_NAME),
+                                         mcp_name_shim.GATE_ENV: str(self.root)},
+                         "the shim is told the root whose claims gate every call")
         self.assertEqual(stat.S_IMODE(descriptor.stat().st_mode), 0o600)
         desc = json.loads(descriptor.read_text())
         self.assertEqual((desc["env_file"], desc["agent_id"]), (self.token, AGENT), "names the token file, never holds it")
@@ -130,6 +133,14 @@ class RoomToolsArgv(unittest.TestCase):
         self.assertEqual(Path(self.state / hold_mod.MCP_CONFIG_NAME).read_text(), first, "the same server entry")
         self.assertNotEqual((self.state / mcp_stdio.SHIM_NAME).read_text(), shim, "a fresh turn id for the shim")
         self.assertEqual(len(self.runs), 2)
+
+    def test_a_recorded_proxy_whose_executable_is_gone_is_said_and_offers_nothing(self):
+        gone = shlex.join([str(self.d / "moved" / "node"), "/app/ag2-mcp-proxy.mjs"])
+        self.assertEqual(self.argv(dict(self.cfg, MCP_PROXY_COMMAND=gone)), [])
+        self.assertIn("the recorded proxy's executable is gone", self.lines[-1])
+        self.assertEqual(self.argv(dict(self.cfg, MCP_PROXY_COMMAND="'unterminated")), [])
+        self.assertIn("not offered: ValueError", self.lines[-1])
+        self.assertEqual(self.runs, [], "no exchange for a proxy that cannot run")
 
     def test_no_proxy_command_no_token_file_gives_nothing(self):
         self.assertEqual(self.argv(dict(self.cfg, MCP_PROXY_COMMAND="")), [])
@@ -322,6 +333,84 @@ class IsolatedTurnHasNoMcp(ConnectBase):
         self.assertNotIn("ag2-space", json.dumps(run))
         self.assertFalse({k for k in run["env"] if k.startswith("AG2_MCP")})
         self.assertFalse((self.work / "state" / "room-tools").exists(), "nothing of the room tools was built")
+
+
+class CollaboratorTurnsGetNoRoomTools(ConnectBase):
+    """The owner and attested collaborators share the one session, so its tools are gated at the shim, per call:
+    while a collaborator's task is in flight in the live session, no `tools/call` reaches the server."""
+
+    CALL = {"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "room_action_execute"}}
+
+    def setUp(self):
+        super().setUp()
+        self.configure(MCP_PROXY_COMMAND=PROXY, TOKEN_ENV_FILE=token_file(self.home), AGENT_ID=AGENT)
+        self.root = str(self.work)
+        self.assertEqual(inbox.prepare_root(self.root), "")
+        self.holder, _ = hold_consumer(self.work)
+        self.addCleanup(unhold, self.holder)
+
+    def claim(self, task_id, tier, extra=""):
+        (self.inbox / (task_id + ".txt")).write_text("id: %s\n%saccess_tier: %s\ntask: post in the room\n"
+                                                     % (task_id, extra, tier))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = cli.main(["inbox", "--root", self.root, "claim", task_id])
+        return rc, json.loads(out.getvalue())
+
+    def call(self):
+        """(forwarded?, the error message) for one room-tool call through the shim, gated on this root."""
+        names = mcp_name_shim.Names({"room.action.execute"}, mcp_name_shim.turn_gate({mcp_name_shim.GATE_ENV: self.root}))
+        names.rename_tools([{"name": "room.action.execute"}])
+        forward, reply = mcp_name_shim.to_server(json.dumps(self.CALL) + "\n", names, set())
+        return forward is not None, (json.loads(reply)["error"]["message"] if reply else "")
+
+    def test_an_owner_turn_calls_the_tools_and_a_collaborator_turn_is_refused_at_the_shim(self):
+        self.assertEqual(self.call(), (True, ""), "nothing in flight: the owner at the session")
+        rc, out = self.claim("task-o", "owner")
+        self.assertEqual((rc, out.get("admission")), (0, "owner"), out)
+        self.assertEqual(inbox.room_tools_refusal(self.root), "")
+        self.assertEqual(self.call(), (True, ""), "the owner's own turn")
+
+        rc, out = self.claim("task-c", "team", "collaborator: true\n")
+        self.assertEqual((rc, out.get("admission")), (0, "collaborator"), out)
+        self.assertEqual(inbox.room_tools_refusal(self.root), inbox.ROOM_TOOLS_OWNER_ONLY)
+        forwarded, why = self.call()
+        self.assertEqual((forwarded, why), (False, inbox.ROOM_TOOLS_OWNER_ONLY),
+                         "the same session, the same granted tool: refused while the collaborator's task is in flight")
+
+        # Its task answered (the file archived, the claim settled): the owner's turns call the tools again.
+        lc = inbox._lifecycle(self.root)
+        rec = lc.claims.load("task-c")
+        lc.claims.save(dict(rec, phase=lifecycle.SETTLED))
+        self.assertEqual(self.call(), (True, ""))
+
+    def test_a_restricted_senders_isolated_turn_does_not_close_the_owners_tools(self):
+        stub = write_isolated_stub(self.home)
+        self.configure(CLAUDE=str(stub), MCP_PROXY_COMMAND=PROXY, TOKEN_ENV_FILE=token_file(self.home), AGENT_ID=AGENT)
+        rc, out = self.claim("task-g", "guest")
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self.call(), (True, ""), "it never runs in the session")
+
+    def test_what_cannot_be_checked_refuses(self):
+        rc, out = self.claim("task-c", "team", "collaborator: true\n")
+        self.assertEqual(rc, 0, out)
+        (self.inbox / "task-c.txt").unlink()
+        self.assertEqual(inbox.room_tools_refusal(self.root), "", "a task file already gone is an answered task")
+        (self.inbox / "task-c.txt").mkdir()
+        self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_UNREAD))
+        (self.inbox / "task-c.txt").rmdir()
+        with mock.patch.object(inbox, "room_tools_refusal", side_effect=RuntimeError("claims unreadable")):
+            self.assertEqual(self.call(), (False, mcp_name_shim.GATE_UNCHECKED), "fail closed")
+        unhold(self.holder)
+        self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_NO_SESSION), "no live session holds the root")
+
+    def test_a_shim_without_the_gate_is_unchanged_for_the_other_connectors(self):
+        self.assertIsNone(mcp_name_shim.turn_gate({}))
+        self.claim("task-c", "team", "collaborator: true\n")
+        names = mcp_name_shim.Names({"room.action.execute"})
+        names.rename_tools([{"name": "room.action.execute"}])
+        forward, reply = mcp_name_shim.to_server(json.dumps(self.CALL) + "\n", names, set())
+        self.assertEqual((json.loads(forward)["params"]["name"], reply), ("room.action.execute", None))
 
 
 if __name__ == "__main__":

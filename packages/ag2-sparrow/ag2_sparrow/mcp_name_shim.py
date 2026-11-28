@@ -7,7 +7,9 @@ were not offered). This shim sits between agy and that proxy and changes nothing
 answer's tool names become `room_action_execute` and so on (`alias`), and a `tools/call` for an alias is sent
 on under the server's own name. It also enforces the turn's grant (TOOLS_ENV, the server names the connector
 grants): a `tools/list` answer keeps only granted tools, and a `tools/call` for any other name, or a malformed
-one, is answered with a JSON-RPC error and never forwarded. No grant named means none granted. Only METHODS and
+one, is answered with a JSON-RPC error and never forwarded. No grant named means none granted. With GATE_ENV (a
+claude-local work root, whose one session the owner and attested collaborators share), every `tools/call` is
+also checked against the tasks in flight there: while a collaborator's is, none is forwarded. Only METHODS and
 `notifications/*` reach the server, plus the client's answers to the server's own requests; any other request,
 and a line that is not a JSON-RPC object, is answered with an error, any other notification dropped. Server
 lines pass through as they came, and the child's environment is this process's (the proxy scrubs its own).
@@ -34,6 +36,8 @@ _BAD = re.compile(r"[^A-Za-z0-9_-]")
 LOG_ENV = "AG2_MCP_LOG"
 STATUS_ENV, TURN_ENV = "AG2_MCP_SHIM_STATUS", "AG2_MCP_SHIM_TURN"
 TOOLS_ENV = "AG2_MCP_SHIM_TOOLS"
+GATE_ENV = "AG2_MCP_SHIM_CLAUDE_ROOT"
+GATE_UNCHECKED = "the turn's sender could not be checked, so no room tool is called"
 NOT_GRANTED = -32601
 PARSE_ERROR, INVALID_REQUEST = -32700, -32600
 # The client methods forwarded; any other request is answered with an error, any other notification dropped.
@@ -44,6 +48,23 @@ def granted(environ=None):
     """The server tool names this turn may list and call (TOOLS_ENV, comma-separated); none when unset."""
     value = (os.environ if environ is None else environ).get(TOOLS_ENV) or ""
     return frozenset(n for n in value.split(",") if n)
+
+
+def turn_gate(environ=None):
+    """None, or the check every `tools/call` passes first: '' to forward it, else why it is refused. Set by
+    GATE_ENV, a claude-local work root; a check that cannot run refuses (fail closed)."""
+    root = (os.environ if environ is None else environ).get(GATE_ENV)
+    if not root:
+        return None
+
+    def check():
+        try:
+            from .adapters.claude_code import inbox
+            return inbox.room_tools_refusal(root)
+        except Exception as e:  # noqa: BLE001 - an unreadable record never opens the tools
+            note("the turn gate could not run (%s)" % type(e).__name__)
+            return GATE_UNCHECKED
+    return check
 
 
 class Status:
@@ -92,9 +113,10 @@ class Names:
     """The aliases handed out so far: alias -> server name (a later tools/list may add or change them), and the
     server names this turn grants (`allowed`)."""
 
-    def __init__(self, allowed=frozenset()):
+    def __init__(self, allowed=frozenset(), gate=None):
         self.to_server = {}
         self.allowed = frozenset(allowed)
+        self.gate = gate
         self.lock = threading.Lock()
 
     def rename_tools(self, tools):
@@ -155,6 +177,9 @@ def _refused(m, names):
         params = m.get("params")
         if not names.call_ok(params.get("name") if isinstance(params, dict) else None):
             return NOT_GRANTED, "tool not granted on this turn"
+        why = names.gate() if names.gate else ""
+        if why:
+            return NOT_GRANTED, why
     return None
 
 
@@ -232,7 +257,7 @@ def main(argv=None, stdin=None, stdout=None, popen=subprocess.Popen):
         note("the server did not start (%s)" % type(e).__name__)
         status.exited(127)
         return 127
-    names, pending, out_lock = Names(granted()), set(), threading.Lock()
+    names, pending, out_lock = Names(granted(), turn_gate()), set(), threading.Lock()
 
     def pump_out():
         for line in child.stdout:

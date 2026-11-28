@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -19,7 +20,8 @@ import time
 import uuid
 from pathlib import Path
 
-from ... import claude_local_records as records, claude_model_switch, connect_common as cm, mcp_auth, mcp_stdio, task_io
+from ... import (claude_local_records as records, claude_model_switch, connect_common as cm, mcp_auth, mcp_name_shim,
+                 mcp_stdio, task_io)
 from ...bounded_file_read import read_regular
 from ...file_lock import locked_file
 from . import inbox
@@ -177,8 +179,10 @@ def claude_argv(cfg: dict, session_id: str) -> list:
 # `--mcp-config` file live in one directory of the root's state (task_lifecycle.STATE_OPTIONAL_DIRS names it).
 ROOM_TOOLS_DIR = ("state", "room-tools")
 MCP_CONFIG_NAME = "ag2-mcp-config.json"
-# What the shim grants the session: the owner and attested collaborators share it (restricted senders never
-# reach it, inbox.admit), and Claude Code keeps a session's MCP servers for its life, as Codex keeps a thread's.
+# What the shim grants the session. Claude Code keeps a session's MCP servers for its life and attested
+# collaborators' turns run in the same session (restricted senders never reach it, inbox.admit), so the grant
+# alone is not per sender: the shim's turn gate (GATE_ENV) refuses every call while a collaborator's task is in
+# flight. The tools are the owner's turns' only.
 ROOM_TOOLS = mcp_auth.OWNER_TOOLS
 # The descriptor's token exchange runs before the session starts: well inside the launcher's wait for its
 # consumer (launcher.CONSUMER_WAIT_S, 30 s), so a slow relay costs the tools, never the session.
@@ -243,6 +247,13 @@ def room_tools_argv(cfg: dict, root: str, cwd: str, entry=None, log=None) -> lis
         log("ag2-space MCP tools not offered: no TOKEN_ENV_FILE (the agent's own token file)")
         return []
     try:
+        # Recorded at install: an app update can move the bundled node, and the server would then fail to
+        # start on every session with nothing said.
+        exe = (shlex.split(proxy) or [""])[0]
+        if not (os.path.isfile(exe) and os.access(exe, os.X_OK)):
+            log("ag2-space MCP tools not offered: the recorded proxy's executable is gone (%s); install again "
+                "with --mcp-proxy-command" % exe)
+            return []
         names = configured_servers(cfg, cwd)
         if mcp_auth.SERVER_NAME in names:
             log("ag2-space MCP tools not offered: the agent's Claude Code config already has an %s server"
@@ -258,6 +269,9 @@ def room_tools_argv(cfg: dict, root: str, cwd: str, entry=None, log=None) -> lis
         if got is None:
             log("ag2-space MCP tools not offered: " + why)
             return []
+        # The session is shared with attested collaborators: the shim asks this root's claims before every call
+        # and forwards none while a collaborator's task is in flight (inbox.room_tools_refusal).
+        got = dict(got, env=list(got["env"]) + [{"name": mcp_name_shim.GATE_ENV, "value": os.path.abspath(root)}])
         path = write_mcp_config(state, got)
     except Exception as e:     # the tools never cost the session its start
         log("ag2-space MCP tools not offered: %s: %s" % (type(e).__name__, str(e)[:200]))
