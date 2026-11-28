@@ -245,16 +245,30 @@ def owner_only_sessions(cfg: dict) -> list:
 
 def room_tools_session(old: dict, values: dict, session_id: str, kept: str, resume: str, live_server, stop_cmd: str,
                        mint=None) -> dict:
-    """`_room_tools_session`'s answer plus OWNER_ONLY_SESSIONS: a conversation that stops being the tools' one
-    is remembered there, so resuming it later never makes it the session collaborators share."""
+    """`_room_tools_session`'s answer plus OWNER_ONLY_SESSIONS: a conversation that is, or stops being, the
+    tools' one is remembered there and beside its transcript (hold.keep_owner_only, which outlives an uninstall),
+    so resuming it later never makes it the session collaborators share."""
     got = _room_tools_session(old, values, session_id, kept, resume, live_server, stop_cmd, mint)
-    was, history = old.get("ROOM_TOOLS_SESSION") or "", owner_only_sessions(old)
+    home = values.get("CLAUDE_CONFIG_DIR") or ""
+    was, history, durable = old.get("ROOM_TOOLS_SESSION") or "", owner_only_sessions(old), hold.owner_only_kept(home)
+    if got["ROOM_TOOLS_SESSION"] and not hold.keep_owner_only(home, got["ROOM_TOOLS_SESSION"]):
+        # Recorded before the conversation can hold a tool's result, or it never gets the tools.
+        print("NOTE mcp: the conversation started for the AG2 Space tools could not be recorded as the owner's "
+              f"alone under {hold.claude_home(home)}: it runs without the tools")
+        got = dict(got, ROOM_TOOLS_SESSION="")
     if was and was != got["ROOM_TOOLS_SESSION"] and was not in history:
         history.append(was)
     now = got.get("SESSION_ID", session_id)
+    if durable is None and resume and now == resume and now not in history:
+        # The record cannot be read, so this conversation cannot be shown never to have had the tools.
+        history.append(now)
+    history += sorted(i for i in durable or () if SESSION_ID_RE.match(i) and i not in history)
+    for one in history:
+        hold.keep_owner_only(home, one)
     if now in history and now != got["ROOM_TOOLS_SESSION"]:
-        print(f"NOTE mcp: the conversation {now} once had the AG2 Space tools: it stays the owner's alone (nobody "
-              "else is answered while a session on it runs), and it runs without the tools")
+        print(f"NOTE mcp: the conversation {now} once had the AG2 Space tools, or cannot be shown not to have: it "
+              "stays the owner's alone (nobody else is answered while a session on it runs), and it runs without "
+              "the tools")
     return dict(got, OWNER_ONLY_SESSIONS=" ".join(history))
 
 

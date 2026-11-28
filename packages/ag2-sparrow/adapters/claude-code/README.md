@@ -306,6 +306,15 @@ the tools' conversation is remembered (`OWNER_ONLY_SESSIONS`) as the owner's
 alone. Resumed later by its id, it runs without the tools. It never becomes the
 session collaborators share.
 
+That record must outlive the install config, which `uninstall` removes while
+the transcripts stay. So each such conversation is also written to
+`ag2-sparrow-owner-only-sessions` (0600) in the Claude config dir, beside the
+transcripts, before it can hold a tool's result; a conversation that cannot be
+recorded there is not given the tools. A later install reads it back, so after
+uninstall and reinstall, `--resume-session <that id>` is still the owner's
+alone. If the record is there but cannot be read, a resumed conversation cannot
+be shown never to have had the tools and is treated as the owner's alone.
+
 While a session started with the tools, or on a conversation that had them,
 still runs, `claim` answers every non-owner task with the owner-only refusal and
 starts nothing for it: no turn in the session and no separate `claude -p` turn

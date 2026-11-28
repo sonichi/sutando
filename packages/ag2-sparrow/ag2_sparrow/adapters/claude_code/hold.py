@@ -69,6 +69,37 @@ def claude_home(config_dir: str) -> str:
     return config_dir or os.path.join(os.path.expanduser("~"), ".claude")
 
 
+OWNER_ONLY_STORE = "ag2-sparrow-owner-only-sessions"    # under the Claude home, beside the transcripts it names
+
+
+def owner_only_kept(config_dir: str) -> "set | None":
+    """The conversations recorded beside their transcripts as the owner's alone (one id a line): it outlives an
+    uninstall, as the transcripts do. Empty when there is no record; None when one is there but cannot be read."""
+    try:
+        with open(os.path.join(claude_home(config_dir), OWNER_ONLY_STORE), encoding="utf-8") as f:
+            return {line.strip() for line in f if line.strip()}
+    except FileNotFoundError:
+        return set()
+    except (OSError, ValueError):
+        return None
+
+
+def keep_owner_only(config_dir: str, session_id: str) -> bool:
+    """Record `session_id` there (0600); True once the record holds it."""
+    kept = owner_only_kept(config_dir)
+    if kept is None:
+        return False
+    if session_id in kept:
+        return True
+    try:
+        home = claude_home(config_dir)
+        os.makedirs(home, exist_ok=True)
+        cm._write(Path(home) / OWNER_ONLY_STORE, "".join(i + "\n" for i in sorted(kept | {session_id})), 0o600)
+    except OSError:
+        return False
+    return True
+
+
 def transcript_path(config_dir: str, session_id: str) -> str:
     """The session's transcript under any project folder of the config dir's projects tree, else ''.
     `claude --resume <id>` finds it from any working directory, so the pane's own cwd needs no copy."""

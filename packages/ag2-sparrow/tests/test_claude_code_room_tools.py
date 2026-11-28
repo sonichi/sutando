@@ -964,6 +964,81 @@ class PreviewThroughInstall(AgentRootBase):
         self.assertTrue(hold_mod.tools_conversation(back))
         self.assertFalse(hold_mod.tools_session(back))
 
+    def fake_transcript(self, config_dir, session_id, text="owner-only page"):
+        path = Path(config_dir) / "projects" / "-tasks" / (session_id + ".jsonl")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"type": "tool_result", "content": text}) + "\n")
+        return path
+
+    def test_uninstall_then_reinstall_and_resume_keeps_the_preview_conversation_the_owners_alone(self):
+        import claude_code_fixtures as fx
+        engine = self.home / "Application Support" / "engine"
+        engine.mkdir(parents=True)
+        node = engine / "node"
+        node.write_text("#!/bin/sh\n")
+        node.chmod(0o755)
+        proxy = shlex.join([str(node), str(engine / "ag2-mcp-proxy.mjs")])
+        fake = self.bridged()
+        rc, out, err = self.install_default(fake, "--mcp-proxy-command", proxy, "--room-tools-preview", *ALONE_FLAGS)
+        self.assertEqual(rc, 0, out + err)
+        on = self.cfg()
+        home = on["CLAUDE_CONFIG_DIR"]
+        self.assertTrue(hold_mod.tools_session(on))
+        store = Path(home) / hold_mod.OWNER_ONLY_STORE
+        self.assertEqual((store.read_text().split(), stat.S_IMODE(store.stat().st_mode)), ([on["SESSION_ID"]], 0o600),
+                         "recorded beside the transcripts before the conversation holds any tool result")
+        transcript = self.fake_transcript(home, on["SESSION_ID"])
+        ordinary = "77777777-2222-4333-8444-555555555555"
+        self.fake_transcript(home, ordinary, "an ordinary chat")
+
+        # Uninstall removes the install config, and with it OWNER_ONLY_SESSIONS; the transcripts stay.
+        path = cli.config_path(cm.select_job(fx.L)[0] or fx.LA)
+        with mock.patch.object(fx.sm, "_run", side_effect=fake):
+            rc, out, err = self.main("uninstall")
+        self.assertEqual(rc, 0, out + err)
+        self.assertFalse(path.exists(), "the install config is gone")
+        self.assertTrue(transcript.exists() and store.exists(), "the transcript and the record beside it are not")
+
+        # Reinstalled with the defaults (everyone served), naming the old preview conversation to resume.
+        rc, out, err = self.install_default(fake, "--resume-session", on["SESSION_ID"])
+        self.assertEqual(rc, 0, out + err)
+        back = self.cfg()
+        self.assertEqual((back["SESSION_ID"], back["ROOM_TOOLS_SESSION"]), (on["SESSION_ID"], ""))
+        self.assertIn(on["SESSION_ID"], back["OWNER_ONLY_SESSIONS"].split())
+        self.assertIn("stays the owner's alone", out)
+        self.assertTrue(hold_mod.tools_conversation(back), "hold marks a session on it: nobody else is answered")
+        self.assertFalse(hold_mod.tools_session(back), "and it has no tools")
+
+        # An ordinary conversation resumed on the same install is shared, as before.
+        with mock.patch.object(fx.sm, "_run", side_effect=fake):
+            self.assertEqual(self.main("uninstall")[0], 0)
+        rc, out, err = self.install_default(fake, "--resume-session", ordinary)
+        self.assertEqual(rc, 0, out + err)
+        plain = self.cfg()
+        self.assertEqual(plain["SESSION_ID"], ordinary)
+        self.assertFalse(hold_mod.tools_conversation(plain), "never had the tools: the session collaborators share")
+        self.assertNotIn("stays the owner's alone", out)
+
+        # The record cannot be read: a resumed conversation cannot be shown shareable, so it is the owner's alone.
+        with mock.patch.object(fx.sm, "_run", side_effect=fake):
+            self.assertEqual(self.main("uninstall")[0], 0)
+        store.unlink()
+        store.mkdir()
+        self.assertIsNone(hold_mod.owner_only_kept(home))
+        rc, out, err = self.install_default(fake, "--resume-session", ordinary)
+        self.assertEqual(rc, 0, out + err)
+        doubt = self.cfg()
+        self.assertEqual(doubt["OWNER_ONLY_SESSIONS"].split(), [ordinary])
+        self.assertTrue(hold_mod.tools_conversation(doubt))
+        self.assertIn("cannot be shown not to have", out)
+        # And with no way to record it, a new preview conversation is not given the tools.
+        with mock.patch.object(fx.sm, "_run", side_effect=fake):
+            self.assertEqual(self.main("uninstall")[0], 0)
+        rc, out, err = self.install_default(fake, "--mcp-proxy-command", proxy, "--room-tools-preview", *ALONE_FLAGS)
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("could not be recorded as the owner's alone", out)
+        self.assertFalse(hold_mod.tools_session(self.cfg()))
+
     def test_an_agent_first_installed_with_the_preview_gets_a_new_conversation_when_it_is_turned_off(self):
         engine = self.home / "Application Support" / "engine"
         engine.mkdir(parents=True)
