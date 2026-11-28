@@ -591,10 +591,36 @@ class OnlyTheOwnersSessionHasRoomTools(ConnectBase):
         rc, out = self.claim("task-o", "owner")
         self.phase("task-o", lifecycle.TURN_CONFIRMED)
         self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_UNREAD))
-        # A mark naming an earlier process is plainly not this session's.
+        # A whole mark naming an earlier process is plainly not this session's.
         mark.write_text(json.dumps({"pid": 1, "start": "long ago", "session_id": SESSION_ID}))
         self.assertIs(inbox.tools_generation(self.root, inbox._generation(self.root)), False)
         self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_NOT_OWNERS))
+
+    def test_an_incomplete_mark_is_unknown_never_a_verified_earlier_start(self):
+        gen = inbox._generation(self.root)
+        mark = Path(self.root).joinpath(*inbox.TOOLS_MARK)
+        mark.parent.mkdir(parents=True, exist_ok=True)
+        halves = ({"pid": gen["pid"]}, {"start": gen["start"]}, {"pid": gen["pid"], "start": None},
+                  {"pid": gen["pid"], "start": ""}, {"pid": 1}, {"pid": 0, "start": gen["start"]},
+                  {"pid": True, "start": gen["start"]}, {"pid": gen["pid"], "start": ["x"]}, {})
+        for i, half in enumerate(halves):
+            with self.subTest(half=half):
+                mark.write_text(json.dumps(dict(half, session_id=SESSION_ID)))
+                self.assertIsNone(inbox.tools_generation(self.root, gen), "pid and start time are both needed")
+                rc, out = self.claim("task-c%d" % i, "team", "collaborator: true\n")
+                self.assertEqual((rc, "admission" in out), (1, False), "kept outside the session: %s" % out)
+                self.assertIn("never submitted to this session", out["refused"])
+        self.assertEqual(len(isolated_runs(self.home)), len(halves))
+        rc, out = self.claim("task-o", "owner")
+        self.phase("task-o", lifecycle.TURN_CONFIRMED)
+        self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_UNREAD), "and no call goes through on it")
+        # A live generation whose own start time is not known cannot be matched either.
+        self.with_tools()
+        self.assertIs(inbox.tools_generation(self.root, gen), True)
+        for unknown in ({"pid": gen["pid"]}, {"pid": gen["pid"], "start": None}, {"start": gen["start"]}):
+            self.assertIsNone(inbox.tools_generation(self.root, unknown), unknown)
+        # And hold never writes half a mark: a start time it cannot read is a mark it could not write.
+        self.assertFalse(hold_mod.mark_tools_generation(self.root, gen["pid"], SESSION_ID, start_time=lambda pid: None))
 
     def test_hold_marks_only_a_session_it_started_with_the_tools(self):
         gen = inbox._generation(self.root)

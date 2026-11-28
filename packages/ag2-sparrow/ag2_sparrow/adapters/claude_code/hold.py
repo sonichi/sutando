@@ -322,6 +322,8 @@ def mark_tools_generation(root, pid=None, session_id="", start_time=None) -> boo
             path.unlink(missing_ok=True)
             return True
         start = (start_time or task_io.start_time)(pid)
+        if start in (None, ""):     # half a mark is read as unknown: say it could not be written
+            return False
         cm._write(path, json.dumps({"pid": pid, "start": start, "session_id": session_id}) + "\n", 0o600)
         return True
     except OSError:
@@ -429,9 +431,8 @@ def _held(root, cfg, session_id, nonce, env, popen, state) -> int:
         plain = claude_argv(cfg, session_id)
         tools = room_tools_argv(cfg, root, os.path.join(root, "tasks"), session_id=session_id)
         child, pipe["go_w"] = spawn_shim(plain + tools, child_env(env, inode), popen)
-        # The gated child has not run yet. A session on the tools' conversation is marked owner-only before
-        # its go byte, with or without the tools now (it holds their results); one that cannot be marked is
-        # not started. Any other start clears an older mark.
+        # Before the gated child's go byte: a session on the tools' conversation is marked owner-only, tools on
+        # or not, and is not started when it cannot be marked. Any other start clears an older mark.
         if tools_conversation(cfg, session_id):
             if not mark_tools_generation(root, child.pid, session_id):
                 reap(child, pipe["go_w"])

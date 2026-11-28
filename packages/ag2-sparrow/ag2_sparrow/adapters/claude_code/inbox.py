@@ -135,8 +135,8 @@ TOOLS_MARK = ("state", "room-tools", "session.json")    # hold.mark_tools_genera
 
 def tools_generation(root, generation) -> "bool | None":
     """Whether the live session process `generation` ({pid, start}) was started with the AG2 Space tools: True
-    when hold's mark names exactly it, False when there is no mark or it names another process (an earlier
-    start), None when the mark is there but cannot be read. Read from the running generation, never from the
+    when hold's mark names exactly it (pid and start time), False when there is no mark or a whole one names
+    another process (an earlier start), None when the mark is there but cannot be read or is incomplete. Read from the running generation, never from the
     install config, which can change or be unreadable while the session runs on."""
     path = os.path.join(root, *TOOLS_MARK)
     try:
@@ -146,9 +146,14 @@ def tools_generation(root, generation) -> "bool | None":
         return False
     except (OSError, ValueError):
         return None
-    if not isinstance(mark, dict) or not isinstance(mark.get("pid"), int):
+    # Both halves name a process: a mark missing its pid or its start time, or a live generation whose start is
+    # not known, proves nothing either way. That is unknown, never a verified record of an earlier start.
+    pid, start = (mark.get("pid"), mark.get("start")) if isinstance(mark, dict) else (None, None)
+    whole = isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and start not in (None, "") \
+        and isinstance(start, (str, int, float)) and not isinstance(start, bool)
+    if not whole or not generation.get("pid") or generation.get("start") in (None, ""):
         return None
-    return (mark["pid"], mark.get("start")) == (generation.get("pid"), generation.get("start"))
+    return (pid, start) == (generation["pid"], generation["start"])
 
 
 def allow_non_owner(environ=None) -> bool:
