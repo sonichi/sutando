@@ -10,6 +10,9 @@ same with no rate-limit window; `[[limit-words]]` fails it on another error whos
 `[[noaccess]]` fails a turn that names no model as one the account cannot run; `[[fail]]` fails it on another error. A refused turn ends with no item, unless `[[worked]]` is there too: then a
 reasoning item and part of a reply come first.
 
+`thread/resume` fails for a thread id starting `stale-`, never answers for `hang-`, and fails for `nomcp-` only
+when its config adds `mcp_servers` (a runtime refusing that override at resume).
+
 `account/rateLimits/read` answers as `stub-limits` under CODEX_HOME says ("out": a window used up; "ok": usage
 left); with no such file the method is unknown.
 
@@ -161,6 +164,9 @@ for line in sys.stdin:
             home_file("auth.json", " ")      # the login switched while the turn was being made ready
         if meth == "thread/resume" and tid.startswith("stale-"):
             send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32603, "message": "no rollout found for thread id " + tid}})
+            continue
+        if meth == "thread/resume" and tid.startswith("nomcp-") and (p.get("config") or {}).get("mcp_servers"):
+            send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": "invalid config: mcp_servers"}})
             continue
         if meth == "thread/resume" and tid.startswith("hang-"):
             continue   # never answers: the client's timeout must fall back

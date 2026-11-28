@@ -30,7 +30,7 @@ isolate_os_environ()
 PKG_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG_ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from ag2_sparrow import mcp_auth, mcp_stdio, task_io  # noqa: E402
+from ag2_sparrow import mcp_auth, mcp_name_shim as shim, mcp_stdio, task_io  # noqa: E402
 from ag2_sparrow.adapters.codex import codex_connector as cc  # noqa: E402
 
 from test_codex_connector import FakeRpc, gateway_mid_task, result, run_connector, write_task, write_text  # noqa: E402
@@ -60,10 +60,12 @@ class World:
         self.desc = {"version": 1, "lane": "primary", "env_file": self.token_file, "env_key": "REMOTE_TASK_TOKEN",
                      "mint_url": "https://relay.s.space/api/v1/mcp/agent-access-tokens",
                      "mcp_url": "https://mcp.s.space/mcp", "relay": "https://relay.s.space"}
-        self.runs, self.prompts = [], []
+        self.runs, self.prompts, self.grants = [], [], []
 
     def run_turn(self, conn, prompt, *a, **kw):
         self.prompts.append(prompt)
+        path = os.path.join(conn.args.state, mcp_stdio.GRANT_NAME)
+        self.grants.append(json.loads(Path(path).read_text()) if os.path.exists(path) else None)
         return REAL_RUN_TURN(conn, prompt, *a, **kw)
 
     def exchange(self, argv, **kw):
@@ -84,12 +86,16 @@ class World:
     def state(self):
         return os.path.abspath(str(self.work / "state"))
 
-    def expected_server(self):
-        state = self.state()
-        return {"command": os.path.join(state, mcp_stdio.SHIM_NAME), "args": ["/app/node", "/app/ag2-mcp-proxy.mjs"],
-                "env": {"AG2_MCP_DESCRIPTOR": os.path.join(state, mcp_stdio.DESCRIPTOR_NAME),
-                        "AG2_MCP_LOG": os.path.join(state, mcp_stdio.PROXY_LOG_NAME)},
-                "startup_timeout_sec": cc.ROOM_TOOLS_STARTUP_S}
+    def expected_server(self, cfg):
+        """The ag2-space entry, with the launch id `cfg` carries (a fresh one per thread opened)."""
+        state, launch = self.state(), mcp_stdio.launch_of(cfg)
+        self.assertRegex(launch, r"^[0-9a-f]{32}$")
+        return {"mcp_servers": {"ag2-space": {
+            "command": os.path.join(state, mcp_stdio.SHIM_NAME), "args": ["/app/node", "/app/ag2-mcp-proxy.mjs"],
+            "env": {"AG2_MCP_DESCRIPTOR": os.path.join(state, mcp_stdio.DESCRIPTOR_NAME),
+                    "AG2_MCP_LOG": os.path.join(state, mcp_stdio.PROXY_LOG_NAME),
+                    shim.GRANT_ENV: os.path.join(state, mcp_stdio.GRANT_NAME), shim.LAUNCH_ENV: launch},
+            "startup_timeout_sec": cc.ROOM_TOOLS_STARTUP_S}}}
 
     def assert_no_secret(self, *texts):
         for text in texts:
@@ -103,7 +109,7 @@ class RoomToolsTest(World, unittest.TestCase):
         err = self.serve(1)
         text = result(self.work, "task-chat-o")
         cfg = config_of(text)
-        self.assertEqual(cfg, {"mcp_servers": {"ag2-space": self.expected_server()}})
+        self.assertEqual(cfg, self.expected_server(cfg))
         launcher = Path(self.state()) / mcp_stdio.SHIM_NAME
         self.assertEqual(os.stat(launcher).st_mode & 0o777, 0o700)
         body = launcher.read_text()
@@ -128,7 +134,8 @@ class RoomToolsTest(World, unittest.TestCase):
         write_task(self.work, "task-chat-t", "[[config]] plain team", tier="team", channel="!t:s.space", mtime=now - 20)
         write_task(self.work, "task-chat-g", "[[config]] guest", tier="guest", channel="!g:s.space", mtime=now - 10)
         self.serve(3)
-        self.assertEqual(config_of(result(self.work, tid)), {"mcp_servers": {"ag2-space": self.expected_server()}})
+        cfg = config_of(result(self.work, tid))
+        self.assertEqual(cfg, self.expected_server(cfg))
         for t in ("task-chat-t", "task-chat-g"):
             cfg = config_of(result(self.work, t))
             self.assertEqual(cfg["mcp_servers"], {"owner-mcp": {"enabled": False}}, t)
@@ -151,11 +158,65 @@ class RoomToolsTest(World, unittest.TestCase):
         thread = (self.work / "state" / "threads" / cc.channel_key("local-chat")).read_text().split()[0]
         write_task(self.work, "task-chat-2", "[[config]] two")
         self.serve(1)
-        self.assertEqual(config_of(result(self.work, "task-chat-2")),
-                         {"mcp_servers": {"ag2-space": self.expected_server()}})
+        cfg = config_of(result(self.work, "task-chat-2"))
+        self.assertEqual(cfg, self.expected_server(cfg))
         saved = self.work / "state" / "threads" / cc.channel_key("local-chat")
         self.assertEqual(saved.read_text().split()[0], thread)
         self.assertEqual(len(self.runs), 2, "one exchange per thread opened on a server, none per turn on a live one")
+
+    def save_thread(self, thread):
+        threads = self.work / "state" / "threads"
+        threads.mkdir(parents=True, exist_ok=True)
+        (threads / cc.channel_key("local-chat")).write_text("%s\nlocal-chat\n%s\n" % (thread, cc.SHARED))
+
+    def test_a_resume_refused_with_the_tools_keeps_the_same_conversation_without_them(self):
+        self.save_thread("nomcp-0001")      # the stub refuses this resume only when the config adds mcp_servers
+        write_task(self.work, "task-chat-1", "[[config]] owner")
+        err = self.serve(1)
+        self.assertTrue(result(self.work, "task-chat-1").rstrip().endswith(" config=null"), "runs without the tools")
+        saved = (self.work / "state" / "threads" / cc.channel_key("local-chat")).read_text().split()[0]
+        self.assertEqual(saved, "nomcp-0001", "the same conversation is kept, never replaced")
+        self.assertIn("resuming the same thread without them", err)
+        self.assertNotIn("starting a new thread", err)
+        self.assertEqual(self.grants, [None], "a thread without the tools gets no grant")
+
+    def test_a_resume_refused_with_and_without_the_tools_falls_back_to_a_new_thread(self):
+        self.save_thread("stale-0001")
+        write_task(self.work, "task-chat-1", "[[config]] owner")
+        err = self.serve(1)
+        cfg = config_of(result(self.work, "task-chat-1"))
+        self.assertEqual(cfg, self.expected_server(cfg), "the new thread gets the tools")
+        saved = (self.work / "state" / "threads" / cc.channel_key("local-chat")).read_text().split()[0]
+        self.assertNotEqual(saved, "stale-0001")
+        self.assertIn("resuming the same thread without them", err)
+        self.assertIn("thread/resume failed, starting a new thread", err)
+
+    def test_each_turn_runs_under_its_own_grant_naming_its_threads_launch_retired_when_it_ends(self):
+        tid = "task-1792100000009"
+        now = time.time()
+        write_task(self.work, "task-chat-o", "[[config]] owner", mtime=now - 30)
+        write_text(self.work, tid, gateway_mid_task(tid, "[[config]] collab", tier="team", collaborator=True),
+                   mtime=now - 20)
+        write_task(self.work, "task-chat-g", "[[config]] guest", tier="guest", channel="!g:s.space", mtime=now - 10)
+        self.serve(3, "--allow-non-owner")
+        owner, collab, guest = self.grants
+        launch = mcp_stdio.launch_of(config_of(result(self.work, "task-chat-o")))
+        self.assertEqual((owner["launch"], owner["tier"], set(owner["tools"])), (launch, "owner", mcp_auth.OWNER_TOOLS))
+        self.assertEqual((collab["launch"], collab["tier"]),
+                         (mcp_stdio.launch_of(config_of(result(self.work, tid))), "collaborator"))
+        self.assertNotEqual(owner["turn"], collab["turn"], "a grant per turn")
+        self.assertGreater(owner["expires"], now)
+        self.assertIsNone(guest, "a restricted turn runs with no grant")
+        grant = Path(self.state()) / mcp_stdio.GRANT_NAME
+        self.assertFalse(grant.exists(), "no grant outlives its turn")
+
+    def test_a_grant_left_by_a_run_that_died_is_retired_at_start(self):
+        Path(self.state()).mkdir(parents=True)
+        mcp_stdio.write_grant(self.state(), "old-launch", "owner", mcp_auth.OWNER_TOOLS, 3600)
+        write_task(self.work, "task-chat-g", "[[config]] guest", tier="guest")
+        self.serve(1, "--allow-non-owner")
+        self.assertEqual(self.grants, [None])
+        self.assertFalse((Path(self.state()) / mcp_stdio.GRANT_NAME).exists())
 
     def test_without_the_proxy_command_or_the_token_file_an_owner_thread_gets_nothing(self):
         write_task(self.work, "task-chat-1", "[[config]] no proxy")
@@ -220,11 +281,28 @@ class RoomToolsUnitTest(World, unittest.TestCase):
         self.assertEqual(c.room_tools(restricted, "/w"), {})
         with contextlib.redirect_stderr(io.StringIO()):
             got = c.room_tools(owner, "/w")
+        launch = mcp_stdio.launch_of(got)
         self.assertEqual(got, {"mcp_servers": {"ag2-space": {"command": "/s/shim", "args": ["/app/node"],
-                                                             "env": {"AG2_MCP_DESCRIPTOR": "/s/d.json"},
+                                                             "env": dict(mcp_stdio.grant_env(c.args.state, launch),
+                                                                         AG2_MCP_DESCRIPTOR="/s/d.json"),
                                                              "startup_timeout_sec": cc.ROOM_TOOLS_STARTUP_S}}})
         [(_a, kw)] = self.runs
         self.assertEqual(kw["tools"], mcp_auth.OWNER_TOOLS)
+
+    def test_a_resume_whose_server_died_is_not_retried_and_a_turn_without_a_state_dir_writes_no_grant(self):
+        tools = {"mcp_servers": {"ag2-space": {"env": {shim.LAUNCH_ENV: "l1"}}}}
+        c, calls = self.connector({"thread/resume": RuntimeError("thread/resume: server pipe closed (x)")})
+        with self.assertRaises(RuntimeError), contextlib.redirect_stderr(io.StringIO()):
+            c.resume_thread(task_io.OWNER_CAPABILITIES, "th-1", tools)
+        self.assertEqual([m for m, _ in calls], ["thread/resume"], "a dead server is not asked again")
+        c.thread_id = "th-1"
+        c.bind_launch(tools)
+        self.assertTrue(c.grant_room_tools(task_io.OWNER_CAPABILITIES, "owner"))
+        restricted = task_io.turn_policy({"access_tier": "guest"}, True).capabilities
+        self.assertFalse(c.grant_room_tools(restricted, "guest"))
+        self.assertFalse((Path(c.args.state) / mcp_stdio.GRANT_NAME).exists(), "a turn without integrations retires it")
+        c.args.state = None
+        self.assertFalse(c.grant_room_tools(task_io.OWNER_CAPABILITIES, "owner"))
 
     def test_a_thread_start_refused_with_the_tools_starts_without_them(self):
         def start(params):
@@ -241,6 +319,50 @@ class RoomToolsUnitTest(World, unittest.TestCase):
                                "thread/start": RuntimeError("thread/start: server pipe closed")})
         with self.assertRaises(RuntimeError), contextlib.redirect_stderr(io.StringIO()):
             c.start_thread(task_io.OWNER_CAPABILITIES, False)
+
+
+class ShimTurnGrantTest(World, unittest.TestCase):
+    """The shim codex-local runs (grant_env set): a call is forwarded only under a live grant for its launch."""
+
+    def test_a_call_with_no_live_grant_for_this_launch_is_refused_and_never_forwarded(self):
+        from test_mcp_name_shim import Session
+        state = self.tmp.name
+        env = dict(mcp_stdio.grant_env(state, "launch-a"), **{shim.TOOLS_ENV: ",".join(sorted(mcp_auth.OWNER_TOOLS))})
+        sess = Session(grant=env)
+        self.addCleanup(lambda: sess.p.poll() is None and sess.close())
+        listed = sess.ask({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})["result"]["tools"]
+        self.assertIn("room_action_execute", [t["name"] for t in listed], "listed for the thread's life")
+        n = iter(range(2, 100))
+
+        def call():
+            return sess.ask({"jsonrpc": "2.0", "id": next(n), "method": "tools/call",
+                             "params": {"name": "room_action_execute"}})
+        tools = mcp_auth.OWNER_TOOLS
+        refused = {"idle, no grant written": lambda: None,
+                   "another thread's launch": lambda: mcp_stdio.write_grant(state, "launch-b", "owner", tools, 60),
+                   "expired": lambda: mcp_stdio.write_grant(state, "launch-a", "owner", tools, -1),
+                   "tool not in the grant": lambda: mcp_stdio.write_grant(state, "launch-a", "owner", {"room.list"}, 60),
+                   "malformed": lambda: Path(state, mcp_stdio.GRANT_NAME).write_text("{not json"),
+                   "retired after the turn": lambda: (mcp_stdio.write_grant(state, "launch-a", "owner", tools, 60),
+                                                      mcp_stdio.retire_grant(state))}
+        for why, setup in refused.items():
+            setup()
+            answer = call()
+            self.assertEqual(answer.get("error", {}).get("code"), shim.NOT_GRANTED, why)
+            self.assertIn("no live turn grant", answer["error"]["message"], why)
+        mcp_stdio.write_grant(state, "launch-a", "owner", tools, 60)
+        self.assertEqual(call()["result"]["content"][0]["text"], "room.action.execute", "live grant: forwarded")
+        mcp_stdio.retire_grant(state)
+        self.assertIn("error", call(), "refused again once the turn's grant is retired")
+        self.assertEqual(sess.close(), 0)
+        self.assertEqual([m for m, _ in sess.got].count("tools/call"), 1, "only the call under the live grant")
+
+    def test_grant_env_set_but_empty_allows_nothing_and_unset_keeps_the_per_launch_grant(self):
+        self.assertFalse(shim.grant_of({shim.GRANT_ENV: ""}).allows("room.list"))
+        self.assertIsNone(shim.grant_of({}))
+        self.assertTrue(shim.Names({"room.list"}).turn_ok("room.list"), "agy: its shim is per turn already")
+        self.assertEqual(mcp_stdio.launch_of({"mcp_servers": {"ag2-space": {"env": {shim.LAUNCH_ENV: 7}}}}), "")
+        self.assertEqual(mcp_stdio.launch_of(None), "")
 
 
 if __name__ == "__main__":

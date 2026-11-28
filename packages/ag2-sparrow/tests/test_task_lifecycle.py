@@ -2163,7 +2163,9 @@ class BoundaryGuardTest(SpyMixin, unittest.TestCase):
                          {"state", "results", "tasks", "results/<task>.txt",
                           "results/.<task>.txt.<tmp>", "state/done", "state/.done.<tmp>", "state/threads",
                           "state/threads/<key>", "state/threads/.<key>.<tmp>", "state/metrics.jsonl",
-                          "state/app-server-stub.stderr", "state/live-view.log"})
+                          "state/app-server-stub.stderr", "state/live-view.log",
+                          # The per-turn room-tools grant (mcp_stdio.GRANT_NAME), retired at start and each turn's end.
+                          "state/ag2-mcp-grant.json"})
 
     def strings(self, tree):
         doc = tree.body[0].value if tree.body and isinstance(tree.body[0], ast.Expr) else None
