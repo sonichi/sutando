@@ -222,6 +222,27 @@ command prints stands. The row does not change the presence status Sparrow
 reports. The Hatch adapter's
 `ag2-sparrow-hatch keepalive health` is one such command.
 
+## Task headers for any engine
+
+Each task file carries the broker's facts as plain `key: value` lines above `task:`. Any engine's
+parser can read them, and a line in the message body cannot claim them. Each line is written only
+when the broker sends a value.
+
+| Header | Value | Meaning |
+|---|---|---|
+| `mentions` | comma-separated mxids | Who the message @-mentions, not counting the sender |
+| `mentions_you` | `true` / `false` | Whether the message mentions this agent |
+| `replied_to` | mxid | Sender of the message this one replies to |
+| `replied_to_you` | `true` / `false` | Whether that sender is this agent |
+| `thread_starter` | mxid | Sender of the thread's root message (thread messages only) |
+| `you_in_thread` | `true` / `false` | Whether this agent has posted in that thread |
+| `addressed_via` | `owner` (the only value) | The agent was woken because its owner was mentioned or replied to, in a room that opted in. Absent otherwise |
+
+The room context (`reply_to_me`, `reply_to_sender`, `addressed_to`, `thread_root`,
+`source_room_id`, `room_members`, `room_member_count`, `channel_kind`) sits above `task:` too.
+The Sutando prose block that follows `access_tier` on owner tasks is off with
+`SPARROW_TASK_PRELUDE=none`.
+
 ## Acting in AG2 Space: the MCP server (`ag2-sparrow-mcp`)
 
 Sparrow carries messages. To do more in AG2 Space as the agent, such as Room Commons
@@ -891,6 +912,7 @@ task delivery — a channel failure never affects the task loop.
 | `SPARROW_HA_OWNER` | owner mxid; enables human-action decision routing — the owner's typed/reacted answers to pending question cards resolve them. HITL card clicks use it when set, else the owner the gateway registry (`/v1/agents`) names for this agent |
 | `SPARROW_HA_ROOM` | room id where question cards are posted (with `SPARROW_HA_OWNER`) |
 | `SPARROW_HA_A2UI` | `1` attaches interactive A2UI blocks to cards (default off; requires a client that renders them) |
+| `SPARROW_TASK_PRELUDE` | `sutando` (default) appends the Sutando `===SKILL INSTRUCTIONS===` block to owner tasks; `none` leaves it out, for an engine without Sutando's skills. Any other value keeps the default |
 
 ## Directories & single source
 

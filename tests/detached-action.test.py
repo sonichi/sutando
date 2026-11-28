@@ -13,6 +13,7 @@ Run: python3 tests/detached-action.test.py
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -22,7 +23,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from _helpers.hermetic_env import isolate_os_environ
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ
 
 isolate_os_environ()
 
@@ -113,6 +114,99 @@ class SurvivesItsCallersSession(unittest.TestCase):
                     if p.poll() is None:
                         os.killpg(p.pid, signal.SIGKILL)
                 subprocess.run(["pkill", "-f", str(launcher)], check=False)
+
+
+HANDOFF_CHILD = textwrap.dedent('''
+    import socket, sys
+    from pathlib import Path
+    src, directory, key, gate, marker, fd = sys.argv[1:]
+    sys.path.insert(0, src)
+    import detached_action as D
+    import recovery_gate
+    ws = Path(directory)
+    control = socket.socket(fileno=int(fd))
+    control.settimeout(10)
+
+    def wait(workspace, claim):
+        def boundary(delay):
+            assert recovery_gate.state(workspace, claim)["state"] == recovery_gate.ACCEPTED
+            assert D.status(workspace, key).state == D.RUNNING
+            control.sendall(b"W")
+            assert control.recv(1) == b"G"
+        return D.wait_for_handoff(workspace, claim, wait_s=10, sleep=boundary)
+
+    command = [sys.executable, "-c",
+               "import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); "
+               "import recovery_gate; Path(sys.argv[4]).write_text("
+               "recovery_gate.state(Path(sys.argv[2]), sys.argv[3])['state'])",
+               src, directory, gate, marker]
+    sys.exit(D._run(ws, key, command, after_gate=gate, wait=wait))
+''')
+
+
+class HandoffAdmission(unittest.TestCase):
+    def _run_after_handoff(self, outcome=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ws, home, cwd = (root / name for name in ("ws", "home", "cwd"))
+            for directory in (ws, home, cwd):
+                directory.mkdir()
+            key, gate = "fictional-action", "fictional-gate"
+            marker = root / "command-ran"
+            D.begin(ws, key)
+            self.assertTrue(recovery_gate.admit(ws, gate, time.time()).ok)
+            parent, child = socket.socketpair()
+            with parent, child:
+                parent.settimeout(10)
+                process = subprocess.Popen(
+                    [sys.executable, "-c", HANDOFF_CHILD, str(SRC), str(ws), key, gate,
+                     str(marker), str(child.fileno())],
+                    env=hermetic_env(home=home, PYTHONDONTWRITEBYTECODE="1"), cwd=cwd,
+                    pass_fds=(child.fileno(),), start_new_session=True,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                child.close()
+                try:
+                    # Readiness comes from inside the real wait, after it read an unfinished claim.
+                    self.assertEqual(parent.recv(1), b"W")
+                    self.assertIsNone(process.poll())
+                    self.assertEqual(D.status(ws, key).state, D.RUNNING)
+                    self.assertEqual(recovery_gate.state(ws, gate)["state"], recovery_gate.ACCEPTED)
+                    self.assertFalse(marker.exists())
+                    if outcome is not None:
+                        expected = (outcome, "reported during handoff", 23)
+                        self.assertTrue(D.report(ws, key, *expected))
+                        first_report = D._path(ws, key).read_bytes()
+                        self.assertEqual(D.status(ws, key), expected)
+                        self.assertEqual(recovery_gate.state(ws, gate)["state"], recovery_gate.ACCEPTED)
+                    recovery_gate.finish(ws, gate, "done")
+                    self.assertEqual(recovery_gate.state(ws, gate)["state"], recovery_gate.FINISHED)
+                    parent.sendall(b"G")
+                    output, _ = process.communicate(timeout=10)
+                    if outcome is None:
+                        self.assertEqual(process.returncode, 0, output)
+                        self.assertEqual(marker.read_text(), recovery_gate.FINISHED)
+                        self.assertEqual(D.status(ws, key), (D.DONE, None, 0))
+                    else:
+                        self.assertFalse(marker.exists(), "a terminal action launched its command: " + output)
+                        self.assertEqual(process.returncode, 1, output)
+                        self.assertEqual(D.status(ws, key), expected)
+                        self.assertEqual(D._path(ws, key).read_bytes(), first_report)
+                finally:
+                    if process.poll() is None:
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    process.communicate(timeout=5)
+
+    def test_a_running_action_executes_after_the_gate_finishes(self):
+        self._run_after_handoff()
+
+    def test_done_reported_during_the_wait_prevents_launch_and_is_preserved(self):
+        self._run_after_handoff(D.DONE)
+
+    def test_failed_reported_during_the_wait_prevents_launch_and_is_preserved(self):
+        self._run_after_handoff(D.FAILED)
 
 
 class Records(unittest.TestCase):

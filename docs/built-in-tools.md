@@ -428,6 +428,12 @@ so pool workers keep their own model): an app-server seat uses it from its next 
 its next start (exit 11). Exit 2 = name refused (a Claude name on a Codex core too); 3 = no live
 pane; 4 = runtime unresolved; 5 = input box busy; 6 = confirm dialog not confirmed; 8 = no acceptance
 seen; 11 = Codex TUI, saved for its next start.
+Run from a pool worker's session it targets that worker, never the core: the worker is switched only
+while its running session uses a Claude folder of its own, and the switch is recorded in
+`<workspace>/state/workers/<worker id>/model-switch.json`, never in the core's record. 15 = the
+worker's session runs in the core's Claude folder (or its folder could not be read): nothing was
+sent, the worker needs a folder of its own and a restart; 14 = whose session to switch could not be
+told, and the core was not switched in its place.
 The capability lives in `skills/model-switch/`.
 
 ## Which account the core is on

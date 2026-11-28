@@ -106,6 +106,32 @@ class Remote(Base):
 
 
 class Offer(Remote):
+    def test_with_only_the_account_in_use_saved_the_card_says_none_and_offers_none(self):
+        # Review of #6905: the words and the buttons come from one reading, taken after the account in use.
+        self.index(self.appdata, {ac.saved_key(SARAH): SARAH})
+        self.posted()
+        rc, out = self.tap("task-s1", "Switch account")
+        self.assertIn("(account-none-here)", out["refused"])
+        card = self.queued()[-1]["card"]
+        self.assertIn(ac.NONE_HERE, card["text"])
+        self.assertNotIn(ac.PICK, card["text"])
+        self.assertFalse([b for b in card["buttons"] if b["label"].startswith("Use ")])
+
+    def test_switch_account_from_the_phone_offers_the_saved_accounts_in_place(self):
+        # Owner 11-27 (claude-code-2 on her phone): "Switch account" only said to open the computer, though
+        # this Mac had other accounts saved for it. With accounts to offer, the card shows them in place.
+        self.posted()
+        rc, out = self.tap("task-s", "Switch account")
+        self.assertIn("(account-picks)", out["refused"])
+        queued, = self.queued()
+        self.assertEqual(queued.get("edit"), "$acct", "in place of the card tapped")
+        card = queued["card"]
+        self.assertEqual([b["label"] for b in card["buttons"]], ["Use " + A, "Use " + B, "Switch account"])
+        self.assertIn(ac.PICK, card["text"])
+        self.assertNotIn("Open this on the computer", card["text"])
+        self.assertNotIn(ac.account_switch.elsewhere(ac.NAME), card["text"])
+        self.assertFalse(self.request().exists(), "nothing is switched until an account is tapped")
+
     def test_the_card_offers_each_other_saved_account_by_address_sorted_and_not_the_one_in_use(self):
         card = self.posted()
         self.assertEqual([b["label"] for b in card["buttons"]], ["Use " + A, "Use " + B, "Switch account"])

@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# switch-model.sh <model> [--dry-run] [--confirm] [--offline] [--accept-timeout S] [--picker-dismiss-after S] [--state-dir DIR] [--brain DIR] [--session NAME] [--socket PATH] [--launcher PATH]
+# switch-model.sh <model> [--dry-run] [--confirm] [--offline] [--accept-timeout S] [--picker-dismiss-after S] [--state-dir DIR] [--brain DIR] [--session NAME] [--target core|worker] [--socket PATH] [--launcher PATH]
 # Claude core: sends /model through the shared sender and records only after the CLI accepts THAT model; settings.json is the CLI's to write.
 # Codex core: records the pick core-only (src/codex_core_model.py) for the seat's next turn or the TUI's next start; pool workers keep theirs.
+# A pool worker's session: switched only while it runs in a Claude folder of its own (worker_target.py), recorded under state/workers/<id>/.
 set -u
-MODEL=""; DRY=""; OFFLINE=""; STATE_DIR=""; BRAIN=""; DESCF=""; SESSION="${SUTANDO_TMUX_SESSION:-}"; SOCK="${SUTANDO_TMUX_SOCKET:-}"; CONFIRM=""; ACCEPT_TIMEOUT=20; DISMISS_AFTER=""; LAUNCHER=""; RELAUNCH=""
+MODEL=""; DRY=""; OFFLINE=""; STATE_DIR=""; BRAIN=""; DESCF=""; SESSION="${SUTANDO_TMUX_SESSION:-}"; SOCK="${SUTANDO_TMUX_SOCKET:-}"; CONFIRM=""; ACCEPT_TIMEOUT=20; DISMISS_AFTER=""; LAUNCHER=""; RELAUNCH=""; TARGET=""
+SESSION_SRC=descriptor; [ -n "$SESSION" ] && SESSION_SRC=env
 while [ $# -gt 0 ]; do case "$1" in
   --dry-run) DRY=1;; --offline) OFFLINE=1;; --state-dir) STATE_DIR="${2:?}"; shift;; --confirm) CONFIRM=1;; --accept-timeout) ACCEPT_TIMEOUT="${2:?}"; shift;;
   --picker-dismiss-after) DISMISS_AFTER="${2:?}"; shift;;
-  --session) SESSION="${2:?}"; shift;; --launcher) LAUNCHER="${2:?}"; shift;; --socket) SOCK="${2:?}"; shift;; --brain) BRAIN="${2:?}"; shift;; --descriptor-file) DESCF="${2:?}"; shift;;
+  --session) SESSION="${2:?}"; SESSION_SRC=flag; shift;; --target) TARGET="${2:?}"; shift;; --launcher) LAUNCHER="${2:?}"; shift;; --socket) SOCK="${2:?}"; shift;; --brain) BRAIN="${2:?}"; shift;; --descriptor-file) DESCF="${2:?}"; shift;;
   -*) echo "switch-model: unknown flag $1" >&2; exit 2;;
   *) [ -z "$MODEL" ] && MODEL="$1" || { echo "switch-model: one model, got '$1' too" >&2; exit 2; };;
 esac; shift; done
@@ -20,18 +22,6 @@ PY="$(bash "$REPO/scripts/sutando-config.sh" python-bin)"
 RUNTIME="$(bash "$REPO/scripts/sutando-config.sh" core-runtime 2>/dev/null)"; RRC=$?
 if [ $RRC -ne 0 ] || [ -z "$RUNTIME" ]; then echo "switch-model: refused — core runtime could not be resolved (rc=$RRC, value='$RUNTIME'); nothing changed" >&2; exit 4; fi
 case "$RUNTIME" in claude|codex) ;; *) echo "switch-model: refused — unrecognized core runtime '$RUNTIME'; nothing changed" >&2; exit 4;; esac
-if [ "$RUNTIME" = codex ]; then
-  # A Codex model slug, never a Claude alias or id: src/codex_core_model.py's rule.
-  if ! "$PY" "$REPO/src/codex_core_model.py" check "$MODEL"; then
-    echo "switch-model: refused '$MODEL' — not a Codex model name (the core runtime is codex)" >&2; exit 2
-  fi
-else
-  # The names /model may be given are src/claude_model_switch.py's, shared with ag2-sparrow's claude-local.
-  NAMES="$("$PY" "$REPO/src/claude_model_switch.py" model-pattern)" || { echo "switch-model: the model rules could not be read" >&2; exit 2; }
-  if ! printf '%s' "$MODEL" | grep -Eq -- "$NAMES"; then
-    echo "switch-model: refused '$MODEL' — not a model alias or claude-* id" >&2; exit 2
-  fi
-fi
 # Defaults come from the configured core's runtime descriptor (brain, socket,
 # session — runtime-authored, foreign-caller safe), never from ambient env.
 if [ -n "$DESCF" ]; then DESC="$(cat "$DESCF")"; else DESC="$(bash "$REPO/scripts/sutando-config.sh" runtime 2>/dev/null)"; fi
@@ -49,15 +39,64 @@ CFG="$BRAIN/settings.json"
 [ -n "$SESSION" ] || SESSION="${DSESSION:-sutando-core}"
 [ -n "$STATE_DIR" ] || STATE_DIR="$(bash "$REPO/scripts/sutando-config.sh" workspace)/state"
 [ -n "$LAUNCHER" ] || LAUNCHER="$REPO/src/agent/start-cli.sh"
+# Whose session this is: the core's, or one pool worker's. One that cannot be told is refused
+# (exit 14), never switched as the core.
+HERE="$REPO/skills/model-switch/scripts"; KIND=core; WORKER=""
+WHO="$("$PY" "$HERE/worker_target.py" resolve --session "$SESSION" --session-source "$SESSION_SRC" --target "$TARGET" --caller-worker "${SUTANDO_WORKER_ID:-}" 2>&1)"; WRC=$?
+case "$WRC:$WHO" in
+  0:core) ;;
+  0:worker\ ?*) KIND=worker; WORKER="${WHO#worker }";;
+  *) if [ -n "$DRY" ]; then echo "dry-run: session kind=unidentified (tmux -S $SOCK -t $SESSION); no record; would refuse (exit 14): ${WHO:-the target could not be checked}"; exit 0; fi
+     echo "switch-model: refused — ${WHO:-the target could not be checked}; nothing sent, nothing recorded" >&2; exit 14;;
+esac
+if [ "$RUNTIME" = codex ] && [ "$KIND" = core ]; then
+  # A Codex model slug, never a Claude alias or id: src/codex_core_model.py's rule.
+  if ! "$PY" "$REPO/src/codex_core_model.py" check "$MODEL"; then
+    echo "switch-model: refused '$MODEL' — not a Codex model name (the core runtime is codex)" >&2; exit 2
+  fi
+else
+  # The names /model may be given are src/claude_model_switch.py's, shared with ag2-sparrow's claude-local.
+  NAMES="$("$PY" "$REPO/src/claude_model_switch.py" model-pattern)" || { echo "switch-model: the model rules could not be read" >&2; exit 2; }
+  if ! printf '%s' "$MODEL" | grep -Eq -- "$NAMES"; then
+    echo "switch-model: refused '$MODEL' — not a model alias or claude-* id" >&2; exit 2
+  fi
+fi
+# A worker: the pane this send reaches, on this socket, must run in a Claude folder of its own.
+# In the core's (or one that cannot be read) it is refused (exit 15): nothing sent, nothing recorded.
+REC_DIR="$STATE_DIR"; EXPECT=(); PANE=(); CHECKED=""
+worker_check() { "$PY" "$HERE/worker_target.py" folder --core-folder "$BRAIN" --worker "$WORKER" --session "$SESSION" --socket "$SOCK" 2>&1; }
+# The same pane, process and folder as first checked; the core's switch has no such check.
+same_pane() { [ "$KIND" = core ] || [ "$(worker_check)" = "$CHECKED" ]; }
+pane_changed() { echo "switch-model: refused — worker $WORKER's pane or its Claude folder changed $1; nothing recorded" >&2; exit 15; }
+if [ "$KIND" = worker ]; then
+  REC_DIR="$STATE_DIR/workers/$WORKER"
+  if [ -n "$OFFLINE" ]; then echo "switch-model: refused — --offline writes the core's settings; worker $WORKER is switched while it runs. Nothing changed." >&2; exit 2; fi
+  CHECKED="$(worker_check)"; ORC=$?
+  { IFS= read -r OWN; IFS= read -r PANE_ID; IFS= read -r PANE_PID; } <<EOF_PANE
+$CHECKED
+EOF_PANE
+  case "$PANE_ID:$PANE_PID" in %*:*[!0-9]*|%*:|[!%]*|:*) ORC=1;; esac
+  if [ "$ORC" != 0 ] || [ ! -d "$OWN" ]; then
+    OWN="$CHECKED"
+    if [ -n "$DRY" ]; then echo "dry-run: session kind=worker ($WORKER, tmux -S $SOCK -t $SESSION); record $REC_DIR/model-switch.json; would refuse (exit 15): ${OWN:-its Claude folder could not be checked}"; exit 0; fi
+    echo "switch-model: refused — ${OWN:-its Claude folder could not be checked}; nothing sent, nothing recorded" >&2; exit 15
+  fi
+  CFG="$OWN/settings.json"; EXPECT=(--expected-pid "$PANE_PID"); PANE=(--pane "$PANE_ID" --expected-pid "$PANE_PID")
+  if [ -n "$DRY" ]; then
+    echo "dry-run: session kind=worker ($WORKER, tmux -S $SOCK -t $SESSION); would record $REC_DIR/model-switch.json (previous read from $CFG) and send '/model $MODEL'; would not refuse: the running session uses its own Claude folder; the core's record and default are untouched"; exit 0
+  fi
+fi
 if [ -n "$DRY" ] && [ "$RUNTIME" = codex ]; then
-  echo "dry-run: would record model=$MODEL for the Codex core in $STATE_DIR/model-switch.json (core-only; the shared Codex home and the pool workers are untouched), seat/TUI looked up as tmux -S $SOCK -t $SESSION"; exit 0
+  echo "dry-run: would record model=$MODEL for the Codex core in $STATE_DIR/model-switch.json (core-only; the shared Codex home and the pool workers are untouched), seat/TUI looked up as tmux -S $SOCK -t $SESSION"
+  echo "dry-run: session kind=core; record $STATE_DIR/model-switch.json; no worker check applies"; exit 0
 fi
 if [ -n "$DRY" ]; then
-  echo "dry-run: would record $STATE_DIR/model-switch.json (previous read from $CFG), send '/model $MODEL' to tmux -S $SOCK -t $SESSION (python: $PY)"; exit 0
+  echo "dry-run: would record $STATE_DIR/model-switch.json (previous read from $CFG), send '/model $MODEL' to tmux -S $SOCK -t $SESSION (python: $PY)"
+  echo "dry-run: session kind=core; record $STATE_DIR/model-switch.json; no worker check applies"; exit 0
 fi
 # One switch at a time per brain: the lock spans preflight, the settings/record
 # transaction and the live send, so two invocations cannot interleave.
-LOCK="$STATE_DIR/.model-switch.lock"; mkdir -p "$STATE_DIR" 2>/dev/null
+LOCK="$REC_DIR/.model-switch.lock"; mkdir -p "$REC_DIR" 2>/dev/null
 if ! { exec 9>"$LOCK"; } 2>/dev/null; then echo "switch-model: could not open the switch lock ($LOCK) — nothing changed" >&2; exit 1; fi
 "$PY" -c 'import fcntl; fcntl.flock(9, fcntl.LOCK_EX)' || { echo "switch-model: could not take the switch lock — nothing changed" >&2; exit 1; }
 # A Codex core: its pick is core-only, kept in the switch record (src/codex_core_model.py), never in
@@ -67,7 +106,7 @@ if ! { exec 9>"$LOCK"; } 2>/dev/null; then echo "switch-model: could not open th
 # - the Codex TUI: nothing typed into it; its launcher starts it with `-m` from the record, so it
 #   holds from the core's next start (exit 11: saved, the running core keeps its model until then);
 # - no core running: the same, from its next launch (exit 13: saved, pending the next core start).
-if [ "$RUNTIME" = "codex" ]; then
+if [ "$RUNTIME" = "codex" ] && [ "$KIND" = core ]; then
   # shellcheck source=../../../src/agent/core-window.sh
   . "$REPO/src/agent/core-window.sh"
   WHERE=down
@@ -93,7 +132,7 @@ fi
 # also matched the tmux server, whose argv keeps the command that created the session.
 TMUX_SOCKET="$SOCK"; . "$REPO/src/agent/claude/cli/session-launch.sh"
 # Held for a provider limit with no core to type into: the pick goes to settings and the core is started.
-if [ -z "$OFFLINE" ] && ! claude_named_process_running \
+if [ "$KIND" = core ] && [ -z "$OFFLINE" ] && ! claude_named_process_running \
    && "$PY" "$REPO/src/core_limit_hold.py" held --workspace "$(dirname "$STATE_DIR")" > /dev/null 2>&1; then
   OFFLINE=1; RELAUNCH=1
 fi
@@ -154,12 +193,12 @@ fi
 SENDER="$REPO/scripts/tmux-send-line.sh"
 LIVE=""
 if [ -x "$SENDER" ] || [ -f "$SENDER" ]; then
-  bash "$SENDER" "$SESSION" "/model $MODEL" --socket "$SOCK" --refuse-if-pending --dry-run > /dev/null 2> "$STATE_DIR/.send-preflight.err"; PRC=$?
+  bash "$SENDER" "$SESSION" "/model $MODEL" --socket "$SOCK" --refuse-if-pending --dry-run > /dev/null 2> "$REC_DIR/.send-preflight.err"; PRC=$?
   case $PRC in
     0) LIVE=1;;
     3) LIVE="";;
-    5) echo "switch-model: refused — $(cat "$STATE_DIR/.send-preflight.err"); nothing changed" >&2; exit 5;;
-    *) echo "switch-model: refused — $(cat "$STATE_DIR/.send-preflight.err"); nothing changed" >&2; exit 7;;
+    5) echo "switch-model: refused — $(cat "$REC_DIR/.send-preflight.err"); nothing changed" >&2; exit 5;;
+    *) echo "switch-model: refused — $(cat "$REC_DIR/.send-preflight.err"); nothing changed" >&2; exit 7;;
   esac
 else
   echo "switch-model: shared sender missing ($SENDER) — nothing changed" >&2; exit 7
@@ -168,7 +207,7 @@ OBS="$REPO/skills/model-switch/scripts/pane-observe.sh"
 if [ -z "$LIVE" ]; then echo "live: NOT sent — no tmux session '$SESSION' on $SOCK; nothing switched, nothing recorded" >&2; exit 3; fi
 # Snapshot `previous` BEFORE the send: the CLI persists the new model on
 # acceptance, so a read afterwards would return the model being switched to.
-PREVLINE="$("$PY" - "$CFG" "$STATE_DIR" <<'PYEOF'
+PREVLINE="$("$PY" - "$CFG" "$REC_DIR" <<'PYEOF'
 import json, os, sys
 cfg, state_dir = sys.argv[1], sys.argv[2]
 try: prev = json.load(open(cfg)).get("model")
@@ -181,56 +220,63 @@ print(f"{prev or ''}\t{src}")
 PYEOF
 )"; PREV="${PREVLINE%%	*}"; PREV_SRC="${PREVLINE#*	}"
 # Baseline the acceptance lines for THIS model already on screen, so a stale one cannot pass as new.
-BASE="$(bash "$OBS" "$SESSION" --socket "$SOCK" --model "$MODEL" --settings "$CFG" --count)"; BRC=$?
+BASE="$(bash "$OBS" "$SESSION" --socket "$SOCK" --model "$MODEL" --settings "$CFG" --count ${PANE[@]+"${PANE[@]}"})"; BRC=$?
+[ "$BRC" = 13 ] && pane_changed "before the send; nothing sent"
 case "$BRC:$BASE" in 0:[0-9]*) ;; *) echo "switch-model: could not read the core pane before sending (rc=$BRC, '$BASE'); nothing sent, nothing recorded" >&2; exit 7;; esac
+same_pane || pane_changed "before the send; nothing sent"
 # Attribute any picker this send leaves on screen to us, so the supervisor may Esc it later (CLI > env > manifest).
 [ -n "$DISMISS_AFTER" ] || DISMISS_AFTER="${MODEL_SWITCH_PICKER_DISMISS_AFTER_S:-$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["config"]["MODEL_SWITCH_PICKER_DISMISS_AFTER_S"])' "$REPO/skills/model-switch/manifest.json" 2>/dev/null)}"
 GATE="$REPO/src/self_opened_gate.py"
-"$PY" "$GATE" record --state-dir "$STATE_DIR" --session "$SESSION" --opener model-switch \
+"$PY" "$GATE" record --state-dir "$REC_DIR" --session "$SESSION" --opener model-switch \
   --dismiss-after "${DISMISS_AFTER:-0}" --claim-window "$((ACCEPT_TIMEOUT * 2 + 30))" || echo "switch-model: could not write the picker attribution; a picker left behind will wait for a human" >&2
-bash "$SENDER" "$SESSION" "/model $MODEL" --socket "$SOCK" --refuse-if-pending > /dev/null; SEND_RC=$?
+bash "$SENDER" "$SESSION" "/model $MODEL" --socket "$SOCK" --refuse-if-pending ${EXPECT[@]+"${EXPECT[@]}"} > /dev/null; SEND_RC=$?
 if [ "$SEND_RC" = 125 ]; then
-  "$PY" "$GATE" close --state-dir "$STATE_DIR" --session "$SESSION"
+  "$PY" "$GATE" close --state-dir "$REC_DIR" --session "$SESSION"
   echo "switch-model: send may have applied (rc=125); picker attribution retained, nothing recorded" >&2; exit 7
 elif [ "$SEND_RC" != 0 ]; then
-  "$PY" "$GATE" clear --state-dir "$STATE_DIR" --session "$SESSION"; echo "switch-model: send failed; nothing recorded" >&2; exit 7
+  "$PY" "$GATE" clear --state-dir "$REC_DIR" --session "$SESSION"; echo "switch-model: send failed; nothing recorded" >&2; exit 7
 fi
 CONFIRMED=false
-VERDICT="$(bash "$OBS" "$SESSION" --socket "$SOCK" --model "$MODEL" --settings "$CFG" --wait --baseline "$BASE" --timeout "$ACCEPT_TIMEOUT")"
+VERDICT="$(bash "$OBS" "$SESSION" --socket "$SOCK" --model "$MODEL" --settings "$CFG" --wait --baseline "$BASE" --timeout "$ACCEPT_TIMEOUT" ${PANE[@]+"${PANE[@]}"})"
 case "$VERDICT" in
-  ACCEPTED) "$PY" "$GATE" clear --state-dir "$STATE_DIR" --session "$SESSION";;
+  CHANGED) "$PY" "$GATE" close --state-dir "$REC_DIR" --session "$SESSION"; pane_changed "while waiting for acceptance";;
+  ACCEPTED) "$PY" "$GATE" clear --state-dir "$REC_DIR" --session "$SESSION";;
   DIALOG)
     if [ -n "$CONFIRM" ]; then
-      VERDICT="$(bash "$OBS" "$SESSION" --socket "$SOCK" --model "$MODEL" --settings "$CFG" --wait --baseline "$BASE" --timeout "$ACCEPT_TIMEOUT" --answer-enter)"; ANSWER_RC=$?
+      same_pane || { "$PY" "$GATE" close --state-dir "$REC_DIR" --session "$SESSION"; pane_changed "before the confirming Enter; not confirmed"; }
+      VERDICT="$(bash "$OBS" "$SESSION" --socket "$SOCK" --model "$MODEL" --settings "$CFG" --wait --baseline "$BASE" --timeout "$ACCEPT_TIMEOUT" --answer-enter ${PANE[@]+"${PANE[@]}"})"; ANSWER_RC=$?
       case "$ANSWER_RC" in
+        13) "$PY" "$GATE" close --state-dir "$REC_DIR" --session "$SESSION"; pane_changed "while waiting for acceptance";;
         0|11) CONFIRMED=true;;
-        125) "$PY" "$GATE" close --state-dir "$STATE_DIR" --session "$SESSION"
+        125) "$PY" "$GATE" close --state-dir "$REC_DIR" --session "$SESSION"
              echo "switch-model: the confirming Enter may have applied (rc=125); picker attribution retained, nothing recorded" >&2; exit 8;;
-        *) "$PY" "$GATE" close --state-dir "$STATE_DIR" --session "$SESSION"
+        *) "$PY" "$GATE" close --state-dir "$REC_DIR" --session "$SESSION"
            echo "switch-model: the confirming Enter was not sent (rc=$ANSWER_RC); picker attribution retained, nothing recorded" >&2; exit 8;;
       esac
-      [ "$VERDICT" = ACCEPTED ] || { "$PY" "$GATE" close --state-dir "$STATE_DIR" --session "$SESSION"; echo "switch-model: confirmed the dialog but no acceptance within ${ACCEPT_TIMEOUT}s; nothing recorded" >&2; exit 8; }
-      "$PY" "$GATE" clear --state-dir "$STATE_DIR" --session "$SESSION"
+      [ "$VERDICT" = ACCEPTED ] || { "$PY" "$GATE" close --state-dir "$REC_DIR" --session "$SESSION"; echo "switch-model: confirmed the dialog but no acceptance within ${ACCEPT_TIMEOUT}s; nothing recorded" >&2; exit 8; }
+      "$PY" "$GATE" clear --state-dir "$REC_DIR" --session "$SESSION"
     else
-      bash "$OBS" "$SESSION" --socket "$SOCK" --cancel > /dev/null; CANCEL_RC=$?
+      bash "$OBS" "$SESSION" --socket "$SOCK" --cancel ${PANE[@]+"${PANE[@]}"} > /dev/null; CANCEL_RC=$?
       if [ "$CANCEL_RC" != 0 ]; then
-        "$PY" "$GATE" close --state-dir "$STATE_DIR" --session "$SESSION"
+        "$PY" "$GATE" close --state-dir "$REC_DIR" --session "$SESSION"
         echo "switch-model: dialog cancel failed (rc=$CANCEL_RC); picker attribution retained, nothing recorded" >&2
         exit 8
       fi
-      "$PY" "$GATE" clear --state-dir "$STATE_DIR" --session "$SESSION"
+      "$PY" "$GATE" clear --state-dir "$REC_DIR" --session "$SESSION"
       echo "switch-model: the core asked to confirm the switch (warm conversation cache); not confirmed — pass --confirm on an owner instruction. Dialog cancelled, nothing recorded" >&2; exit 6
     fi;;
-  *) "$PY" "$GATE" close --state-dir "$STATE_DIR" --session "$SESSION"
+  *) "$PY" "$GATE" close --state-dir "$REC_DIR" --session "$SESSION"
      echo "switch-model: sent '/model $MODEL' but saw no acceptance OF THAT MODEL within ${ACCEPT_TIMEOUT}s; nothing recorded. A picker it left on screen is dismissed after ${DISMISS_AFTER:-0}s unless someone answers it (0 = never)" >&2; exit 8;;
 esac
+same_pane || pane_changed "after the send, so the session that took it is gone"
 # Record only now, with the previous model snapshotted before the send.
-OUT="$("$PY" - "$CFG" "$MODEL" "$STATE_DIR" "$CONFIRMED" "$PREV" "$PREV_SRC" <<'PYEOF'
+OUT="$("$PY" - "$CFG" "$MODEL" "$REC_DIR" "$CONFIRMED" "$PREV" "$PREV_SRC" "$WORKER" <<'PYEOF'
 import json, os, sys, time, tempfile
-cfg, model, state_dir, confirmed, prev, src = sys.argv[1:7]
+cfg, model, state_dir, confirmed, prev, src, worker = sys.argv[1:8]
 rec = {"model": model, "previous": prev or None, "previous_source": src, "accepted": True, "confirmed": confirmed == "true",
        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
        "by": "skills/model-switch/scripts/switch-model.sh", "settings_read": cfg}
+if worker: rec["worker"] = worker
 try:
     os.makedirs(state_dir, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=state_dir, prefix=".model-switch.staged.")
@@ -242,9 +288,17 @@ print(f"OK {prev if prev else '-'}")
 PYEOF
 )"; RC=$?
 case "$OUT" in
-  RECORD-FAILED*) echo "switch-model: switched, but could not write the record ($STATE_DIR): ${OUT#RECORD-FAILED }" >&2; exit 1;;
+  RECORD-FAILED*) echo "switch-model: switched, but could not write the record ($REC_DIR): ${OUT#RECORD-FAILED }" >&2; exit 1;;
   OK*) ;;
   *) echo "switch-model: unexpected python outcome (rc=$RC): $OUT" >&2; exit 1;;
 esac
+if [ "$KIND" = worker ]; then
+  # The pick the worker's launch passes as --model follows the switch, or its next start would undo it.
+  PICK="$MODEL"; [ "$MODEL" = default ] && PICK=""
+  "$PY" "$REPO/skills/worker-pool/scripts/worker_model.py" set "$(dirname "$STATE_DIR")" "$WORKER" "$PICK" > /dev/null \
+    || echo "switch-model: worker $WORKER switched, but its launch pick could not be updated; its next start may use the earlier pick" >&2
+  echo "switched: worker $WORKER model=$MODEL (was ${OUT#OK }); accepted by the CLI$([ "$CONFIRMED" = true ] && echo ' after confirming its dialog') and saved in its own Claude folder; record: $REC_DIR/model-switch.json (the core's record and default are untouched)"
+  exit 0
+fi
 echo "switched: model=$MODEL (was ${OUT#OK }); accepted by the CLI$([ "$CONFIRMED" = true ] && echo ' after confirming its dialog'); record: $STATE_DIR/model-switch.json"
 exit 0
