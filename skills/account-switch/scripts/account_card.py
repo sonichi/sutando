@@ -21,14 +21,18 @@ Saved accounts are the desktop's store for the Sutando core on Codex
 (`<app support>/accounts/codex/<key>.json`, {label, auth}, folder 0700, files 0600; desktop
 ag2space-cinny-desktop#1264). The key is 16 hex of the SHA-256 of "<Codex account id>|<email>", so a
 key on a button names no account. `post` first saves the signed-in account there, as the desktop does, so a
-later sign-in never loses it. Each other saved account gets a "Use" button. A Claude core has no
-saved accounts (its sign-in is in the Keychain), so its card offers only "Add another account".
+later sign-in never loses it. The card's choices are two rows any client draws (a phone, a browser, the
+desktop): "Account", a menu of the account in use (marked), each other saved account ("Use" it) and
+"Add account…"; and "Runs on", Claude Code or Codex, whose pick is the core runtime card's own command
+(card:runtime:core:<rt>), which `reply` hands to skills/runtime-switch/scripts/runtime_card.py. A Claude
+core's saved sign-ins are the desktop's Keychain copies, which only the desktop switches, so its menu
+offers only "Add account…".
 
 "Add another account" never signs in from chat: it points the owner to Settings → Connections →
 the Sutando core's row → "Switch account", where the sign-in terminal takes the code in the app's
 own box. A sign-in code or token never goes in a message, a card or a log.
 
-A "Use" tap answers "switching" at once and starts `switch` detached, because the core restarts.
+A "Use" pick answers "switching" at once and starts `switch` detached, because the core restarts.
 It comes from any client the owner uses (the desktop app, the web, a phone): it carries only the
 choice, and the saved sign-in it names never leaves this computer. A tap message acts once (a resent
 one is answered, never switched again), and each tap's outcome is one line in the owner-action audit
@@ -95,7 +99,15 @@ RUNNING_STALE_S = RESTART_TIMEOUT_S + READY_TIMEOUT_S + 600
 # graceful-restart.sh exits 3/4/5 before it stops the core; any other failure may have restarted it.
 NOT_RESTARTED = (3, 4, 5)
 SETTLE_TRIES, SETTLE_PAUSE_S = 4, 15
-USE_BUTTONS = ac.LIMITS["buttons"] - 1          # one place is "Add another account"
+# The card's choices are two row menus of `reply` items, so a phone or a browser gets them too (listed()).
+MENU_ITEMS = ac.LIMITS["menu_items"]
+ADD_ITEM, ADD_WORDS = "Add account…", "Add another account"
+CURRENT_TAG = " (current)"
+ACCOUNT_ROW, RUNTIME_ROW, MENU_LABEL = "Account", "Runs on", "Change"
+# The core runtime card's own commands and words (skills/runtime-switch/scripts/runtime_card.py), so a pick
+# in the "Runs on" row is that card's tap: `reply` hands it to that card's handler.
+RUNTIME_KIND, RUNTIMES = "runtime", (("claude", "Claude Code"), ("codex", "Codex"))
+RUNTIME_SCRIPT = _REPO / "skills" / "runtime-switch" / "scripts" / "runtime_card.py"
 SETTINGS = ("Settings → Connections → the Sutando (on this computer) row → \"Switch account\". "
             "A sign-in opens there; paste the code only into that box in the app, never in this chat.")
 NO_CODE = "Never send me a sign-in code or token here."
@@ -435,30 +447,77 @@ def in_use_words(cur: dict) -> str:
 
 # ── the card ──────────────────────────────────────────────────────────────────────────────────────
 
+def _fit(name: str, tag: str, suffix: str = "") -> str:
+    """`name` + `suffix` within a label's limit; `tag` (the " #N" at the end of `name`) kept whole."""
+    room = ac.LIMITS["label"] - len(tag) - len(suffix)
+    return name[: len(name) - len(tag)][:room] + tag + suffix
+
+
+def listed(cur: dict, others: list, signed_out: bool = False) -> tuple:
+    """(the account in use is an item, the other saved accounts that are items, how many are left out).
+    The menu holds MENU_ITEMS: "Add account…", the account in use when its saved key is known and its
+    login was not refused, then the others by label as many as fit."""
+    in_use = bool(cur["runtime"] == "codex" and cur.get("key") and not signed_out)
+    room = MENU_ITEMS - 1 - int(in_use)
+    return in_use, others[:room], max(len(others) - room, 0)
+
+
+def account_items(cur: dict, others: list, names: dict, signed_out: bool = False) -> list:
+    """The "Account" menu: the account in use (marked, not tappable: a tap would change nothing), each
+    other saved account (a tap is the "Use" command `reply` acts on), then "Add account…"."""
+    in_use, shown, _ = listed(cur, others, signed_out)
+    items = []
+    entries = ([{"key": cur["key"], "label": cur["shown"]}] if in_use else []) + shown
+    for i, s in enumerate(entries):
+        name = names.get(s["key"]) or masked_label(s["label"])
+        tag = name[len(masked_label(s["label"])):]   # the " #N" kept whole when the label is cut
+        mine = in_use and i == 0
+        items.append(ac.button(_fit(name, tag, CURRENT_TAG if mine else ""), "reply",
+                               reply=("Use " + name)[: ac.LIMITS["reply"]],
+                               command=ac.reply(KIND, TARGET, s["key"]), **({"disabled": True} if mine else {})))
+    items.append(ac.button(ADD_ITEM, "reply", reply=ADD_WORDS, command=ac.reply(KIND, TARGET, ADD)))
+    return items
+
+
+def runtime_items(rt: str) -> list:
+    """The "Runs on" menu: the core runtime card's own choices, the one in use marked and not tappable."""
+    return [ac.button(name + (CURRENT_TAG if key == rt else ""), "reply", reply=f"Switch the core to {name}",
+                      command=ac.reply(RUNTIME_KIND, TARGET, key), **({"disabled": True} if key == rt else {}))
+            for key, name in RUNTIMES]
+
+
+def choice_rows(cur: dict, others: list, names: dict, signed_out: bool = False) -> list:
+    """The card's one group: the "Account" row (the account in use as its value) and the "Runs on" row."""
+    who = "Not signed in" if signed_out or cur["signed_in"] is False else (cur["shown"] or "Unknown")
+    on = dict(RUNTIMES)[cur["runtime"]]
+    return [{"rows": [
+        ac.row(ACCOUNT_ROW, subtitle=who, actions=[ac.button(MENU_LABEL, "menu",
+                                                             items=account_items(cur, others, names, signed_out))]),
+        ac.row(RUNTIME_ROW, subtitle=on, actions=[ac.button(MENU_LABEL, "menu", items=runtime_items(cur["runtime"]))]),
+    ]}]
+
+
 def menu_card(cur: dict, others: list, signed_out: bool = False, lead: str = "", retry: bool = False,
               names: Optional[dict] = None) -> tuple:
-    """(body, card): a "Use" button per other saved account (up to five), then "Add another account".
+    """(body, card): the "Account" and "Runs on" rows (choice_rows), each a menu any client draws.
     `lead`, when given, opens the card's words and its fallback line. `signed_out`: the core's login was
     refused, so the card drops the account in use and, with no `lead`, opens with SIGNED_OUT. `retry`
     (the quota card) adds a Retry button whose words are the owner's own "retry now", which the Claude
-    core's limit hold acts on; a Codex core has no such hold, so its card carries none."""
-    buttons = []
+    core's limit hold acts on; a Codex core has no such hold, so its card carries none. The choices are
+    not repeated as buttons: every client that draws this card draws its rows."""
     names = names if names is not None else shown_names(others)
-    for s in others[:USE_BUTTONS]:
-        name = names.get(s["key"]) or masked_label(s["label"])
-        tag = name[len(masked_label(s["label"])):]   # the " #N" kept whole when the label is cut
-        label = ("Use " + name[: len(name) - len(tag)])[: ac.LIMITS["label"] - len(tag)] + tag
-        buttons.append(ac.button(label, "reply", style="secondary", reply=label,
-                                 command=ac.reply(KIND, TARGET, s["key"])))
-    buttons.append(ac.button("Add another account", "reply", style="primary", reply="Add another account",
-                             command=ac.reply(KIND, TARGET, ADD)))
+    buttons = []
     if retry and cur["runtime"] != "codex":
         buttons.append(ac.button("Retry", "reply", style="secondary", reply=RETRY_WORDS))
     if signed_out:
         lead = lead or SIGNED_OUT
     if cur["runtime"] == "codex":
+        _, _, left = listed(cur, others, signed_out)
         more = (" Pick an account to switch to; the core restarts on it." if others else
                 " No other account is saved on this computer yet.")
+        if left:
+            more += (f" {left} more saved account{'s are' if left > 1 else ' is'} not listed here; "
+                     "switch in Settings on the computer that runs the core.")
     else:
         more = ""
     note = NO_CODE
@@ -470,7 +529,8 @@ def menu_card(cur: dict, others: list, signed_out: bool = False, lead: str = "",
     # Out of usage or signed out, the core waits on the owner: `pending`, as the app's needs-you bar lists it.
     stuck = signed_out or retry
     body, card = ac.build(CARD_ID, "pending" if stuck else "info", title="Account", avatar_=ac.avatar(initial="A"),
-                          text=words, buttons=buttons, note=note, note_tone="dim",
+                          text=words, groups=choice_rows(cur, others, names, signed_out), buttons=buttons,
+                          note=note, note_tone="dim",
                           body=" ".join(w for w in (lead, using, 'Reply "switch account" for options.') if w))
     # The marker by which the desktop app on the core's computer draws the core's own account controls;
     # `signed_out` makes it lead with "Sign in again" for this account, above the account dropdown.
@@ -578,7 +638,8 @@ def cmd_post(ws: Path, args, *, core=None, execute=None, now=time.time, run=subp
             return _emit({"status": "failed", "why": f"{type(e).__name__}: {e}"}, 1)
         if not room:
             return _emit({"status": "failed", "why": "the owner's DM is not known"}, 1)
-    shown = [s["key"] for s in others[:USE_BUTTONS]]
+    in_use, listed_others, _ = listed(cur, others, args.signed_out)
+    shown = [s["key"] for s in listed_others]
     tag = hashlib.sha256(",".join(shown).encode()).hexdigest()[:12]
     kind = "signed-out" if args.signed_out else "menu"
     reply_to = args.reply_to or ""
@@ -586,7 +647,8 @@ def cmd_post(ws: Path, args, *, core=None, execute=None, now=time.time, run=subp
                 reply_to=reply_to, core=core, execute=execute)
     if out.get("event_id"):
         try:
-            remember_keys(ws, out["event_id"], shown, now())
+            # The account in use is offered too: a tap on it (a client that ignores `disabled`) is told so.
+            remember_keys(ws, out["event_id"], ([cur["key"]] if in_use else []) + shown, now())
         except OSError as e:
             out["why"] = f"its buttons will not act ({type(e).__name__})"
     return _emit(out, 0 if out["status"] == "posted" else 1)
@@ -703,6 +765,18 @@ def start_switch(ws: Path, room: str, key: str, attempt: str, popen=subprocess.P
     return int(proc.pid)
 
 
+def runtime_card():
+    """The core runtime card's module (skills/runtime-switch), loaded once."""
+    mod = sys.modules.get("runtime_card")
+    if mod is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("runtime_card", RUNTIME_SCRIPT)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["runtime_card"] = mod
+        spec.loader.exec_module(mod)
+    return mod
+
+
 def cmd_reply(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen, now=time.time,
               run=subprocess.run, codex_read=None) -> int:
     try:
@@ -714,9 +788,13 @@ def cmd_reply(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen
     except Exception:  # noqa: BLE001 - a card records its own lane; only one without it needs the core's owner
         core = {}
     verdict = ac.click_verdict(headers, said, ws, ac.lane_owner(ws, str(core.get("owner_mxid") or "")))
-    other = ac.click_answer(verdict, said, (KIND,))
+    other = ac.click_answer(verdict, said, (KIND, RUNTIME_KIND))
     if other is not None:
         return _emit(other, 1)
+    if verdict.command.kind == RUNTIME_KIND:
+        # A pick in the "Runs on" row: the core runtime card's own command, acted on by that card's handler.
+        return runtime_card().cmd_reply(ws, args, core=core or None, execute=execute, popen=popen, now=now,
+                                        run=run, codex_read=codex_read)
     verb, room = verdict.command.verb, str(headers.get("channel_id") or "")
     event = str(headers.get("reply_to_event") or "")
     if verdict.command.target != TARGET:

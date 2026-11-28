@@ -39,8 +39,8 @@ app's own box.
 - **Saved accounts (Codex core only).** The desktop keeps a copy of each ChatGPT sign-in the core has
   had in `<app support>/accounts/codex/<key>.json` (ag2space-cinny-desktop#1264; `<app support>` is
   `$SUTANDO_APP_SUPPORT`, else the folder of the desktop's `runtime.json`). `post` saves the
-  signed-in account there first, in the desktop's own format, so a later sign-in never loses it. Up to
-  five other saved accounts get a "Use <account>" button. The key on a button is 16 hex of a hash of
+  signed-in account there first, in the desktop's own format, so a later sign-in never loses it. The
+  other saved accounts are items of the "Account" menu (below). The key on a button is 16 hex of a hash of
   Codex's account id and the person's email (the desktop's `codex_identity`: one ChatGPT workspace id is
   shared by everyone in it); it names no account and carries no credential.
   A file an earlier engine filed under the workspace id alone is read too and listed once under the
@@ -50,12 +50,23 @@ app's own box.
   computer) row → "Switch account". The app's sign-in terminal shows the link and takes the code in its
   own box. Then the owner asks for the card again.
 
-A Claude core has no saved accounts (its sign-in lives in the Keychain), so its card offers only
-"Add another account".
+A Claude core's saved sign-ins are the desktop's Keychain copies (`<app support>/accounts/claude/index.json`
+lists them), which only the desktop can put in place, so its card offers only "Add account…".
+
+- **The choices are two rows** any client draws (the desktop, the web, a phone), each a `menu` row action
+  of `reply` items (agent_panel v1; no client needs v2 for it), and they are not repeated as buttons:
+  - "Account" (its value the account in use): the account in use, marked " (current)" and disabled; each
+    other saved account (`card:account:core:<key>`, words "Use <account>"); "Add account…"
+    (`card:account:core:add`). At most 8 items: the others by label as many as fit, and the card's text
+    says how many more are saved. A signed-out card lists no account in use.
+  - "Runs on" (its value the runtime in use): Claude Code / Codex, the one in use marked and disabled,
+    with the core runtime card's own words and commands (`card:runtime:core:<claude|codex>`).
+  The card keeps `account_controls`, by which the desktop on the core's computer draws its own controls.
 
 ## A tap
 
-`src/agent_card.py click` routes a tap to `account_card.py reply` (the recorded handler). Only the
+`src/agent_card.py click` routes a tap to `account_card.py reply` (the recorded handler). A "Runs on"
+pick is handed as it is to `skills/runtime-switch/scripts/runtime_card.py`'s own `reply`. Only the
 owner's tap, in the DM the card was posted in, on a card this agent posted, acts
 (`agent_card.click_verdict`). A "Use" tap acts only for a key that card offered and the store still
 holds; a tap on the account already in use changes nothing; a second switch while one is under way is

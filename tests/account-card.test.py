@@ -14,6 +14,9 @@
   restart fails the previous sign-in is put back; a sign-in that is not the wanted one after the
   restart is reported as a failure.
 - No token appears in any output or card.
+- The choices are two row menus any client draws: "Account" (the account in use marked, the other saved
+  accounts as many as fit in 8 items with the rest counted in the text, "Add account…") and "Runs on"
+  (Claude Code / Codex, the core runtime card's own commands, which `reply` hands to that card's handler).
 
 The Action call, the core's row, the restart and the process launch are fakes; no network, no tmux.
 
@@ -101,6 +104,18 @@ def task(said, *, tier="owner", user=OWNER, kind="dm", room=DM, **extra):
             "source_message_id": "$ask", "task_id": "task-1", **extra}
     return "\n".join([f"{k}: {v}" for k, v in head.items()] + [f"task: {said}"]
                      + [f"{k}: {v}" for k, v in tail.items()]) + "\n"
+
+
+def account_menu(card: dict) -> list:
+    """The items of the card's "Account" row menu."""
+    row = card["groups"][0]["rows"][0]
+    assert row["title"] == "Account", row
+    return row["actions"][0]["items"]
+
+
+def picks(card: dict) -> list:
+    """The account menu's tappable items: the other saved accounts' "Use" and "Add account…"."""
+    return [i for i in account_menu(card) if not i.get("disabled")]
 
 
 class Fake:
@@ -238,9 +253,9 @@ class CodexCard(Base):
         self.assertEqual(card["id"], acc.CARD_ID)
         self.assertIn("alice@example.com", card["text"])
         self.assertNotIn("(plus)", json.dumps(card))  # the full email, never a plan
-        labels = [b["label"] for b in card["buttons"]]
+        labels = [b["reply"] for b in picks(card)]
         self.assertEqual(labels, ["Use bob@work.io", "Use carol@example.org", "Add another account"])
-        self.assertEqual([b["command"] for b in card["buttons"]],
+        self.assertEqual([b["command"] for b in picks(card)],
                          [f"card:account:core:{key_of('acct-b')}", f"card:account:core:{key_of('acct-c')}",
                           "card:account:core:add"])
         self.assertEqual(self.fake.calls[0][3], DM)
@@ -252,7 +267,7 @@ class CodexCard(Base):
         self.assertEqual(json.loads(path.read_text()), {"label": "alice@example.com", "auth": A})
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(self.store.stat().st_mode), 0o700)
-        self.assertEqual([b["label"] for b in self.fake.cards()[0]["buttons"]], ["Add another account"])
+        self.assertEqual([b["reply"] for b in picks(self.fake.cards()[0])], ["Add another account"])
         self.assertIn("No other account is saved", self.fake.cards()[0]["text"])
 
     def test_an_api_key_sign_in_is_named_and_not_saved(self):
@@ -272,7 +287,7 @@ class CodexCard(Base):
         self.assertIsNone(ac.problem(card))
         self.assertTrue(card["text"].startswith(lead + " I'm using alice@example.com"))
         self.assertNotIn("Settings", card["note"])
-        self.assertNotIn("Retry", [b["label"] for b in card["buttons"]])
+        self.assertNotIn("Retry", [b["label"] for b in card.get("buttons", [])])
         # The desktop draws the core's own account controls (saved accounts, Add account…) in it.
         self.assertEqual(card["account_controls"], {"runtime": "codex", "core": True})
         # A signed-out core says so in the marker: the client leads with "Sign in again".
@@ -283,15 +298,15 @@ class CodexCard(Base):
         for runtime, offered in (("claude", 1), ("codex", 0)):
             acc_card = acc.menu_card({"runtime": runtime, "signed_in": True, "shown": "alice@example.com",
                                       "key": ""}, [], lead, retry=True)[1]
-            retry = [b for b in acc_card["buttons"] if b["label"] == "Retry"]
+            retry = [b for b in acc_card.get("buttons", []) if b["label"] == "Retry"]
             self.assertEqual(len(retry), offered, runtime)
             self.assertEqual([(b["reply"], b.get("command")) for b in retry], [("retry now", None)] * offered)
         rc, out = self.run_(["post", "--owner-dm", "--retry", "--lead", lead])
         self.assertEqual((rc, out["status"]), (0, "posted"))
         self.assertIsNone(ac.problem(self.fake.cards()[-1]))
-        self.assertNotIn("Retry", [b["label"] for b in self.fake.cards()[-1]["buttons"]])
+        self.assertNotIn("Retry", [b["label"] for b in self.fake.cards()[-1].get("buttons", [])])
         self.assertTrue(self.fake.calls[0][1]["body"].startswith(lead))
-        self.assertEqual(card["buttons"][-1]["label"], "Add another account")
+        self.assertEqual(picks(card)[-1]["reply"], "Add another account")
 
     def test_the_quota_card_says_the_limit_alone_never_that_the_core_is_not_signed_in(self):
         # 2026-11-25: at the limit the card read "... The core (Claude Code) is not signed in." over the account it
@@ -345,7 +360,7 @@ class CodexCard(Base):
         card = self.fake.cards()[0]
         self.assertTrue(card["text"].startswith(acc.SIGNED_OUT + " Pick an account"), card["text"])
         self.assertNotIn("signed in as", card["text"])
-        self.assertEqual([b["label"] for b in card["buttons"]], ["Use bob@work.io", "Add another account"])
+        self.assertEqual([b["reply"] for b in picks(card)], ["Use bob@work.io", "Add another account"])
         self.assertEqual(self.fake.calls[0][3], DM)
 
     def test_a_lead_replaces_the_signed_out_line_and_owner_dm_is_the_default_dm(self):
@@ -376,7 +391,7 @@ class ClaudeCard(Base):
         card = self.fake.cards()[0]
         self.assertIn("I'm using susan@example.com", card["text"])
         self.assertNotIn("(max)", card["text"])  # the email alone, never the plan
-        self.assertEqual([b["label"] for b in card["buttons"]], ["Add another account"])
+        self.assertEqual([b["reply"] for b in picks(card)], ["Add another account"])
         self.assertFalse(self.store.exists())
 
     def test_a_replayed_answer_to_an_older_message_keeps_the_newer_cards_buttons(self):
@@ -505,7 +520,7 @@ class Taps(Base):
         for text in alike.values():
             self.keep(text)
         self.post()
-        by_key = {b["command"].rsplit(":", 1)[1]: b["label"] for b in self.fake.cards()[-1]["buttons"]}
+        by_key = {b["command"].rsplit(":", 1)[1]: b["reply"] for b in picks(self.fake.cards()[-1])}
         first, second = sorted(key_of(a) for a in alike)
         self.assertEqual((by_key[first], by_key[second]), ("Use alma@example.net", "Use adam@example.net"))
         for key in (first, second):
@@ -646,8 +661,8 @@ class LegacyStore(Base):
 
     def test_a_legacy_saved_account_is_offered_once_under_its_current_key(self):
         self.post()
-        buttons = {b["label"]: b["command"].rsplit(":", 1)[1] for b in self.fake.cards()[-1]["buttons"]
-                   if b["label"].startswith("Use ")}
+        buttons = {b["reply"]: b["command"].rsplit(":", 1)[1] for b in picks(self.fake.cards()[-1])
+                   if b["reply"].startswith("Use ")}
         self.assertEqual(buttons, {"Use bob@work.io": key_of("acct-b")}, "the account in use is not offered")
         self.assertEqual([s["key"] for s in acc.saved(self.store, key_of("acct-a")) if s["current"]], [key_of("acct-a")])
         self.assertEqual(len(acc.saved(self.store)), 2, "a legacy file and its new copy are one account")
@@ -669,8 +684,8 @@ class LegacyStore(Base):
         self.assertEqual((state, self.live(), self.restarts), ("error", A, []), words)
         # A fresh card names each person once, under their own key, and switches.
         self.post()
-        buttons = {b["label"]: b["command"].rsplit(":", 1)[1] for b in self.fake.cards()[-1]["buttons"]
-                   if b["label"].startswith("Use ")}
+        buttons = {b["reply"]: b["command"].rsplit(":", 1)[1] for b in picks(self.fake.cards()[-1])
+                   if b["reply"].startswith("Use ")}
         self.assertEqual(buttons, {"Use dana@work.io": acc.identity(dana)[0]})
 
     def test_the_holder_check_applies_to_an_account_filed_under_the_old_key(self):
@@ -684,6 +699,168 @@ class LegacyStore(Base):
         state, words = acc.do_switch(self.ws, key_of("acct-b"), restart=self.restart, ready=self.ready,
                                      live=self.live_account, held=lambda home, key: False)
         self.assertEqual((state, self.live()), ("done", B), words)
+
+
+class ChoiceRows(Base):
+    """The card carries its own choices as two row menus, so a phone or a browser gets them too."""
+
+    def people(self, n: int) -> list:
+        """`n` other saved accounts, kept as the desktop keeps them; their emails sorted."""
+        emails = [f"user{i:02d}@example.com" for i in range(n)]
+        for i, email in enumerate(emails):
+            PEOPLE[f"acct-u{i:02d}"] = email
+            self.keep(auth(email, "plus", f"acct-u{i:02d}", SECRET_C))
+        return emails
+
+    def card(self) -> dict:
+        rc, out = self.post()
+        self.assertEqual((rc, out["status"]), (0, "posted"), out)
+        card = self.fake.cards()[-1]
+        self.assertIsNone(ac.problem(card))
+        return card
+
+    def rows(self, card: dict) -> list:
+        return [(r["title"], r.get("subtitle"), [a["kind"] for a in r["actions"]]) for r in card["groups"][0]["rows"]]
+
+    def runtime_menu(self, card: dict) -> list:
+        row = card["groups"][0]["rows"][1]
+        self.assertEqual(row["title"], "Runs on")
+        return row["actions"][0]["items"]
+
+    def assert_shape(self, card: dict, who: str, on: str) -> None:
+        self.assertEqual(card["v"], 1, "menus in rows are v1 for every client that draws cards")
+        self.assertEqual(self.rows(card), [("Account", who, ["menu"]), ("Runs on", on, ["menu"])])
+        self.assertNotIn("buttons", card, "the choices are not repeated as buttons")
+        self.assertEqual(card["account_controls"]["core"], True, "the desktop's marker stays")
+
+    def test_codex_with_no_other_saved_account(self):
+        self.signed_in(A)
+        card = self.card()
+        self.assert_shape(card, "alice@example.com", "Codex")
+        menu = account_menu(card)
+        self.assertEqual([(i["label"], i.get("disabled", False)) for i in menu],
+                         [("alice@example.com (current)", True), ("Add account…", False)])
+        self.assertEqual(menu[0]["command"], f"card:account:core:{key_of('acct-a')}")
+
+    def test_codex_with_one_and_three_other_saved_accounts(self):
+        self.signed_in(A)
+        self.keep(B)
+        self.assertEqual([i["label"] for i in account_menu(self.card())],
+                         ["alice@example.com (current)", "bob@work.io", "Add account…"])
+        self.keep(C)
+        PEOPLE["acct-d"] = "dave@example.com"
+        self.keep(auth("dave@example.com", "plus", "acct-d", SECRET_C))
+        card = self.card()
+        self.assertEqual([i["label"] for i in account_menu(card)],
+                         ["alice@example.com (current)", "bob@work.io", "carol@example.org", "dave@example.com",
+                          "Add account…"])
+        self.assertEqual([i["reply"] for i in account_menu(card)],
+                         ["Use alice@example.com", "Use bob@work.io", "Use carol@example.org", "Use dave@example.com",
+                          "Add another account"])
+        self.assertNotIn("not listed", card["text"])
+
+    def test_the_menu_holds_eight_items_and_says_how_many_are_left_out(self):
+        self.signed_in(A)
+        emails = self.people(9)
+        card = self.card()
+        menu = account_menu(card)
+        self.assertEqual(len(menu), ac.LIMITS["menu_items"])
+        self.assertEqual([i["label"] for i in menu],
+                         ["alice@example.com (current)", *emails[:6], "Add account…"], "by label, the first that fit")
+        self.assertIn("3 more saved accounts are not listed here", card["text"])
+        # The card offers exactly what it lists: the account in use and the six shown.
+        offered = acc.offered_keys(self.ws, "$card1")
+        self.assertEqual(offered, [key_of("acct-a")] + [key_of(f"acct-u{i:02d}") for i in range(6)])
+        # A signed-out core has no account in use to list: one more place for the others.
+        cur = {"runtime": "codex", "signed_in": False, "shown": "", "key": key_of("acct-a")}
+        others = [{"key": key_of(f"acct-u{i:02d}"), "label": e} for i, e in enumerate(emails)]
+        in_use, shown, left = acc.listed(cur, others, signed_out=True)
+        self.assertEqual((in_use, len(shown), left), (False, 7, 2))
+        out = acc.menu_card(cur, others[:1], signed_out=True)[1]
+        self.assertEqual([i["label"] for i in account_menu(out)], ["user00@example.com", "Add account…"])
+        self.assertEqual(out["groups"][0]["rows"][0]["subtitle"], "Not signed in")
+        self.assertIn("1 more saved account is not listed", acc.menu_card(
+            {"runtime": "codex", "signed_in": True, "shown": "a@b.co", "key": "0" * 16}, others[:7])[1]["text"])
+
+    def test_claude_lists_the_account_in_use_and_add_only(self):
+        self.RUNTIME = "claude"
+        card = self.card()
+        self.assert_shape(card, "susan@example.com", "Claude Code")
+        self.assertEqual([i["label"] for i in account_menu(card)], ["Add account…"])
+        self.assertEqual([(i["label"], i.get("disabled", False)) for i in self.runtime_menu(card)],
+                         [("Claude Code (current)", True), ("Codex", False)])
+
+    def test_the_runtime_row_marks_the_runtime_in_use(self):
+        self.signed_in(A)
+        menu = self.runtime_menu(self.card())
+        self.assertEqual([(i["label"], i["reply"], i["command"], i.get("disabled", False)) for i in menu],
+                         [("Claude Code", "Switch the core to Claude Code", "card:runtime:core:claude", False),
+                          ("Codex (current)", "Switch the core to Codex", "card:runtime:core:codex", True)])
+
+    def test_every_command_is_one_its_handler_accepts(self):
+        self.signed_in(A)
+        self.keep(B)
+        card = self.card()
+        rtc = acc.runtime_card()
+        for item in account_menu(card):
+            cmd = ac.parse_reply(item["command"])
+            self.assertEqual((cmd.kind, cmd.target, cmd.confirmed), (acc.KIND, acc.TARGET, False), item)
+            self.assertTrue(cmd.verb == acc.ADD or acc.KEY_RE.fullmatch(cmd.verb), item)
+            self.assertEqual(item["command"], ac.reply(acc.KIND, acc.TARGET, cmd.verb))
+        for item in self.runtime_menu(card):
+            cmd = ac.parse_reply(item["command"])
+            self.assertEqual((cmd.kind, cmd.target), (rtc.KIND, rtc.TARGET), item)
+            self.assertIn(cmd.verb, rtc.NAMES)
+            # The runtime card's own button for that runtime sends the same words and command.
+            mine = [b for b in rtc.menu_card("codex")[1]["buttons"] if b["command"] == item["command"]]
+            self.assertEqual([b["reply"] for b in mine], [item["reply"]])
+        import issued_cards
+        offers = issued_cards.offered(card)
+        for item in account_menu(card) + self.runtime_menu(card):
+            self.assertEqual(offers[item["reply"]], item["command"], "each pick's words name one command")
+
+    def test_picks_act_through_the_existing_handlers(self):
+        self.signed_in(A)
+        self.keep(B)
+        self.card()
+        # The account in use (a client that ignores `disabled`): told so, nothing starts.
+        rc, out = self.tap("Use alice@example.com")
+        self.assertEqual(out["status"], "say")
+        self.assertIn("Already using alice@example.com", out["say"])
+        # The runtime in use: the runtime card's handler answers, from the account card's tap.
+        rtc = acc.runtime_card()
+        with mock.patch.object(rtc, "runtime", lambda: "codex"):
+            rc, out = self.tap("Switch the core to Codex", source_message_id="$t2")
+        self.assertEqual((rc, out["status"]), (0, "say"))
+        self.assertIn("already running on Codex", out["say"])
+        # The other runtime: handed to that handler as it is, with this tap.
+        seen = []
+        with mock.patch.object(rtc, "cmd_reply", lambda ws, args, **kw: seen.append((ws, args.task_file, kw)) or 0):
+            rc, _ = self.run_tap_raw("Switch the core to Claude Code")
+        self.assertEqual((rc, seen[0][0], seen[0][2]["core"]), (0, self.ws, CORE))
+        # Then "Use" and "Add" act as before.
+        self.assertEqual(self.tap("Use bob@work.io", source_message_id="$t3")[1]["status"], "started")
+        self.assertEqual(self.tap("Add another account", source_message_id="$t4")[1]["status"], "say")
+        self.assertEqual(self.launch.calls[0][0][self.launch.calls[0][0].index("--key") + 1], key_of("acct-b"))
+
+    def run_tap_raw(self, label):
+        path = self.ws / "task.txt"
+        path.write_text(task(label, reply_to_event="$card1",
+                             card_click=json.dumps({"card_id": acc.CARD_ID, "action": label})))
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = acc.main(["--workspace", str(self.ws), "reply", "--task-file", str(path)], core=CORE,
+                          popen=self.launch, run=self.claude_run, execute=lambda *a, **k: self.fake.execute(*a, **k),
+                          codex_read=codex_read_from(self))
+        return rc, None
+
+    def test_no_token_or_path_reaches_the_card(self):
+        self.signed_in(A)
+        self.keep(B)
+        self.people(3)
+        seen = json.dumps(self.card())
+        for secret in (SECRET_A, SECRET_B, SECRET_C, "access_token", "refresh_token", "id_token", "auth.json",
+                       str(self.app), str(self.home), str(self.ws), "accounts/codex", "acct-a", "acct-b"):
+            self.assertNotIn(secret, seen)
 
 
 class Switch(Base):

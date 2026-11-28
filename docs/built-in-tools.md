@@ -477,11 +477,12 @@ python3 skills/account-switch/scripts/account_card.py post --room <owner DM>   #
 python3 skills/account-switch/scripts/account_card.py status                   # the same facts as JSON
 ```
 
-The card names the account in use (masked) and, on a Codex core, a "Use" button for each account
-saved on this Mac (the desktop's store), plus "Add another account", which points to Settings →
-Connections → the Sutando core's row → "Switch account". A tap on it reaches
-`account_card.py reply` through `src/agent_card.py click`; a "Use" tap restarts the core on the
-saved account and the card confirms the outcome in the DM. Details: `skills/account-switch/SKILL.md`.
+The card names the account in use and carries two row menus any client draws (a phone too):
+"Account" (on a Codex core each account saved on this Mac, from the desktop's store, then "Add
+account…", which points to Settings → Connections → the Sutando core's row → "Switch account") and
+"Runs on" (Claude Code / Codex, as the runtime card). A tap reaches `account_card.py reply` through
+`src/agent_card.py click`; picking a saved account restarts the core on it and the card confirms the
+outcome in the DM; a "Runs on" pick is the runtime card's own switch. Details: `skills/account-switch/SKILL.md`.
 
 ## Switch the core's runtime (Codex / Claude Code)
 
