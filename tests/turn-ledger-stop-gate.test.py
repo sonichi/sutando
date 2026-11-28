@@ -621,8 +621,134 @@ def test_a_no_send_counts_for_this_turn_only() -> None:
         check("...exit 1", turn_ledger.main(["--workspace", str(ws), "--session", "s2", "no-send-this-turn"]) == 1)
 
 
+def _hook_with(ws: pathlib.Path, payload: dict) -> dict:
+    """The real hook with a chosen Stop payload."""
+    out = subprocess.run(["/bin/bash", str(_stub(ws))], capture_output=True, text=True,
+                         input=json.dumps(payload))
+    assert out.returncode == 0, f"hook exited {out.returncode}: {out.stderr}"
+    return json.loads(out.stdout or "{}")
+
+
+def test_a_second_stop_hook_for_the_same_stop_gets_the_same_answer() -> None:
+    """#6208: project and config-dir settings both register this hook, so one Stop runs
+    the gate twice. The second used to find the boundary the first had just moved."""
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = _workspace(tmp)
+        transcript = ws / "session.jsonl"
+        transcript.write_text('{"type": "assistant"}\n')
+        payload = {"hook_event_name": "Stop", "session_id": "s-6208", "transcript_path": str(transcript),
+                   "stop_hook_active": False}
+        _arm(ws)
+        _hook_with(ws, payload)
+        transcript.write_text(transcript.read_text() + '{"type": "assistant", "n": 2}\n')
+        turn_ledger.begin_turn(ws)
+        turn_ledger.record_no_send("read-only turn, nothing to say", ws)
+        first = _hook_with(ws, payload)
+        boundary = turn_ledger.last_stop_ts(ws)
+        second = _hook_with(ws, payload)
+        check("the first hook lets the silent turn end", first == {}, repr(first))
+        check("the second hook for that same stop lets it end too", second == {}, repr(second))
+        check("...and moves nothing", turn_ledger.last_stop_ts(ws) == boundary, "")
+        check("...and spends no reminder", not turn_ledger.reminder_spent(ws), "")
+        transcript.write_text(transcript.read_text() + '{"type": "assistant", "n": 3}\n')
+        third = _hook_with(ws, payload)
+        check("the next turn's stop cannot reuse that no-send", _blocked(third), repr(third))
+
+
+def test_a_stop_that_names_no_transcript_is_judged_as_before() -> None:
+    """Without a readable transcript the hook cannot tell two copies of one stop from two
+    stops, so it judges each afresh: the old behavior, never a turn let through by mistake."""
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = _workspace(tmp)
+        _arm(ws)
+        _hook(ws)
+        payload = {"hook_event_name": "Stop", "session_id": "s-6208",
+                   "transcript_path": str(ws / "gone.jsonl")}
+        turn_ledger.record_no_send("nothing to say", ws)
+        check("the first stop ends the turn", _hook_with(ws, payload) == {}, "")
+        check("an unreadable transcript identifies nothing", _blocked(_hook_with(ws, payload)), "")
+
+
+def test_overlapping_copies_of_one_stop_are_serialised() -> None:
+    """The reviewer's interleaving: copy B has read the previous stop's id when copy A runs
+    whole. Unserialised, A moved the boundary and B, resuming, refused the same stop."""
+    import threading
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = _workspace(tmp)
+        turn_ledger.stop_gate(ws, stop_id="earlier")
+        turn_ledger.begin_turn(ws)
+        turn_ledger.record_no_send("quiet on purpose", ws)
+        read, go, results = threading.Event(), threading.Event(), {}
+        real_read = turn_ledger._allowed_stop_id
+
+        def paused_read(ws_, session):
+            got = real_read(ws_, session)
+            if threading.current_thread().name == "B":
+                read.set()
+                go.wait(10)
+            return got
+
+        def run(name):
+            results[name] = turn_ledger.stop_gate(ws, stop_id="this-stop")
+
+        turn_ledger._allowed_stop_id = paused_read
+        try:
+            b = threading.Thread(target=run, args=("B",), name="B")
+            b.start()
+            read.wait(10)
+            a = threading.Thread(target=run, args=("A",), name="A")
+            a.start()
+            a.join(1.0)
+            a_waited = a.is_alive()
+            go.set()
+            b.join(10)
+            a.join(10)
+        finally:
+            turn_ledger._allowed_stop_id = real_read
+        check("the second copy waits for the first to finish", a_waited, "A ran its gate inside B's")
+        check("both copies let the same stop end", results == {"A": None, "B": None}, repr(results))
+        check("and no reminder is spent", not turn_ledger.reminder_spent(ws), "")
+
+
+def test_a_gate_that_cannot_make_its_lock_dir_still_answers() -> None:
+    """The lock fails open like the ledger's: a state dir that cannot be created must not
+    turn the gate into an exception on the Stop path."""
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = pathlib.Path(tmp)
+        (ws / "state").write_text("not a directory")
+        check("the gate still answers, and lets the turn end", turn_ledger.stop_gate(ws, stop_id="s") is None, "")
+
+
+def test_the_stop_id_in_process() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = _workspace(tmp)
+        turn_ledger.stop_gate(ws)
+        turn_ledger.begin_turn(ws)
+        turn_ledger.record_no_send("quiet", ws)
+        check("allowed, and the stop is recorded", turn_ledger.stop_gate(ws, stop_id="A") is None
+              and turn_ledger._allowed_stop_id(ws, None) == "A", "")
+        check("the same stop again is allowed", turn_ledger.stop_gate(ws, stop_id="A") is None, "")
+        check("another stop is judged afresh, and reminded",
+              turn_ledger.stop_gate(ws, stop_id="B", commit=False) is not None, "")
+        check("no id is judged afresh too", turn_ledger.stop_gate(ws, commit=False) is not None, "")
+        turn_ledger.write_status(turn_ledger.STOP_NAME, ["not", "a", "record"], ws)
+        check("a malformed record names no stop", turn_ledger._allowed_stop_id(ws, None) is None, "")
+        turn_ledger.write_status(turn_ledger.STOP_NAME, {"ts": 1.0, "stop_id": 7}, ws)
+        check("a non-string id names no stop", turn_ledger._allowed_stop_id(ws, None) is None, "")
+        turn_ledger.mark_stop(ws)
+        check("a stop recorded without an id names none", turn_ledger._allowed_stop_id(ws, None) is None, "")
+        check("the CLI passes --stop-id through",
+              turn_ledger.main(["--workspace", str(ws), "stop-gate", "--stop-id", "C"]) in (0, 1)
+              and turn_ledger.main(["--workspace", str(ws), "stop-gate", "--stop-id"]) in (0, 1), "")
+
+
 def main() -> int:
     for fn in (
+        test_a_second_stop_hook_for_the_same_stop_gets_the_same_answer,
+        test_a_stop_that_names_no_transcript_is_judged_as_before,
+        test_the_stop_id_in_process,
+        test_overlapping_copies_of_one_stop_are_serialised,
+        test_a_gate_that_cannot_make_its_lock_dir_still_answers,
         test_module_records_both_kinds,
         test_a_no_send_counts_for_this_turn_only,
         test_the_file_is_bounded_and_keeps_the_newest,
