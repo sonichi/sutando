@@ -143,17 +143,25 @@ def _normalize(items):
         if ref:
             norm["media_ref"] = ref
             # Also conditional: the gateway is an external producer, so a media event
-            # arriving without msgtype or mimetype must not grow an explicit null either.
-            if (mt := m.get("msgtype")):
-                norm["msgtype"] = mt
+            # arriving without mimetype must not grow an explicit null either.
             if (mime := m.get("mimetype")):
                 norm["mimetype"] = mime
+        # Attachment or not, and never inferred: a gateway that sends no type yields no key.
+        mt = m.get("msgtype")
+        if isinstance(mt, str) and mt:
+            norm["msgtype"] = mt
         # Conditional like media_ref: a reader binding a reply to its question needs these.
         reply, thread = _relation(m)
         if reply:
             norm["in_reply_to"] = reply
         if thread:
             norm["thread_root"] = thread
+        # The gateway folds an edit into the message it changed, so these are the only mark.
+        if m.get("edited") is True:
+            norm["edited"] = True
+        edit_id = m.get("edit_event_id")
+        if isinstance(edit_id, str) and edit_id:
+            norm["edit_event_id"] = edit_id
         out.append(norm)
     return out
 

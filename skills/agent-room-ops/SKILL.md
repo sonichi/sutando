@@ -132,6 +132,18 @@ python3 skills/agent-room-ops/room_ops.py action execute  '!room:hs' room.common
 
 ```bash
 python3 skills/agent-room-ops/room_ops.py read   '!room:hs' --limit 20 --agent '@a:hs'
+#   -> {"ok":true,"messages":[...],"complete":...,"order":...}. Every message has `sender`,
+#   `ts`, `body`, `event_id`, `reactions`. The rest appear only when the gateway sends them,
+#   never as null and never inferred from the body:
+#     `msgtype`                            the message type (`m.text`, `m.notice`, `m.emote`, `m.image`, ...)
+#     `media_ref`, `mimetype`              an attachment's fetch handle and content type
+#     `in_reply_to`, `thread_root`         the message replied to / the thread it is in
+#     `edited` (true), `edit_event_id`     the message was edited; the id of its latest edit
+#   An edit is never a message of its own: the gateway folds it into the message it changed,
+#   which keeps its `event_id` and shows the edited `body`. No `edited` means this read
+#   reported no edit, not that the message was never edited. `msgtype` appears whenever
+#   the gateway sends one; an older gateway sends it only for an attachment, so no `msgtype`
+#   means the type was not reported, not that the message is text.
 python3 skills/agent-room-ops/room_ops.py fetch  'mxc://hs/abc' --room '!room:hs' --agent '@a:hs'
 python3 skills/agent-room-ops/room_ops.py send   '!room:hs' /tmp/pic.png --caption 'fig 1' --agent '@a:hs'
 python3 skills/agent-room-ops/room_ops.py react  '!room:hs' '$evt' --ack received --agent '@a:hs'
