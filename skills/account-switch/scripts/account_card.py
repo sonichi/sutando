@@ -5,6 +5,7 @@
                                               [--signed-out] [--lead TEXT]
     python3 account_card.py [--workspace WS] reply --task-file PATH
     python3 account_card.py [--workspace WS] switch --room ROOM --key KEY --attempt ID
+    python3 account_card.py [--workspace WS] await-core --room ROOM --key KEY --nonce NONCE
     python3 account_card.py [--workspace WS] status
 
 `post` sends the card to the owner's checked DM and records it (src/issued_cards.py), so only the
@@ -21,14 +22,24 @@ Saved accounts are the desktop's store for the Sutando core on Codex
 (`<app support>/accounts/codex/<key>.json`, {label, auth}, folder 0700, files 0600; desktop
 ag2space-cinny-desktop#1264). The key is 16 hex of the SHA-256 of "<Codex account id>|<email>", so a
 key on a button names no account. `post` first saves the signed-in account there, as the desktop does, so a
-later sign-in never loses it. Each other saved account gets a "Use" button. A Claude core has no
-saved accounts (its sign-in is in the Keychain), so its card offers only "Add another account".
+later sign-in never loses it. The card's choices are two rows any client draws (a phone, a browser, the
+desktop): "Account", a menu of the account in use (marked), each other saved account ("Use" it) and
+"Add account…"; and "Runs on", Claude Code or Codex, whose pick is the core runtime card's own command
+(card:runtime:core:<rt>), which `reply` hands to skills/runtime-switch/scripts/runtime_card.py. A Claude
+core's saved sign-ins are the desktop's Keychain copies, which only the desktop switches. When the desktop
+says it reads requests in the core's Claude folder (its marker `.ag2-switch-consumer.json` there is
+{"v":2,"runtimes":["claude"],"target":"core"}; ag2space-cinny-desktop#1348), the menu lists the desktop's
+saved Claude accounts (`<app support>/accounts/claude/index.json`, key → label) and a "Use" pick leaves
+the request `.ag2-switch-request.json` ({"v":2,"key","nonce","at","target":"core"}, 0600, created
+exclusively) there; a detached `await-core` tells the desktop's answer (`.ag2-switch-result-<nonce>.json`)
+after the core's restart, and withdraws a request the desktop has not claimed within 90 s. Without that
+marker the menu offers only "Add account…".
 
 "Add another account" never signs in from chat: it points the owner to Settings → Connections →
 the Sutando core's row → "Switch account", where the sign-in terminal takes the code in the app's
 own box. A sign-in code or token never goes in a message, a card or a log.
 
-A "Use" tap answers "switching" at once and starts `switch` detached, because the core restarts.
+A "Use" pick answers "switching" at once and starts `switch` detached, because the core restarts.
 It comes from any client the owner uses (the desktop app, the web, a phone): it carries only the
 choice, and the saved sign-in it names never leaves this computer. A tap message acts once (a resent
 one is answered, never switched again), and each tap's outcome is one line in the owner-action audit
@@ -59,6 +70,7 @@ import secrets
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -95,7 +107,15 @@ RUNNING_STALE_S = RESTART_TIMEOUT_S + READY_TIMEOUT_S + 600
 # graceful-restart.sh exits 3/4/5 before it stops the core; any other failure may have restarted it.
 NOT_RESTARTED = (3, 4, 5)
 SETTLE_TRIES, SETTLE_PAUSE_S = 4, 15
-USE_BUTTONS = ac.LIMITS["buttons"] - 1          # one place is "Add another account"
+# The card's choices are two row menus of `reply` items, so a phone or a browser gets them too (listed()).
+MENU_ITEMS = ac.LIMITS["menu_items"]
+ADD_ITEM, ADD_WORDS = "Add account…", "Add another account"
+CURRENT_TAG = " (current)"
+ACCOUNT_ROW, RUNTIME_ROW, MENU_LABEL = "Account", "Runs on", "Change"
+# The core runtime card's own commands and words (skills/runtime-switch/scripts/runtime_card.py), so a pick
+# in the "Runs on" row is that card's tap: `reply` hands it to that card's handler.
+RUNTIME_KIND, RUNTIMES = "runtime", (("claude", "Claude Code"), ("codex", "Codex"))
+RUNTIME_SCRIPT = _REPO / "skills" / "runtime-switch" / "scripts" / "runtime_card.py"
 SETTINGS = ("Settings → Connections → the Sutando (on this computer) row → \"Switch account\". "
             "A sign-in opens there; paste the code only into that box in the app, never in this chat.")
 NO_CODE = "Never send me a sign-in code or token here."
@@ -111,6 +131,15 @@ ACTED = "I already acted on that tap. Ask me for the account card again to switc
 RECOVERED = "recovered"
 STOPPED = "The previous switch stopped before it finished."
 NOT_CODEX = "Saved accounts are kept only for a core on Codex. Add the account in Settings instead."
+# A Claude core switched by the desktop (ag2space-cinny-desktop#1348): its files in the core's Claude folder.
+CONSUMER, REQUEST = ".ag2-switch-consumer.json", ".ag2-switch-request.json"
+CLAIMED, RESULT = ".ag2-switch-claimed-%s.json", ".ag2-switch-result-%s.json"
+CLAUDE_SUB = ("accounts", "claude", "index.json")
+NONCE_RE = re.compile(r"[A-Za-z0-9-]{8,64}")
+UNCLAIMED_S, CLAIMED_GIVE_UP_S, WATCH_POLL_S = 90.0, 900.0, 1.0
+WAITING = "A switch is already waiting for the app on the computer. I'll confirm here when it has finished."
+UNCLAIMED = "The app on the computer didn't pick this up. Nothing changed."
+UNTOLD = "The app on the computer hasn't said how the switch ended. Ask me for the account card to check."
 # graceful-restart.sh's exit codes, as one short reason the owner reads.
 RESTART_REASONS = {3: "the core could not get ready to restart",
                    4: "the core was busy, so the restart was put off",
@@ -412,6 +441,87 @@ def current(rt: str, *, run=subprocess.run, codex_read=None) -> dict:
     return {"runtime": rt, "signed_in": st["signed_in"], "shown": shown if st["signed_in"] else "", "key": ""}
 
 
+# ── a Claude core the desktop switches ────────────────────────────────────────────────────────────
+
+def claude_core_dir() -> Optional[Path]:
+    """The core's Claude config dir (its CLAUDE_CONFIG_DIR), as `claude_status` resolves it; None when unknown."""
+    try:
+        from sutando_config import resolve_claude_sutando_config_dir
+        return Path(resolve_claude_sutando_config_dir())
+    except Exception:  # noqa: BLE001 - no config: no folder the desktop could be watching
+        return None
+
+
+def core_consumer(cdir: Optional[Path]) -> bool:
+    """Whether the desktop says it switches the core from `cdir`: its marker there is exactly v 2, for
+    Claude, for the core."""
+    data = _read_json(cdir / CONSUMER) if cdir else {}
+    v, runtimes = data.get("v"), data.get("runtimes")
+    return (type(v) is int and v == 2 and isinstance(runtimes, list) and "claude" in runtimes
+            and data.get("target") == "core")
+
+
+def claude_index() -> Optional[Path]:
+    """The desktop's saved-account index of the core on Claude Code, beside the Codex store."""
+    store = store_dir()
+    return store.parent.parent.joinpath(*CLAUDE_SUB) if store else None
+
+
+def claude_saved(email: str = "") -> list:
+    """[{key, label, current}] of the core's saved Claude accounts (labels as kept), by label; `current`
+    is the one signed in as `email`, by the desktop's key (16 hex of its SHA-256) or its label."""
+    index = claude_index()
+    data = _read_json(index) if index else {}
+    mine = hashlib.sha256(email.encode("utf-8")).hexdigest()[:16] if email else ""
+    out = [{"key": k, "label": v, "current": bool(email) and (k == mine or masked_label(v).lower() == email.lower())}
+           for k, v in data.items() if KEY_RE.fullmatch(k) and isinstance(v, str) and v.strip()]
+    return sorted(out, key=lambda s: s["label"])
+
+
+def write_core_request(cdir: Path, key: str, nonce: str, now: float) -> None:
+    """The core's switch request, whole and 0600, linked in only where there is none (FileExistsError
+    then), as ag2_sparrow's account_remote.write_request writes it, with `"target":"core"`."""
+    path = cdir / REQUEST
+    tmp = cdir / f"{REQUEST}.{nonce}.tmp"
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"v": 2, "key": key, "nonce": nonce, "at": int(now), "target": "core"}))
+            f.flush()
+            os.fsync(f.fileno())
+        os.link(str(tmp), str(path))
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def withdraw_core_request(cdir: Path, nonce: str) -> bool:
+    """Take the request back while it is still this nonce's and unclaimed; True when it was taken back."""
+    path = cdir / REQUEST
+    aside = cdir / f"{REQUEST}.withdrawn-{nonce}"
+    try:
+        os.rename(str(path), str(aside))
+    except OSError:
+        return False  # the desktop claimed it meanwhile
+    try:
+        mine = _read_json(aside).get("nonce") == nonce
+        if not mine:
+            try:
+                os.link(str(aside), str(path))  # not ours: put back, unless a newer one is there
+            except OSError:
+                pass
+        return mine
+    finally:
+        aside.unlink(missing_ok=True)
+
+
+def core_claims(cdir: Path) -> bool:
+    """Whether the desktop holds a claim in `cdir` (a switch of the core still under way there)."""
+    try:
+        return any(n.startswith(".ag2-switch-claimed-") for n in os.listdir(cdir))
+    except OSError:
+        return False
+
+
 def _seat_home() -> Optional[Path]:
     """The Codex home the running seat was started with (its own CODEX_HOME), when the launcher's
     resolution is refused from here: an absolute directory holding a sign-in file, else None. Read only."""
@@ -435,30 +545,87 @@ def in_use_words(cur: dict) -> str:
 
 # ── the card ──────────────────────────────────────────────────────────────────────────────────────
 
+def _fit(name: str, tag: str, suffix: str = "") -> str:
+    """`name` + `suffix` within a label's limit; `tag` (the " #N" at the end of `name`) kept whole."""
+    room = ac.LIMITS["label"] - len(tag) - len(suffix)
+    return name[: len(name) - len(tag)][:room] + tag + suffix
+
+
+def listed(cur: dict, others: list, signed_out: bool = False) -> tuple:
+    """(the account in use is an item, the other saved accounts that are items, how many are left out).
+    The menu holds MENU_ITEMS: "Add account…", the account in use when its saved key is known and its
+    login was not refused, then the others by label as many as fit."""
+    if cur.get("remote"):
+        in_use = bool(cur["signed_in"] and cur.get("shown") and not signed_out)
+    else:
+        in_use = bool(cur["runtime"] == "codex" and cur.get("key") and not signed_out)
+    room = MENU_ITEMS - 1 - int(in_use)
+    return in_use, others[:room], max(len(others) - room, 0)
+
+
+def account_items(cur: dict, others: list, names: dict, signed_out: bool = False) -> list:
+    """The "Account" menu: the account in use (marked, not tappable: a tap would change nothing), each
+    other saved account (a tap is the "Use" command `reply` acts on), then "Add account…"."""
+    in_use, shown, _ = listed(cur, others, signed_out)
+    items = []
+    entries = ([{"key": cur["key"], "label": cur["shown"]}] if in_use else []) + shown
+    for i, s in enumerate(entries):
+        name = names.get(s["key"]) or masked_label(s["label"])
+        tag = name[len(masked_label(s["label"])):]   # the " #N" kept whole when the label is cut
+        mine = in_use and i == 0
+        # A Claude core's account in use carries no command: only the desktop could act on it.
+        command = "" if mine and cur.get("remote") else ac.reply(KIND, TARGET, s["key"])
+        items.append(ac.button(_fit(name, tag, CURRENT_TAG if mine else ""), "reply",
+                               reply=("Use " + name)[: ac.LIMITS["reply"]],
+                               command=command, **({"disabled": True} if mine else {})))
+    items.append(ac.button(ADD_ITEM, "reply", reply=ADD_WORDS, command=ac.reply(KIND, TARGET, ADD)))
+    return items
+
+
+def runtime_items(rt: str) -> list:
+    """The "Runs on" menu: the core runtime card's own choices, the one in use marked and not tappable."""
+    return [ac.button(name + (CURRENT_TAG if key == rt else ""), "reply", reply=f"Switch the core to {name}",
+                      command=ac.reply(RUNTIME_KIND, TARGET, key), **({"disabled": True} if key == rt else {}))
+            for key, name in RUNTIMES]
+
+
+def choice_rows(cur: dict, others: list, names: dict, signed_out: bool = False, retry: bool = False) -> list:
+    """The card's one group: the "Account" row (the account in use as its value) and the "Runs on" row.
+    `retry` (the quota card): a probe at the limit may read a signed-in core as signed out, so the row
+    says "Not signed in" only for a refused login (`signed_out`), never from that probe."""
+    unsigned = signed_out or (cur["signed_in"] is False and not retry)
+    who = "Not signed in" if unsigned else (cur["shown"] or "Unknown")
+    on = dict(RUNTIMES)[cur["runtime"]]
+    return [{"rows": [
+        ac.row(ACCOUNT_ROW, subtitle=who, actions=[ac.button(MENU_LABEL, "menu",
+                                                             items=account_items(cur, others, names, signed_out))]),
+        ac.row(RUNTIME_ROW, subtitle=on, actions=[ac.button(MENU_LABEL, "menu", items=runtime_items(cur["runtime"]))]),
+    ]}]
+
+
 def menu_card(cur: dict, others: list, signed_out: bool = False, lead: str = "", retry: bool = False,
               names: Optional[dict] = None) -> tuple:
-    """(body, card): a "Use" button per other saved account (up to five), then "Add another account".
+    """(body, card): the "Account" and "Runs on" rows (choice_rows), each a menu any client draws.
     `lead`, when given, opens the card's words and its fallback line. `signed_out`: the core's login was
     refused, so the card drops the account in use and, with no `lead`, opens with SIGNED_OUT. `retry`
     (the quota card) adds a Retry button whose words are the owner's own "retry now", which the Claude
-    core's limit hold acts on; a Codex core has no such hold, so its card carries none."""
-    buttons = []
+    core's limit hold acts on; a Codex core has no such hold, so its card carries none. Saved accounts
+    are menu items only; "Add another account" is also a button, for a client that draws no row menus."""
     names = names if names is not None else shown_names(others)
-    for s in others[:USE_BUTTONS]:
-        name = names.get(s["key"]) or masked_label(s["label"])
-        tag = name[len(masked_label(s["label"])):]   # the " #N" kept whole when the label is cut
-        label = ("Use " + name[: len(name) - len(tag)])[: ac.LIMITS["label"] - len(tag)] + tag
-        buttons.append(ac.button(label, "reply", style="secondary", reply=label,
-                                 command=ac.reply(KIND, TARGET, s["key"])))
-    buttons.append(ac.button("Add another account", "reply", style="primary", reply="Add another account",
-                             command=ac.reply(KIND, TARGET, ADD)))
+    buttons = []
     if retry and cur["runtime"] != "codex":
         buttons.append(ac.button("Retry", "reply", style="secondary", reply=RETRY_WORDS))
+    buttons.append(ac.button(ADD_WORDS, "reply", style="primary", reply=ADD_WORDS,
+                             command=ac.reply(KIND, TARGET, ADD)))
     if signed_out:
         lead = lead or SIGNED_OUT
-    if cur["runtime"] == "codex":
+    if cur["runtime"] == "codex" or cur.get("remote"):
+        _, _, left = listed(cur, others, signed_out)
         more = (" Pick an account to switch to; the core restarts on it." if others else
                 " No other account is saved on this computer yet.")
+        if left:
+            more += (f" {left} more saved account{'s are' if left > 1 else ' is'} not listed here; "
+                     "switch in Settings on the computer that runs the core.")
     else:
         more = ""
     note = NO_CODE
@@ -470,7 +637,8 @@ def menu_card(cur: dict, others: list, signed_out: bool = False, lead: str = "",
     # Out of usage or signed out, the core waits on the owner: `pending`, as the app's needs-you bar lists it.
     stuck = signed_out or retry
     body, card = ac.build(CARD_ID, "pending" if stuck else "info", title="Account", avatar_=ac.avatar(initial="A"),
-                          text=words, buttons=buttons, note=note, note_tone="dim",
+                          text=words, groups=choice_rows(cur, others, names, signed_out, retry), buttons=buttons,
+                          note=note, note_tone="dim",
                           body=" ".join(w for w in (lead, using, 'Reply "switch account" for options.') if w))
     # The marker by which the desktop app on the core's computer draws the core's own account controls;
     # `signed_out` makes it lead with "Sign in again" for this account, above the account dropdown.
@@ -560,7 +728,11 @@ def cmd_post(ws: Path, args, *, core=None, execute=None, now=time.time, run=subp
             save_current(store, _live_auth(codex_home()))
         except (OSError, codex_account.NoHome):
             pass  # the card still names the account; only the copy for switching back is missing
-    every = saved(store, cur["key"])
+    if rt == "claude" and core_consumer(claude_core_dir()):
+        every = claude_saved(cur["shown"] if cur["signed_in"] else "")
+        cur = dict(cur, remote=True, key=next((s["key"] for s in every if s["current"]), ""))
+    else:
+        every = saved(store, cur["key"])
     others = [s for s in every if not s["current"]]
     try:
         body, card = menu_card(cur, others, signed_out=args.signed_out, lead=args.lead or "",
@@ -578,7 +750,8 @@ def cmd_post(ws: Path, args, *, core=None, execute=None, now=time.time, run=subp
             return _emit({"status": "failed", "why": f"{type(e).__name__}: {e}"}, 1)
         if not room:
             return _emit({"status": "failed", "why": "the owner's DM is not known"}, 1)
-    shown = [s["key"] for s in others[:USE_BUTTONS]]
+    in_use, listed_others, _ = listed(cur, others, args.signed_out)
+    shown = [s["key"] for s in listed_others]
     tag = hashlib.sha256(",".join(shown).encode()).hexdigest()[:12]
     kind = "signed-out" if args.signed_out else "menu"
     reply_to = args.reply_to or ""
@@ -586,7 +759,8 @@ def cmd_post(ws: Path, args, *, core=None, execute=None, now=time.time, run=subp
                 reply_to=reply_to, core=core, execute=execute)
     if out.get("event_id"):
         try:
-            remember_keys(ws, out["event_id"], shown, now())
+            # The account in use is offered too: a tap on it (a client that ignores `disabled`) is told so.
+            remember_keys(ws, out["event_id"], ([cur["key"]] if in_use and cur["key"] else []) + shown, now())
         except OSError as e:
             out["why"] = f"its buttons will not act ({type(e).__name__})"
     return _emit(out, 0 if out["status"] == "posted" else 1)
@@ -703,6 +877,18 @@ def start_switch(ws: Path, room: str, key: str, attempt: str, popen=subprocess.P
     return int(proc.pid)
 
 
+def runtime_card():
+    """The core runtime card's module (skills/runtime-switch), loaded once."""
+    mod = sys.modules.get("runtime_card")
+    if mod is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("runtime_card", RUNTIME_SCRIPT)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["runtime_card"] = mod
+        spec.loader.exec_module(mod)
+    return mod
+
+
 def cmd_reply(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen, now=time.time,
               run=subprocess.run, codex_read=None) -> int:
     try:
@@ -714,9 +900,13 @@ def cmd_reply(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen
     except Exception:  # noqa: BLE001 - a card records its own lane; only one without it needs the core's owner
         core = {}
     verdict = ac.click_verdict(headers, said, ws, ac.lane_owner(ws, str(core.get("owner_mxid") or "")))
-    other = ac.click_answer(verdict, said, (KIND,))
+    other = ac.click_answer(verdict, said, (KIND, RUNTIME_KIND))
     if other is not None:
         return _emit(other, 1)
+    if verdict.command.kind == RUNTIME_KIND:
+        # A pick in the "Runs on" row: the core runtime card's own command, acted on by that card's handler.
+        return runtime_card().cmd_reply(ws, args, core=core or None, execute=execute, popen=popen, now=now,
+                                        run=run, codex_read=codex_read)
     verb, room = verdict.command.verb, str(headers.get("channel_id") or "")
     event = str(headers.get("reply_to_event") or "")
     if verdict.command.target != TARGET:
@@ -732,8 +922,11 @@ def cmd_reply(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen
     t = now()
     key = verb if KEY_RE.fullmatch(verb) else "-"
     if runtime() != "codex":
-        audit(ws, headers, key, "refused:not_codex", t)
-        return _emit({"status": "refused", "say": NOT_CODEX}, 2)
+        cdir = claude_core_dir()
+        if not core_consumer(cdir):
+            audit(ws, headers, key, "refused:not_codex", t)
+            return _emit({"status": "refused", "say": NOT_CODEX}, 2)
+        return claude_pick(ws, headers, verb, cdir, t, core=core, execute=execute, popen=popen, run=run)
     store = store_dir()
     if not KEY_RE.fullmatch(verb) or verb not in offered_keys(ws, event) or store is None:
         audit(ws, headers, key, "refused:gone", t)
@@ -779,6 +972,124 @@ def cmd_reply(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen
     out = {"status": "started", "attempt": attempt, "pid": pid, "say": say}
     out.update({"event_id": posted["event_id"]} if posted.get("event_id") else {"card_why": posted.get("why", "")})
     return _emit(out)
+
+
+# ── a Claude core's pick, switched by the desktop ─────────────────────────────────────────────────
+
+def claude_pick(ws: Path, headers: dict, verb: str, cdir: Path, t: float, *, core=None, execute=None,
+                popen=subprocess.Popen, run=subprocess.run) -> int:
+    """A "Use" tap on a Claude core whose folder the desktop watches: the request left there for the
+    desktop, "switching" posted, and `await-core` started detached to tell the outcome."""
+    room, event = str(headers.get("channel_id") or ""), str(headers.get("reply_to_event") or "")
+    key = verb if KEY_RE.fullmatch(verb) else "-"
+    cur = current("claude", run=run)
+    every = claude_saved(cur["shown"] if cur["signed_in"] else "")
+    names = shown_names(every)
+    if not KEY_RE.fullmatch(verb) or verb not in offered_keys(ws, event) or verb not in names:
+        audit(ws, headers, key, "refused:gone", t)
+        return _emit({"status": "refused", "say": GONE}, 2)
+    label = names[verb]
+    if any(s["current"] and s["key"] == verb for s in every):
+        audit(ws, headers, key, "already_using", t)
+        return _emit({"status": "say", "say": f"Already using {label} — nothing to change."})
+    tap = str(headers.get("source_message_id") or "")
+    nonce = str(uuid.uuid4())
+    try:
+        if tap and not take_tap(ws, tap, t):
+            audit(ws, headers, key, "refused:tap_acted_on", t)
+            return _emit({"status": "say", "say": ACTED})
+        if core_claims(cdir):
+            raise FileExistsError(REQUEST)
+        write_core_request(cdir, verb, nonce, t)
+    except FileExistsError:
+        release_tap(ws, tap)
+        audit(ws, headers, key, "busy", t)
+        return _emit({"status": "say", "say": WAITING})
+    except OSError as e:
+        release_tap(ws, tap)
+        audit(ws, headers, key, "failed", t)
+        return _emit({"status": "failed", "say": "I couldn't start the switch. Nothing changed.",
+                      "why": type(e).__name__}, 1)
+    say = f"Switching the core to {label}… the core restarts once; I'll confirm here."
+    body, card = notice_card("pending", "Switching", say)
+    posted = _post(ws, room, body, card, f"account-card:{nonce}:switching", reply_to=event, core=core or None,
+                   execute=execute)
+    try:
+        pid = start_watch(ws, room, verb, nonce, popen)
+    except OSError as e:
+        withdraw_core_request(cdir, nonce)
+        release_tap(ws, tap)
+        audit(ws, headers, key, "failed", t)
+        return _emit({"status": "failed", "say": "I couldn't start the switch. Nothing changed.",
+                      "why": f"{type(e).__name__}: {e}"}, 1)
+    audit(ws, headers, key, "requested", t)
+    out = {"status": "started", "nonce": nonce, "pid": pid, "say": say}
+    out.update({"event_id": posted["event_id"]} if posted.get("event_id") else {"card_why": posted.get("why", "")})
+    return _emit(out)
+
+
+def start_watch(ws: Path, room: str, key: str, nonce: str, popen=subprocess.Popen) -> int:
+    """Start `await-core` in a session of its own, so it outlives the core's restart; its pid."""
+    log = ws / "logs" / "account-card.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    argv = ["nohup", sys.executable, str(Path(__file__).resolve()), "--workspace", str(ws), "await-core",
+            "--room", room, "--key", key, "--nonce", nonce]
+    with open(log, "ab") as fh:
+        fh.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} core account request ({nonce})\n".encode())
+        fh.flush()
+        proc = popen(argv, cwd=str(_REPO), stdin=subprocess.DEVNULL, stdout=fh, stderr=subprocess.STDOUT,
+                     start_new_session=True)
+    return int(proc.pid)
+
+
+def told(result: dict, label: str) -> tuple:
+    """(state, words) of the desktop's answer; its own label (an email) named when it gives one."""
+    name = masked_label(str(result.get("label") or "")) or label
+    if result.get("ok") is True:
+        if result.get("verified") is True:
+            return "done", f"Now using {name}."
+        return "info", f"Switched to {name}; not yet confirmed."
+    why = " ".join(str(result.get("error") or "the app did not say why").split())[:300]
+    return "error", f"Could not switch: {why}"
+
+
+def await_core(cdir: Path, nonce: str, label: str, *, sleep=time.sleep, clock=time.time) -> tuple:
+    """(state, words): the desktop's answer to request `nonce` in `cdir`. A request still unclaimed after
+    UNCLAIMED_S is withdrawn; a claim unanswered after CLAIMED_GIVE_UP_S is told as not known."""
+    result, claim = cdir / (RESULT % nonce), cdir / (CLAIMED % nonce)
+    start, seen = clock(), False
+    while True:
+        answer = _read_json(result)
+        if answer.get("nonce") == nonce and isinstance(answer.get("ok"), bool):
+            result.unlink(missing_ok=True)
+            return told(answer, label)
+        seen = seen or claim.exists()
+        waited = clock() - start
+        if not seen and waited >= UNCLAIMED_S:
+            if withdraw_core_request(cdir, nonce):
+                return "error", UNCLAIMED
+            seen = True  # claimed (or answered) meanwhile: its answer is read on the next look
+        if waited >= CLAIMED_GIVE_UP_S:
+            return "info", UNTOLD
+        sleep(WATCH_POLL_S)
+
+
+def cmd_await_core(ws: Path, args, *, core=None, execute=None, sleep=time.sleep, clock=time.time) -> int:
+    cdir = claude_core_dir()
+    if cdir is None:
+        return _emit({"status": "refused", "why": "the core's Claude folder is not known"}, 2)
+    label = shown_names(claude_saved()).get(args.key) or "that account"
+    state, words = await_core(cdir, args.nonce, label, sleep=sleep, clock=clock)
+    status = {"done": "Switched", "info": "Switched" if words != UNTOLD else "Not known"}.get(state, "Not switched")
+    body, card = notice_card(state, status, words)
+    out = {"status": "failed"}
+    for i in range(SETTLE_TRIES):
+        out = _post(ws, args.room, body, card, f"account-card:{args.nonce}:outcome", core=core, execute=execute)
+        if out["status"] == "posted":
+            break
+        if i + 1 < SETTLE_TRIES:
+            sleep(SETTLE_PAUSE_S)
+    return _emit({**out, "outcome": state, "say": words}, 0 if state == "done" else 1)
 
 
 # ── the detached switch ───────────────────────────────────────────────────────────────────────────
@@ -971,7 +1282,7 @@ def cmd_switch(ws: Path, args, *, core=None, execute=None, restart=restart_core,
 
 
 def main(argv=None, *, core=None, execute=None, popen=subprocess.Popen, run=subprocess.run, codex_read=None,
-         restart=restart_core, sleep=time.sleep, ready=core_ready, live=live_account) -> int:
+         restart=restart_core, sleep=time.sleep, ready=core_ready, live=live_account, clock=time.time) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--workspace", default=None)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -991,6 +1302,10 @@ def main(argv=None, *, core=None, execute=None, popen=subprocess.Popen, run=subp
     w.add_argument("--room", required=True)
     w.add_argument("--key", required=True)
     w.add_argument("--attempt", required=True)
+    a = sub.add_parser("await-core")
+    a.add_argument("--room", required=True)
+    a.add_argument("--key", required=True)
+    a.add_argument("--nonce", required=True)
     sub.add_parser("status")
     args = p.parse_args(argv)
     if args.workspace:
@@ -1006,6 +1321,10 @@ def main(argv=None, *, core=None, execute=None, popen=subprocess.Popen, run=subp
         if not KEY_RE.fullmatch(args.key):
             return _emit({"status": "refused", "why": "that is not a saved account's key"}, 2)
         return cmd_switch(ws, args, core=core, execute=execute, restart=restart, sleep=sleep, ready=ready, live=live)
+    if args.cmd == "await-core":
+        if not KEY_RE.fullmatch(args.key) or not NONCE_RE.fullmatch(args.nonce):
+            return _emit({"status": "refused", "why": "that is not a request this card made"}, 2)
+        return cmd_await_core(ws, args, core=core, execute=execute, sleep=sleep, clock=clock)
     rt = runtime()
     cur = current(rt, run=run, codex_read=codex_read)
     store = store_dir() if rt == "codex" else None
