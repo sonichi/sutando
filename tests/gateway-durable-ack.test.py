@@ -18,6 +18,10 @@ Covers:
      `not leased` 404, and kept behind the cooldown on a bare no-route 404;
   5. the production ack round — `main()` itself, not a copy of its ordering —
      puts `durable` on the wire and withholds every ack of a failed round.
+  6. a served round acks each task as soon as its own write lands, so a slow
+     sibling's intake never holds an earlier ack past its lease; a task the round
+     leaves unacked is logged with the reason its ack did not land, and a slow
+     intake logs how long each step took.
 
 Run: python3 tests/gateway-durable-ack.test.py
 """
@@ -687,6 +691,97 @@ class DurableAck(unittest.TestCase):
         mod._retry_pending_acks(inflight)
         self.assertEqual(self._acks(), [], "a closed lease is retired without posting")
         self.assertEqual(sorted(mod._load_pending_acks()), [])
+
+
+    # -- 6. a burst round: ack per task, and why an ack did not land --------- #
+
+    def _logs(self):
+        lines: list[str] = []
+        return lines, patch.object(self.mod, "_log", side_effect=lambda m, *a, **k: lines.append(str(m)))
+
+    def test_a_round_acks_each_task_before_the_next_task_is_written(self):
+        mod = self.mod
+        order: list[tuple[str, str]] = []
+        real_write = mod._write_task
+
+        def write(task, *a, **k):
+            order.append(("write", task["id"]))
+            return real_write(task, *a, **k)
+
+        def req(method, path, payload=None, timeout=35, **_kw):
+            if path.endswith("/ack"):
+                order.append(("ack", payload["id"]))
+            return {}
+
+        tasks = [self._task(f"task-burst{n}", signal=False) for n in (1, 2, 3)]
+        fates = {mod._served_key(t): None for t in tasks}
+        with patch.object(mod, "_write_task", side_effect=write), \
+                patch.object(mod, "_req", side_effect=req):
+            mod._take_served_round(tasks, mod._load_inflight(), [], fates, [])
+        self.assertEqual(order, [("write", "task-burst1"), ("ack", "task-burst1"),
+                                 ("write", "task-burst2"), ("ack", "task-burst2"),
+                                 ("write", "task-burst3"), ("ack", "task-burst3")],
+                         "a later task's intake must not hold an earlier task's ack")
+        self.assertEqual(set(fates.values()), {"acked"})
+        self.assertEqual(json.loads(mod.INFLIGHT_FILE.read_text()),
+                         ["task-burst1", "task-burst2", "task-burst3"])
+
+    def test_an_unacked_task_is_settled_with_the_reason_its_ack_did_not_land(self):
+        mod = self.mod
+        mod._ack_disabled_until = time.time() + 60
+        tasks = [self._task("task-cool", signal=False)]
+        fates = {mod._served_key(t): None for t in tasks}
+        lines, logs = self._logs()
+        with logs:
+            mod._take_served_round(tasks, mod._load_inflight(), [], fates, [])
+            mod._settle_round(fates)
+        self.assertEqual(self._acks(), [])
+        self.assertTrue(any("task ack for task-cool: skipped" in m for m in lines), lines)
+        self.assertTrue(any(m.startswith("served task-cool was not acked") and "/ack cooldown" in m
+                            for m in lines), lines)
+        self.assertNotIn("task-cool", mod._ACK_MISS, "the settle consumes the reason")
+
+    def test_a_withheld_round_is_settled_with_the_withholding_named(self):
+        mod = self.mod
+        tasks = [self._task("task-held", signal=False)]
+        fates = {mod._served_key(t): None for t in tasks}
+        lines, logs = self._logs()
+        with logs, patch.object(mod, "_record_pending_acks", return_value=False):
+            mod._take_served_round(tasks, mod._load_inflight(), [], fates, [])
+            mod._settle_round(fates)
+        self.assertTrue(any(m.startswith("served task-held was not acked") and "ledger did not commit" in m
+                            for m in lines), lines)
+
+    def test_a_slow_intake_logs_each_step_from_served_to_queued(self):
+        mod = self.mod
+        tasks = [self._task("task-slow", signal=False)]
+        fates = {mod._served_key(t): None for t in tasks}
+        lines, logs = self._logs()
+        with logs, patch.object(mod, "INTAKE_SLOW_LOG_S", 0.0):
+            mod._take_served_round(tasks, mod._load_inflight(), [], fates, [])
+        timed = [m for m in lines if m.startswith("intake of task-slow took")]
+        self.assertEqual(len(timed), 1, lines)
+        for step in ("intake gate", "media", "staged", "published", "queued", "rest"):
+            self.assertIn(f"{step} ", timed[0])
+
+
+    def test_an_invalid_wire_id_is_not_posted_and_says_why(self):
+        mod = self.mod
+        lines, logs = self._logs()
+        with logs, patch.object(mod, "_valid_tid", return_value=False):
+            self.assertFalse(mod._post_task_ack("task-badid"))
+        self.assertEqual(self._acks(), [])
+        self.assertTrue(any("task ack for task-badid: its wire id is not valid" in m for m in lines), lines)
+        self.assertEqual(mod._ACK_MISS.get(mod._broker_tid("task-badid")), "its wire id is not valid")
+
+    def test_the_ack_miss_record_stays_bounded(self):
+        mod = self.mod
+        with patch.object(mod, "_ACK_MISS_MAX", 2):
+            mod._ACK_MISS.clear()
+            mod._ack_missed("task-m1", "a")
+            mod._ack_missed("task-m2", "b")
+            mod._ack_missed("task-m3", "c")
+            self.assertEqual(list(mod._ACK_MISS.values()), ["c"])
 
 
 if __name__ == "__main__":
