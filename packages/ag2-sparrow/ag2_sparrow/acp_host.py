@@ -10,6 +10,11 @@ owner may read or edit under the working directory, an adapter may add its own e
 line, a file of its own), and an adapter may switch on, per turn, command execution and web fetch/search. A
 turn may carry the task's own attachments (`task_media`): images as prompt content blocks, and a read-only
 copy of every file in a folder of its own.
+
+`AcpHost` is the long-lived form: one agent process started once (`start`: spawn, `initialize`, the adapter's
+authenticate step) and one shared Session (its id kept 0600 in the agent's state, reloaded with `session/load`
+after a restart), on which each turn (`run_turn`) is one `session/prompt`. A process that exited, a timed-out
+request or a changed authentication restarts it cleanly; a turn whose prompt was not sent yet is tried once more.
 """
 from __future__ import annotations
 
@@ -464,11 +469,12 @@ def _write_copy(path, data):
 
 
 @contextlib.contextmanager
-def task_media(headers, readable, log=None):
+def task_media(headers, readable, log=None, parent=None):
     """The task's own attachments (its attested `attachments:` header, as the bridge stamps the files it
     downloaded for this message) as a `Media`: each image of a known type and at most MAX_IMAGE_BYTES as an
     image block; with `readable`, a read-only copy of every file in a new 0500 folder of this turn's own,
-    removed after the turn. No other task's files are copied, and the originals are never named to the agent.
+    removed after the turn (inside `parent` when given: a long-lived Session's own media root). No other task's
+    files are copied, and the originals are never named to the agent.
     An attachment that cannot be used (unreadable, too large, not a regular file, its copy not written) is
     left out on its own; the others still go with the turn."""
     files, images, folder = [], [], None
@@ -476,7 +482,7 @@ def task_media(headers, readable, log=None):
     try:
         if refs and readable:
             try:
-                folder = os.path.realpath(tempfile.mkdtemp(prefix=MEDIA_PREFIX))
+                folder = os.path.realpath(tempfile.mkdtemp(prefix=MEDIA_PREFIX, dir=parent))
             except OSError:
                 folder = None   # no folder: the images still go, the files are said not readable
         used = set()
@@ -608,6 +614,8 @@ class Turn:
         self.updates = collections.Counter()
         self.resumed = False   # the Session came from session/load, not session/new
         self.session_id = None
+        self.opened = False    # the Session was opened (new or loaded) for this turn: its MCP servers launched now
+        self.model_skipped = ""   # a wanted model the Session does not offer: session/set_model was not sent
         self.lock = threading.Lock()
         self.view = None       # the agent's live view (`live_view.Writer`), when the adapter keeps one
         self.calls = {}        # toolCallId -> the call's fields so far, until a terminal status
@@ -681,12 +689,17 @@ def pick_mode(modes, wanted):
 def use_model(client, session_id, wanted, models, on_models, timeout, log):
     """Hand the Session's model list (ACP `models`: availableModels, currentModelId) to `on_models` and
     switch the Session to `wanted` with `session/set_model`; the model id now set, '' when the agent
-    names none. A refused switch is logged and the turn runs on the Session's own model."""
+    names none. A refused switch is logged and the turn runs on the Session's own model; a model the Session
+    lists no `availableModels` entry for is never asked for."""
     state = models if isinstance(models, dict) else {}
     current = str(state.get("currentModelId") or "")
     if on_models and state:
         on_models(state)
     if wanted and wanted != current:
+        offered = offered_model_ids(state)
+        if offered is not None and wanted not in offered:
+            log("model", wanted, "is not offered by this session; session/set_model not sent")
+            return current
         try:
             client.call("session/set_model", {"sessionId": session_id, "modelId": wanted}, timeout)
             return wanted
@@ -695,6 +708,18 @@ def use_model(client, session_id, wanted, models, on_models, timeout, log):
         except AcpError as e:
             log("session/set_model refused; the turn runs on", current or "the agent's own model", "-", str(e)[:200])
     return current
+
+
+def _answer_permission(turn, decide, params):
+    """`decide`'s answer to one permission request, recorded on `turn` (and its live view)."""
+    ok, why, result = decide(params)
+    title = (params.get("toolCall") or {}).get("title") if isinstance(params.get("toolCall"), dict) else None
+    turn.decisions.append({"title": str(title or "")[:120], "allowed": ok, "reason": why,
+                           "category": action_category(params)})
+    if turn.view is not None:
+        turn.view.step("allowed" if ok else "refused",
+                       "%s%s" % (action_category(params), ": %s" % title if title else ""), why)
+    return result
 
 
 def run_prompt(client_factory, args, headers, task_id, prompt, decide, store, stderr_name, not_signed_in, log,
@@ -720,20 +745,11 @@ def run_prompt(client_factory, args, headers, task_id, prompt, decide, store, st
     argv = isolated.argv if isolated else args.acp_argv
     env = isolated.env if isolated else args.child_env
 
-    def on_permission(params):
-        ok, why, result = decide(params)
-        title = (params.get("toolCall") or {}).get("title") if isinstance(params.get("toolCall"), dict) else None
-        turn.decisions.append({"title": str(title or "")[:120], "allowed": ok, "reason": why,
-                               "category": action_category(params)})
-        if turn.view is not None:
-            turn.view.step("allowed" if ok else "refused",
-                           "%s%s" % (action_category(params), ": %s" % title if title else ""), why)
-        return result
-
     try:
         client = client_factory(argv, cwd=cwd, env=env,
                                 stderr_path=os.path.join(args.state, stderr_name),
-                                on_permission=on_permission, on_update=turn.on_update)
+                                on_permission=lambda params: _answer_permission(turn, decide, params),
+                                on_update=turn.on_update)
     except OSError as e:
         return "failed", "", "the ACP command did not start (%s)" % e, turn
     try:
@@ -842,3 +858,328 @@ def _set_mode(client, session_id, modes, isolated, timeout):
     except AcpError as e:
         return "setting session mode %s failed (%s)" % (mode, str(e)[:160])
     return ""
+
+
+# ── one long-lived agent and its shared Session ──────────────────────────────
+
+SHARED_NAME = "shared-session.json"
+MEDIA_ROOT_NAME = "acp-media"
+UNREAD_BACKOFF_S, UNREAD_BACKOFF_CAP_S = 60, 30 * 60   # AcpHost: the wait after a start that was not settled
+REFUSED = {"outcome": {"outcome": "cancelled"}}
+
+
+def shared_session_lead(headers, task_id):
+    """The first paragraph of every prompt in a shared Session: which room the turn is from, who sent it and that
+    its reply goes back to that room, from the attested headers only. The Session also holds other rooms' turns."""
+    room = _oneline(headers.get("channel_id") or headers.get("source_room_id") or "task:%s" % task_id)
+    return ("[shared session] This turn is from room %s, sent by %s (access_tier=%s, collaborator=%s), as Sparrow's "
+            "attested task headers say. Your reply to this turn goes back to room %s, and only there. This one "
+            "session also carries earlier turns from your owner and collaborators in other rooms: answer this "
+            "sender, in this room, and never repeat what was said in another room to a sender who is not your owner."
+            % (room, _oneline(headers.get("user_id") or "an unknown sender"),
+               _oneline(headers.get("access_tier") or "guest"),
+               "true" if headers.get("collaborator") == "true" else "false", room))
+
+
+class SharedSessionFile:
+    """The shared Session's record (session_id, cwd, auth, turns), one JSON object written 0600 and replaced whole."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+
+    def read(self):
+        try:
+            rec = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return rec if isinstance(rec, dict) and isinstance(rec.get("session_id"), str) and rec["session_id"] else None
+
+    def write(self, rec):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_name(".%s.%d.tmp" % (self.path.name, os.getpid()))
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(dict(rec, updated_at=time.time()), f, indent=2)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, self.path)
+
+
+def offered_model_ids(models):
+    """The model ids a Session's ACP `models` lists, or None when it lists none (availableModels absent)."""
+    offered = models.get("availableModels") if isinstance(models, dict) else None
+    if not isinstance(offered, list):
+        return None
+    return [m["modelId"] for m in offered if isinstance(m, dict) and isinstance(m.get("modelId"), str)]
+
+
+class AcpHost:
+    """One long-lived ACP agent process (`args.acp_argv` in `args.cwd`) and one shared Session, one turn at a time.
+
+    `start` spawns the agent, sends `initialize` and runs `on_initialized(client, init, argv)` (the adapter's own
+    authenticate step; a str it returns names the authentication, saved with the Session). The shared Session is
+    opened on the first turn: its saved record (`shared_path`) is resumed with `session/load` when it was opened in
+    the same working directory under the same authentication, else (or when the load is refused) a new one is
+    opened with `session/new` and saved; `mcp_servers(init)` names its MCP servers, attached once, when it opens.
+    `on_models(models)` gets the ACP `models` of each Session opened. Before a turn the process is restarted when it
+    exited, or when `auth_probe()` gives another marker than the last known one (the adapter's authentication
+    changed; None, the probe could not tell, changes nothing). The last known marker is the one read just before and
+    after `on_initialized` in the start that authenticated, when both reads agree and `auth_settled()` (when given)
+    says that start read what the marker watches; else it is unknown and the next marker read restarts the process
+    once, so the one running is proven on it. After a start that was not settled, that restart waits until the
+    marker moves from the one that start read, or a backoff ends (UNREAD_BACKOFF_S, doubling to
+    UNREAD_BACKOFF_CAP_S on each start still not settled, reset by a settled one; `clock` gives seconds). A request
+    that timed out, or a sign-in error, closes it so the next turn starts clean. A turn whose prompt was not sent
+    yet when the process went away is tried once more on a fresh one. With `turn_cap`, a Session that has had that
+    many turns is left for a new one (0: never). `media_root` is a folder given to the Session as an additional
+    directory (when the agent declares them), inside which each turn's attachments are copied."""
+
+    def __init__(self, client_factory, args, stderr_name, not_signed_in, log, shared_path, on_initialized=None,
+                 mcp_servers=None, on_models=None, auth_probe=None, turn_cap=0, media_root=None, auth_settled=None,
+                 clock=time.monotonic):
+        self.client_factory, self.args, self.stderr_name = client_factory, args, stderr_name
+        self.not_signed_in, self.log = not_signed_in, log
+        self.file = SharedSessionFile(shared_path)
+        self.on_initialized, self.mcp_servers, self.on_models = on_initialized, mcp_servers, on_models
+        self.auth_probe, self.turn_cap, self.media_root = auth_probe, int(turn_cap or 0), media_root
+        self.auth_settled, self.clock = auth_settled, clock
+        # after a start that was not settled: (marker it read, until when its retry waits, logged)
+        self.unread_hold, self.unread_backoff = None, 0
+        self.client = None
+        self.init, self.auth, self.probed = {}, None, None
+        self.session_id, self.turns, self.models, self.model = None, 0, {}, ""
+        self.spawns = 0
+        self._turn, self._decide = None, None
+        if media_root:
+            os.makedirs(media_root, mode=0o700, exist_ok=True)   # before the first turn copies into it
+
+    # the reader thread's two callbacks: only the turn in progress, only its own Session
+    def _on_permission(self, params):
+        turn, decide = self._turn, self._decide
+        if turn is None or decide is None or params.get("sessionId") not in (None, turn.session_id):
+            return REFUSED
+        return _answer_permission(turn, decide, params)
+
+    def _on_update(self, params):
+        turn = self._turn
+        if turn is not None and params.get("sessionId") in (None, turn.session_id):
+            turn.on_update(params)
+
+    @property
+    def pid(self):
+        return getattr(getattr(self.client, "p", None), "pid", None)
+
+    def alive(self):
+        gone = getattr(self.client, "gone", None)
+        if self.client is None or (gone is not None and gone.is_set()):
+            return False
+        poll = getattr(getattr(self.client, "p", None), "poll", None)
+        return poll is None or poll() is None
+
+    def restart_reason(self):
+        """Why the process must be started (again) before this turn, '' when the running one serves."""
+        if self.client is None:
+            return "not started"
+        if not self.alive():
+            return "the agent process exited"
+        if self.auth_probe is not None:
+            probed = self._probe()
+            if probed is not None and probed != self.probed and not self._unread_held(probed):
+                return "the authentication changed"
+        return ""
+
+    def _unread_held(self, probed):
+        """True while the restart for an unknown baseline waits: the last start was not settled, `probed` is the
+        marker it read, and its backoff has not ended. A moved marker (a real key change) is never held."""
+        hold = self.unread_hold
+        if self.probed is not None or hold is None or probed != hold[0] or self.clock() >= hold[1]:
+            return False
+        if not hold[2]:
+            self.unread_hold = hold[:2] + (True,)
+            self.log("the last start could not read what the authentication watches; not restarting for it "
+                     "for %d s more, unless it changes" % max(0, round(hold[1] - self.clock())))
+        return True
+
+    def _probe(self):
+        """auth_probe()'s marker, or None when it could not tell: neither a change nor a removal, and the last
+        known marker stays the one the next read is compared with."""
+        try:
+            probed = self.auth_probe()
+        except Exception as e:  # noqa: BLE001 - an unreadable probe reads as unknown
+            self.log("authentication not checked:", type(e).__name__)
+            return None
+        if probed is None:
+            self.log("authentication not checked: the probe could not tell")
+        return probed
+
+    def start(self):
+        """Spawn, `initialize`, authenticate. Raises OSError (not started) or AcpError."""
+        self.close()
+        self.probed = None   # unknown until this start shows which marker it authenticated under
+        self.client = self.client_factory(self.args.acp_argv, cwd=self.args.cwd, env=self.args.child_env,
+                                          stderr_path=os.path.join(self.args.state, self.stderr_name),
+                                          on_permission=self._on_permission, on_update=self._on_update)
+        self.spawns += 1
+        self.init = self.client.initialize(self.args.rpc_timeout)
+        before = self._probe() if self.auth_probe is not None else None
+        self.auth = self.on_initialized(self.client, self.init, self.args.acp_argv) \
+            if self.on_initialized is not None else None
+        after = self._probe() if self.auth_probe is not None else None
+        # The baseline is a marker read on both sides of this start's authenticate; else unknown, and restarts once.
+        settled = self.auth_settled is None or self.auth_settled()
+        self.probed = before if before is not None and before == after and settled else None
+        if settled:
+            self.unread_hold, self.unread_backoff = None, 0
+        else:
+            self.log("this start could not read what the authentication watches; it restarts once it reads")
+            self.unread_backoff = min(self.unread_backoff * 2, UNREAD_BACKOFF_CAP_S) or UNREAD_BACKOFF_S
+            seen = after if before is None or before == after else None   # moved during the start: not held
+            self.unread_hold = None if seen is None else (seen, self.clock() + self.unread_backoff, False)
+        if before is not None and after is not None and before != after:
+            self.log("the authentication changed while the agent started; it restarts before the next turn")
+        self.log("agent started (pid %s), auth %s" % (self.pid, self.auth or "none"))
+
+    def close(self, grace=None):
+        client, self.client, self.session_id = self.client, None, None
+        if client is not None:
+            with contextlib.suppress(Exception):
+                client.close(self.args.interrupt_grace if grace is None else grace)
+
+    def _caps(self):
+        caps = self.init.get("agentCapabilities") if isinstance(self.init.get("agentCapabilities"), dict) else {}
+        sub = lambda k: caps.get(k) if isinstance(caps.get(k), dict) else {}   # noqa: E731
+        return caps, sub("promptCapabilities"), sub("sessionCapabilities")
+
+    def _open(self, turn):
+        """Resume the saved shared Session, else open a new one and save it."""
+        caps, _, session_caps = self._caps()
+        cwd = self.args.cwd
+        extra = {"additionalDirectories": [self.media_root]} \
+            if self.media_root and "additionalDirectories" in session_caps else {}
+        servers = list(self.mcp_servers(self.init) or []) if self.mcp_servers is not None else []
+        rec, opened, session_id = self.file.read(), None, None
+        if rec and self.auth and (rec.get("auth") or SIGNED_IN_AUTH) != self.auth:
+            self.log("not resuming shared session", rec["session_id"], "- it was opened under",
+                     rec.get("auth") or SIGNED_IN_AUTH, "and this agent runs on", self.auth, "; opening a new one")
+            rec = None
+        if rec and self.turn_cap and int(rec.get("turns") or 0) >= self.turn_cap:
+            self.log("shared session", rec["session_id"], "has had", rec.get("turns"), "turns (cap %d); opening a new one"
+                     % self.turn_cap)
+            rec = None
+        if rec and rec.get("cwd") == cwd and caps.get("loadSession"):
+            try:
+                opened = self.client.call("session/load", dict({"sessionId": rec["session_id"], "cwd": cwd,
+                                                                "mcpServers": servers}, **extra), self.args.turn_timeout)
+                session_id, self.turns = rec["session_id"], int(rec.get("turns") or 0)
+                turn.resumed = True
+                self.log("resumed shared session", session_id)
+            except (AcpTimeout, AcpGone):
+                raise
+            except AcpError as e:
+                self.log("shared session/load refused (%s); opening a new shared session" % str(e)[:200])
+        if session_id is None:
+            opened = self.client.call("session/new", dict({"cwd": cwd, "mcpServers": servers}, **extra),
+                                      self.args.rpc_timeout)
+            session_id = opened.get("sessionId") if isinstance(opened, dict) else None
+            if not session_id:
+                raise AcpError("session/new returned no sessionId")
+            self.turns = 0
+            self.log("new shared session", session_id)
+        self.session_id, turn.opened = session_id, True
+        self.file.write({"session_id": session_id, "cwd": cwd, "turns": self.turns,
+                         **({"auth": self.auth} if self.auth else {})})
+        models = (opened or {}).get("models") if isinstance(opened, dict) else None
+        if isinstance(models, dict) and models:
+            self.models = models
+            self.model = str(models.get("currentModelId") or "")
+            if self.on_models is not None:
+                self.on_models(models)
+
+    def _use_model(self, wanted, turn):
+        """Switch the shared Session to `wanted` when it is not on it: only to a model the Session lists (else
+        `turn.model_skipped` says so and nothing is sent); a refused switch is logged and the turn runs on as is."""
+        if wanted and wanted != self.model:
+            offered = offered_model_ids(self.models)
+            if offered is not None and wanted not in offered:
+                self.log("model", wanted, "is not offered by this session (offered: %s); session/set_model not sent"
+                         % (", ".join(offered) or "none"))
+                turn.model_skipped = wanted
+            else:
+                try:
+                    self.client.call("session/set_model", {"sessionId": self.session_id, "modelId": wanted},
+                                     self.args.rpc_timeout)
+                    self.model = wanted
+                except (AcpTimeout, AcpGone):
+                    raise
+                except AcpError as e:
+                    self.log("session/set_model refused; the turn runs on", self.model or "the agent's own model", "-",
+                             str(e)[:200])
+        turn.model = self.model
+
+    def run_turn(self, prompt, decide, media=None, model=None, view=None):
+        """One turn on the shared Session: (status, text, detail, turn) as `run_prompt` gives them."""
+        turn = Turn()
+        turn.view = view
+        self._turn, self._decide = turn, decide
+        try:
+            for attempt in (1, 2):   # every path of the second attempt returns
+                sent = False
+                try:
+                    why = self.restart_reason()
+                    if why:
+                        if why != "not started":
+                            self.log("restarting the agent:", why)
+                        self.start()
+                    if self.session_id and self.turn_cap and self.turns >= self.turn_cap:
+                        self.log("shared session", self.session_id, "reached its cap of %d turns" % self.turn_cap)
+                        self.session_id = None
+                    if self.session_id is None:
+                        self._open(turn)
+                    turn.session_id = self.session_id
+                    self._use_model(model, turn)
+                    _, prompt_caps, _ = self._caps()
+                    images = media.blocks() if media and prompt_caps.get("image") is True else []
+                    note = media.note(bool(images)) if media else ""
+                    params = {"sessionId": self.session_id, "prompt": [{"type": "text", "text": prompt}] + images
+                              + ([{"type": "text", "text": note}] if note else [])}
+                    turn.live, sent = True, True
+                    res = self.client.call("session/prompt", params, self.args.turn_timeout)
+                except OSError as e:
+                    self.close()
+                    return "failed", "", "the ACP command did not start (%s)" % e, turn
+                except AcpTimeout as e:
+                    if sent:
+                        self.log("turn timeout; session/cancel", self.session_id, "and restarting the agent")
+                        with contextlib.suppress(AcpError):
+                            self.client.notify("session/cancel", {"sessionId": self.session_id})
+                    self.close()
+                    if sent:
+                        return "timeout", turn.text, "not finished after %ss" % self.args.turn_timeout, turn
+                    if attempt == 2:
+                        return "timeout", turn.text, str(e), turn
+                    self.log("agent did not answer before the prompt (%s); restarting and trying once more" % e)
+                    turn.resumed = turn.opened = False
+                    continue
+                except AcpGone as e:
+                    self.close()
+                    if sent or attempt == 2:
+                        return "gone", turn.text, str(e), turn
+                    self.log("agent went away before the prompt (%s); restarting and trying once more" % e)
+                    turn.resumed = turn.opened = False
+                    continue
+                except AcpError as e:
+                    if e.code == AUTH_REQUIRED:
+                        self.close()   # signed out: the next turn starts a fresh process, which reads the sign-in again
+                        return "failed", turn.text, self.not_signed_in % e, turn
+                    if not sent:
+                        self.close()
+                    return "failed", turn.text, str(e), turn
+                stop = res.get("stopReason") or ""
+                self.turns += 1
+                rec = self.file.read() or {}
+                if rec.get("session_id") == self.session_id:
+                    with contextlib.suppress(OSError):
+                        self.file.write(dict(rec, turns=self.turns))
+                return ("completed" if stop in COMPLETED_STOPS else
+                        "cancelled" if stop == "cancelled" else "failed"), turn.text, stop or "no stopReason", turn
+        finally:
+            self._turn, self._decide = None, None

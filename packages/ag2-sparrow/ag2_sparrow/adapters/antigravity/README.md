@@ -2,10 +2,24 @@
 
 Runs Google's Antigravity CLI (`agy`) on this computer as an s.space agent, the way
 `ag2-sparrow-claude-local` and `ag2-sparrow-codex-local` run Claude Code and Codex: people @-mention the
-agent in a room and Antigravity answers there. For each task file Sparrow queues, the connector wakes
-Antigravity over the Agent Client Protocol: it spawns `agy acp`, sends `initialize`, resumes the room's
-Session with `session/load` (or opens one with `session/new`) and sends one `session/prompt`; a
-guest's turn runs isolated instead (see Tiers and permissions). Stdlib only;
+agent in a room and Antigravity answers there. The connector talks to Antigravity over the Agent Client
+Protocol, the way the local Claude Code connector keeps one session: one long-lived `agy acp` process
+(started once: `initialize`, then the app key's `authenticate`) and one shared Session for the owner's and
+attested collaborators' turns from every room, each turn one `session/prompt`; a restricted sender's turn
+runs isolated instead, in a short process of its own (see Tiers and permissions). Turns run one at a time.
+
+**The shared Session.** Opened once with the AG2 Space MCP server attached (owner and collaborator get the
+same grant), its id kept in `state/shared-session.json` (0600) with its working directory, auth mode and
+turn count, and resumed with `session/load` after a restart. Every prompt starts with a line naming the
+room, the sender and that the reply goes back to that room; a collaborator's prompt carries the same
+non-owner note claude-local adds. Replies are routed by task, as before. agy is restarted when its process
+exited, a request timed out, a turn hit a sign-in or quota error, or the app's Gemini API key was saved or
+removed; a turn whose prompt was not sent yet is tried once more on the fresh process. A saved Session
+opened under the other auth mode, or one agy refuses to load, is replaced by a new one, and the log says so.
+`--shared-session-turns N` starts a new shared Session after N turns (default 0: never); agy reports no
+context compaction over ACP that the connector could act on. Each turn's attachments are copied into a
+folder of its own under `state/acp-media`, which the Session gets as its additional directory. The per-room
+Sessions of earlier releases (`state/sessions.json`) are no longer used, and left in place. Stdlib only;
 opt-in; the core never imports it.
 
 Status: the handshake and the sign-in check were run against a real `agy` 1.5.9 (signed out); a full turn
@@ -91,11 +105,18 @@ message body changes nothing); the adapter only maps its verdict to a turn (`TUR
 | `turn_policy` verdict | Who | Turn |
 | --- | --- | --- |
 | owner | the owner | the owner's turn |
-| collaborator | an attested collaborator (Team: `team` + the broker's `collaborator: true`) | the owner's turn, with a Session of their own per room |
+| collaborator | an attested collaborator (Team: `team` + the broker's `collaborator: true`) | the owner's turn, on the shared Session; with `--no-allow-collaborator`, the isolated read-only turn below |
 | restricted | a guest, plain team (no collaborator stamp), any unknown tier | the isolated read-only turn below |
 | refused | (not reached here: every non-owner who is not a collaborator is served restricted, as Sutando answers them) | one refusal line, agy not started |
 
 No flag is needed for any of them; `--allow-non-owner` still parses and changes nothing.
+
+**Opting collaborators out.** Collaborators share the owner's Session by default (`--allow-collaborator`).
+`install --no-allow-collaborator` records `ALLOW_COLLABORATOR=0`: an attested collaborator is then served
+exactly as a guest is (the isolated read-only turn, its own throwaway Session and agy home, no AG2 Space tools),
+never the owner's Session, history, tools or key. Every reinstall keeps the recorded choice unless one of the
+two flags is given again: a repair by selector, an `install` with the agent's token file or `--token-stdin`,
+and the app's own reinstall after an update (`--replace-install`). `verify` says which is in force.
 
 Every turn runs on the owner's agy sign-in (the Google account and quota in the Keychain): giving someone
 Collaborator access to this agent lets them spend that quota, and their turns may read and edit the
@@ -110,9 +131,8 @@ hand-off to the owner verbatim (`tier_block_lines`). The final reply is scanned 
 
 **The owner's turn** (the owner and Team, decided by the owner on 2026-11-21) runs in the working
 directory with agy's own home (`~/.gemini`: its settings, rules and context) under the owner's permission
-policy below. The owner resumes the room's Session; each collaborator resumes a Session of their own for
-the room (keyed by their user id), so no one resumes another's conversation. A collaborator is still framed
-as not the owner.
+policy below, on the one shared Session (as claude-local puts owner and collaborators in its one session).
+Each prompt names its room and sender first. A collaborator is still framed as not the owner.
 
 **A restricted turn** (a guest, plain team, an unknown tier) runs isolated:
 
@@ -142,7 +162,11 @@ the owner has picked one (`wanted` there), the turn first calls `session/set_mod
 from the next message with nothing restarted. A refused `session/set_model` is logged, told to the owner
 (below) and the turn runs on the Session's own model; the model a turn ran on is `model` in
 `metrics.jsonl`, and `model_switch` there is `switched` or `not-switched` on the turn that settled a
-pick. Guest turns are not switched.
+pick. Guest turns are not switched. On the shared Session the switch is sent once, and only to a model
+the Session lists in `availableModels` (from `session/new` or `session/load`): a pick it does not list is
+never sent (agy answers an unknown id with "Unknown model ID"); the owner's card says the switch did not
+happen ("this Antigravity session does not offer it"), once, and the pick is kept for a Session that offers
+it. When a Session lists no models at all, the switch is asked for as before.
 
 The owner picks from a card, and asks for it in their own words. Each of the owner's turns (not a
 collaborator's) ends with one more line telling agy to answer a question about its model with the mark
@@ -156,8 +180,8 @@ model, at most six. A tap comes back as a task with `card_click`; it is judged b
 owner tapped a card this agent posted, in that DM. It then records the pick and posts a card with no
 buttons saying the switch comes with the next message, which retires the first card's buttons. After
 the next owner turn that opens a Session, one more card in that DM says what happened: "Switched. I'm
-now using X.", or that the switch was refused and which model is still in use (the refused pick is
-dropped, not retried). The owner is never left to infer a switch from silence. Any other tap
+now using X.", or that the switch was refused and which model is still in use (a pick agy refused is
+dropped, not retried; one the Session does not list is kept). The owner is never left to infer a switch from silence. Any other tap
 gets the fixed "couldn't match that button" line and reaches neither agy nor the record. `/model` before
 any turn has run answers that the models are not known yet; in a shared room it is ordinary words.
 
@@ -239,7 +263,15 @@ as is or base64 JSON `{"tag", "value"}`). After `initialize`, when agy lists `ge
 key, the Google sign-in is left untouched. Guest turns (`--gemini-dir`) never get the key. The key goes only
 into that request on agy's stdin: never argv, environment or logs. Each saved Session records its auth mode
 (`auth`: `sign-in` or `gemini-api-key`, none = `sign-in`); a Session opened under the other mode is not
-resumed (resuming a sign-in Session still bills the Google account's quota), a new one is opened.
+resumed (resuming a sign-in Session still bills the Google account's quota), a new one is opened. Saving,
+replacing (A to B) or removing the key restarts the long-lived agy before the next turn, which then resumes
+the shared Session. The change is seen in this agent's own item's attributes, read before each owner or
+collaborator turn with one `security find-generic-password` without `-w`/`-g` (never the key, and no other
+agent's item; a bounded subprocess, no Keychain prompt): the item version the app sets in its generic attribute
+(`gena`, `ag2v1-` and 32 random hex digits, new on every paste, saved-key pick or write), or, for an item an older
+app wrote with no version, its creation and modification dates. A dates-only marker misses a replacement in the
+same second; that case is covered once the app that sets the version ships. A query that fails other than "not
+found" is unknown: no restart, and the next good read is compared with the last known marker.
 `AG2_AGY_GEMINI_KEY=0` in the connector's environment turns this off. See `gemini_key.py`.
 
 ## The account card

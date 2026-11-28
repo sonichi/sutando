@@ -132,11 +132,13 @@ class AgyAccount:
     asks = staticmethod(lambda text: asks_for_card(text))
     CARD_ID = account_switch.CARD
 
-    def __init__(self, state_dir, bridge_state, name, agent_id, publish, quoted, log, saved=None, clear=None):
+    def __init__(self, state_dir, bridge_state, name, agent_id, publish, quoted, log, saved=None, clear=None,
+                 marker=None):
         self.state_dir, self.bridge_state, self.name, self.agent_id = state_dir, bridge_state, name, agent_id or ""
         self.publish, self.quoted, self.log = publish, quoted, log
         self.saved = saved or (lambda: gemini_key.key_saved(self.agent_id))
         self.clear = clear or (lambda: gemini_key.clear_key(self.agent_id))
+        self.marker = marker or (lambda: gemini_key.key_marker(self.agent_id))
 
     # ── state (no secret: the account's shortened name and when the quota card was last shown) ──
     def record(self) -> dict:
@@ -163,6 +165,10 @@ class AgyAccount:
         except Exception as e:  # noqa: BLE001 - unknown reads as the sign-in, which agy falls back to
             self.log("Gemini API key not checked:", type(e).__name__)
             return False
+
+    def key_marker(self) -> str:
+        """This agent's own key item's change marker (gemini_key.key_marker): no secret, '' when none is saved."""
+        return self.marker()
 
     def using(self, keyed=None) -> str:
         keyed = self.keyed() if keyed is None else keyed

@@ -15,6 +15,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -698,6 +699,7 @@ class ConnectorTest(unittest.TestCase):
             kept = json.loads(state.read_text())
             state.write_text(json.dumps(dict(kept, wanted="no-such-model", told="")))     # pick B, during the outage
             (self.w.home / "set-model-fails").write_text("")
+            (self.w.home / "models").unlink()     # the resumed Session lists none: the switch is asked, and refused
             self.w.task("task-2", "STUB:TEXT again")
             self.w.serve()                                  # B is refused: settled now, though A's notice is still owed
             settled = json.loads(state.read_text())
@@ -1080,7 +1082,10 @@ class ConnectorTest(unittest.TestCase):
         self.w.serve(1, "--allow-non-owner")
         self.assertTrue(self.w.result("task-2").startswith("[no-send]"))
 
-    def test_the_owner_turn_keeps_its_home_directory_and_room_session(self):
+    def shared(self):
+        return json.loads((self.w.root / "state" / acp_host.SHARED_NAME).read_text())
+
+    def test_the_owner_turn_keeps_its_home_directory_and_the_shared_session(self):
         home = self.owner_home_with_context()
         self.w.task("task-1", "STUB:TEXT hi")
         self.w.serve()
@@ -1090,8 +1095,9 @@ class ConnectorTest(unittest.TestCase):
         self.assertNotIn("session/set_mode", self.w.methods())
         new = next(r for r in self.w.records() if r.get("method") == "session/new")
         self.assertEqual(new["params"]["cwd"], str(self.w.cwd))
-        store = acp_host.SessionStore(self.w.root / "state" / gc.SESSIONS_NAME)
-        self.assertEqual(store.get(("!room:s.space", "owner"))["session_id"], "s-1")
+        self.assertEqual(self.shared()["session_id"], "s-1")
+        self.assertEqual(os.stat(self.w.root / "state" / acp_host.SHARED_NAME).st_mode & 0o777, 0o600)
+        self.assertFalse((self.w.root / "state" / gc.SESSIONS_NAME).exists(), "no per-room Session any more")
         self.assertFalse(self.w.metrics()[0]["isolated"])
 
     def test_the_read_only_mode_is_picked_by_id_or_name(self):
@@ -1131,9 +1137,9 @@ class ConnectorTest(unittest.TestCase):
         prompt = next(r["text"] for r in self.w.records() if r.get("method") == "session/prompt")
         self.assertIn("You may read and edit files under %s." % self.w.cwd, prompt)
         self.assertIn("The sender is not your owner.", prompt, "a collaborator is still framed as not the owner")
-        store = acp_host.SessionStore(self.w.root / "state" / gc.SESSIONS_NAME)
-        self.assertIsNotNone(store.get(("!room:s.space", "collaborator:@alice:s.space")), "their own Session")
-        self.assertIsNone(store.get(("!room:s.space", "owner")), "never the owner's Session")
+        self.assertEqual(len(self.boots()), 1, "one long-lived agy for both turns")
+        self.assertEqual({r["sessionId"] for r in self.w.records() if r.get("method") == "session/prompt"},
+                         {self.shared()["session_id"]}, "the one shared Session")
 
     def test_a_collaborator_turn_can_do_exactly_what_an_owner_turn_can_without_the_owners_shell_switch(self):
         owner = self.edit_and_shell()[:2]
@@ -1143,7 +1149,7 @@ class ConnectorTest(unittest.TestCase):
                 self.setUp()
                 self.assertEqual(self.edit_and_shell(*extra, tier="team", collaborator=True)[:2], owner)
 
-    def test_a_collaborator_resumes_a_session_of_their_own_beside_the_owner(self):
+    def test_a_collaborator_shares_the_owners_session_across_restarts(self):
         self.w.task("task-1", "STUB:TEXT hi", tier="team", collaborator=True)
         self.w.task("task-2", "STUB:TEXT hi")
         os.utime(self.w.root / "tasks" / "task-2.txt", (2e9, 2e9))
@@ -1153,12 +1159,11 @@ class ConnectorTest(unittest.TestCase):
         self.assertEqual([self.w.result(t) for t in ("task-1", "task-2", "task-3")], ["hello from agy-stub\n"] * 3)
         self.assertEqual([(m["tier"], m["isolated"]) for m in self.w.metrics()],
                          [("team", False), ("owner", False), ("team", False)])
-        store = acp_host.SessionStore(self.w.root / "state" / gc.SESSIONS_NAME)
-        mine, owners = store.get(("!room:s.space", "collaborator:@alice:s.space")), store.get(("!room:s.space", "owner"))
-        self.assertNotEqual(mine["session_id"], owners["session_id"])
-        self.assertEqual((mine["turns"], owners["turns"]), (2, 1))
+        shared = self.shared()
+        self.assertEqual((shared["session_id"], shared["turns"]), ("s-1", 3))
+        self.assertEqual([r["sessionId"] for r in self.w.records() if r.get("method") == "session/prompt"], ["s-1"] * 3)
         loaded = [r["params"]["sessionId"] for r in self.w.records() if r.get("method") == "session/load"]
-        self.assertEqual(loaded, [mine["session_id"]])
+        self.assertEqual(loaded, ["s-1"], "the second connector run resumes it")
 
     def test_a_collaborator_turn_needs_no_read_only_mode(self):
         (self.w.home / "no-modes").write_text("")
@@ -1192,7 +1197,8 @@ class ConnectorTest(unittest.TestCase):
         self.assertEqual([(m["tier"], m["policy"], m["isolated"], m["status"]) for m in self.w.metrics()],
                          [(t, k, iso, "completed") for t, _c, k, iso in cases])
         boots = self.boots()
-        self.assertEqual(["--gemini-dir" in b["argv"] for b in boots], [iso for *_x, iso in cases])
+        # One long-lived agy for the owner and the collaborator, then a short one per restricted turn.
+        self.assertEqual(["--gemini-dir" in b["argv"] for b in boots], [False, True, True])
 
     def routed(self, verdict, **task):
         """Serve one task with turn_policy stubbed to answer `verdict`; return (metrics row, boots, prompt)."""
@@ -1412,14 +1418,14 @@ class ConnectorTest(unittest.TestCase):
         prompt = next(r["text"] for r in self.w.records() if r.get("method") == "session/prompt")
         self.assertNotIn("you may read these files", prompt)
 
-    def test_a_room_keeps_its_session_and_replayed_history_is_not_the_answer(self):
+    def test_the_shared_session_is_resumed_and_replayed_history_is_not_the_answer(self):
         self.w.task("task-1", "STUB:TEXT one")
         self.w.serve()
         self.w.task("task-2", "STUB:TEXT two")
         self.w.serve()
         self.assertIn("session/load", self.w.methods())
         self.assertEqual(self.w.result("task-2"), "hello from agy-stub\n")
-        rec = acp_host.SessionStore(self.w.root / "state" / gc.SESSIONS_NAME).get(("!room:s.space", "owner"))
+        rec = json.loads((self.w.root / "state" / acp_host.SHARED_NAME).read_text())
         self.assertEqual((rec["session_id"], rec["turns"]), ("s-1", 2))
 
     def test_message_and_event_prompts_say_how_to_answer(self):
@@ -1690,8 +1696,9 @@ class MediaAndMarkersTest(unittest.TestCase):
         self.assertEqual(blocks[1], {"type": "image", "mimeType": "image/png", "data": len(
             __import__("base64").b64encode(PNG))})
         (dirs,) = self.session_dirs()
-        self.assertEqual(len(dirs), 1)
-        folder = dirs[0]
+        self.assertEqual(dirs, [os.path.realpath(self.w.root / "state" / acp_host.MEDIA_ROOT_NAME)], "the shared media root")
+        folder = os.path.dirname(re.search(r"read-only copy at (\S+?);", self.prompt_rec()["text"]).group(1))
+        self.assertEqual(os.path.dirname(folder), dirs[0], "the turn's own folder, inside the root")
         self.assertTrue(os.path.basename(folder).startswith(acp_host.MEDIA_PREFIX), folder)
         self.assertFalse(folder.startswith(str(self.w.cwd)))
         reads = {r["read"]: r["bytes"] for r in self.w.records() if "read" in r}
@@ -1727,7 +1734,7 @@ class MediaAndMarkersTest(unittest.TestCase):
             status, text, _, turn = gc.Connector(a).run_turn("task-1", headers, "STUB:MEDIA " + message, True)
         self.assertEqual(status, "completed")
         (dirs,) = self.session_dirs()
-        self.assertTrue(dirs and os.path.basename(dirs[0]).startswith(acp_host.MEDIA_PREFIX))
+        self.assertEqual(dirs, [os.path.realpath(os.path.join(a.state, acp_host.MEDIA_ROOT_NAME))])
         self.assertIn("a read of the task's own attachments", [d["reason"] for d in turn.decisions])
 
     def test_an_isolated_turn_gets_its_images_but_no_file_access(self):
@@ -1833,7 +1840,8 @@ class MediaAndMarkersTest(unittest.TestCase):
         with mock.patch("os.chmod", chmod):
             self.w.serve()
         self.assertEqual(self.w.metrics()[0]["status"], "completed")
-        self.assertEqual(self.session_dirs(), [None])
+        self.assertEqual(self.session_dirs(), [[os.path.realpath(self.w.root / "state" / acp_host.MEDIA_ROOT_NAME)]],
+                         "the empty media root only")
         prompt = self.prompt_rec()
         self.assertEqual([b["type"] for b in prompt["blocks"]], ["text", "image", "text"])
         self.assertIn("not readable in this session", prompt["text"])
@@ -2241,6 +2249,56 @@ class InstallVerifyTest(unittest.TestCase):
                       out)
         self.assertNotIn("collaborators refused", out)
 
+    def test_the_collaborator_opt_out_is_recorded_kept_on_every_reinstall_and_undone_only_by_the_flag(self):
+        rc, seen, out = self.install()
+        self.assertEqual((rc, seen["values"]["ALLOW_COLLABORATOR"]), (0, "1"), "the default: shared")
+        rc, seen, out = self.install("--no-allow-collaborator")
+        self.assertEqual((rc, seen["values"]["ALLOW_COLLABORATOR"]), (0, "0"), out)
+        self.write_config(ALLOW_COLLABORATOR="0")
+        for extra in ((), ("--replace-install",)):    # a repair by its selector, and an updated app's reinstall
+            rc, seen, out = self.install(*extra)
+            self.assertEqual((rc, seen["values"]["ALLOW_COLLABORATOR"]), (0, "0"), (extra, out))
+        rc, seen, out = self.install("--allow-collaborator")
+        self.assertEqual((rc, seen["values"]["ALLOW_COLLABORATOR"]), (0, "1"), "only the flag re-enables")
+        self.write_config(ALLOW_COLLABORATOR="1")
+        self.assertEqual(self.install()[1]["values"]["ALLOW_COLLABORATOR"], "1")
+        self.write_config()                        # an older config with no such key: the default
+        self.assertEqual(self.install()[1]["values"]["ALLOW_COLLABORATOR"], "1")
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            self.install("--allow-collaborator", "--no-allow-collaborator")   # one or the other
+
+    def test_an_agents_own_job_keeps_its_opt_out_on_a_token_reinstall(self):
+        # The app's update reinstalls with the agent's token file or --token-stdin: both read the job's own config.
+        job, why = cm.agent_job(cli.LOCAL, "@agy:s.space")
+        self.assertEqual(why, "")
+        path = cli.config_path(job)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(cm.render_config(job, {"ACP_COMMAND": "agy acp", "CWD": "/c", "INBOX_DIR": "/i",
+                                               "RESULTS_DIR": "/r", "ROOT": "/w", "ALLOW_COLLABORATOR": "0"}))
+        given = lambda **kw: argparse.Namespace(**kw)  # noqa: E731
+        self.assertEqual(cli.collaborator_choice(given(), job), "0")
+        self.assertEqual(cli.collaborator_choice(given(allow_collaborator=True), job), "1")
+        self.assertEqual(cli.collaborator_choice(given(no_allow_collaborator=True), cli.LOCAL), "0")
+        self.assertEqual(cli.collaborator_choice(given(), cli.LOCAL), "1", "another job's config is not read")
+
+    def test_the_connector_gets_the_opt_out_and_help_and_verify_name_it(self):
+        cfg = {"ACP_COMMAND": "%s acp" % self.agy, "CWD": str(self.cwd), "ALLOW_COLLABORATOR": "0"}
+        self.assertIn("--no-allow-collaborator", cli.connector_argv(cfg, str(self.work), 7))
+        for value in ("1", ""):
+            self.assertNotIn("--no-allow-collaborator", cli.connector_argv(dict(cfg, ALLOW_COLLABORATOR=value),
+                                                                           str(self.work), 7))
+        self.assertIn("ALLOW_COLLABORATOR", cli.CONFIG_KEYS)
+        self.assertTrue(gc.build_parser().parse_args(["--work", "/w", "--no-allow-collaborator"]).no_allow_collaborator)
+        out = io.StringIO()
+        with self.assertRaises(SystemExit), contextlib.redirect_stdout(out):
+            cli.main(["install", "--help"])
+        out = out.getvalue()
+        for flag in ("--allow-collaborator", "--no-allow-collaborator"):
+            self.assertIn(flag, out)
+        self.write_config(ALLOW_COLLABORATOR="0")
+        _rc, out = self.verify("--no-probe")
+        self.assertIn("INFO team (attested collaborator): opted out (--no-allow-collaborator)", out)
+
     def test_verify_fails_when_agy_does_not_start_or_answer(self):
         self.write_config()
         self.agy.write_text("#!/bin/sh\nexit 3\n")
@@ -2359,7 +2417,7 @@ class SspaceToolsTest(unittest.TestCase):
         self.w.task("task-3", "STUB:TEXT hi", channel="!c:s.space")
         err = self.serve(token=False)
         self.assertIn("no --token-env-file", err)
-        self.assertEqual(self.sent("session/new"), [[], [], []])
+        self.assertEqual(self.sent("session/new") + self.sent("session/load"), [[], [], []])
         self.assertEqual(self.minted, [], "nothing is minted for a Session that cannot use it")
 
     def test_a_failed_exchange_runs_the_turn_without_the_tools(self):
