@@ -141,6 +141,7 @@ def owner_alone(environ=None) -> bool:
 
 
 TOOLS_MARK = ("state", "room-tools", "session.json")    # hold.mark_tools_generation writes it
+TOOLS_SESSION_LIVE = "the session that has, or had, the room tools is still running: owner only until it is stopped"
 
 
 def tools_generation(root, generation) -> "bool | None":
@@ -478,10 +479,12 @@ def claim(root, task_id) -> dict:
                 # A tap on the model card, or the owner's /model: answered here, never submitted to the session.
                 outcome = lc.complete_without_call(task_id, body, "card: %s" % carded)
                 raise Refused("%s answered by its card (%s); its answer is %s" % (task_id, carded, outcome))
-            # A session running with the room tools takes the owner's tasks only: a collaborator's is answered
-            # outside it. A mark that cannot be read is taken as "with the tools" (never admitted on a doubt).
-            outside = kind == task_io.RESTRICTED or (kind == task_io.COLLABORATOR
-                                                     and tools_generation(root, generation) is not False)
+            # While the session started with the room tools runs on (or its mark cannot be read), nobody but the
+            # owner is served: not in it, and not by a turn started beside it, whatever the install now allows.
+            if kind != task_io.OWNER and tools_generation(root, generation) is not False:
+                outcome = lc.complete_without_call(task_id, refusal_body(root, headers), TOOLS_SESSION_LIVE)
+                raise Refused("%s not admitted (%s); the owner-only refusal is %s" % (task_id, TOOLS_SESSION_LIVE, outcome))
+            outside = kind == task_io.RESTRICTED
             try:
                 attempt = lc.prepare(task_id, INTERRUPTED_BODY, mode=lifecycle.LOCAL, generation=generation)
                 if outside:

@@ -233,7 +233,8 @@ PREVIEW_NOTE = ("NOTE mcp: room tools preview. It is on only while nobody but yo
 
 OWNER_ALONE_NOTE = ("NOTE mcp: the room tools preview needs an install that serves nobody but the owner: both "
                     "--no-allow-collaborator and --no-allow-non-owner. This one serves others, so the session gets "
-                    "no AG2 Space tools; a conversation that had them stays the owner's alone.")
+                    "no AG2 Space tools; a conversation that had them stays the owner's alone, and while a session "
+                    "started with them still runs, nobody but the owner is answered: stop the job first.")
 
 
 def owner_only_sessions(cfg: dict) -> list:
@@ -252,8 +253,8 @@ def room_tools_session(old: dict, values: dict, session_id: str, kept: str, resu
         history.append(was)
     now = got.get("SESSION_ID", session_id)
     if now in history and now != got["ROOM_TOOLS_SESSION"]:
-        print(f"NOTE mcp: the conversation {now} once had the AG2 Space tools: it stays the owner's alone (a "
-              "collaborator's task is answered outside it), and it runs without the tools")
+        print(f"NOTE mcp: the conversation {now} once had the AG2 Space tools: it stays the owner's alone (nobody "
+              "else is answered while a session on it runs), and it runs without the tools")
     return dict(got, OWNER_ONLY_SESSIONS=" ".join(history))
 
 
@@ -968,9 +969,10 @@ def session_options(p) -> None:
                      "transcript must be under the config dir's projects/, and no other process may have it open) "
                      "instead of a new one; replaces a kept id only once the old session is proven gone")
     p.add_argument("--mcp-proxy-command", help="the stdio ag2-mcp-proxy command line ('<node> <the desktop app's "
-                   "engine/ag2-mcp-proxy.mjs>'), each path quoted when it has a space: the session (the owner's and "
-                   "attested collaborators' turns) gets the AG2 Space tools as this agent, through --mcp-config; "
-                   "needs the agent's own token file and --room-tools-preview (default: none, no AG2 Space tools)")
+                   "engine/ag2-mcp-proxy.mjs>'), each path quoted when it has a space: recorded only. The session gets "
+                   "the AG2 Space tools as this agent, for the owner's turns alone, only with --room-tools-preview, "
+                   "both --no-allow-collaborator and --no-allow-non-owner, and the agent's own token file "
+                   "(default: none, no AG2 Space tools)")
     p.add_argument("--room-tools-preview", action="store_true",
                    help="preview, off by default: with --mcp-proxy-command and both --no-allow-collaborator and "
                         "--no-allow-non-owner, start a new conversation that has the AG2 Space tools and takes only "

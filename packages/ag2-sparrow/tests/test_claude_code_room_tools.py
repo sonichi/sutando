@@ -34,7 +34,7 @@ from claude_code_fixtures import (  # noqa: E402
     AgentRootBase, cli, cm, ConnectBase, hold_consumer, hold_mod, inbox, isolated_runs, SESSION_ID, unhold,
     write_isolated_stub,
 )
-from ag2_sparrow import mcp_auth, mcp_name_shim, mcp_stdio, task_lifecycle as lifecycle  # noqa: E402
+from ag2_sparrow import mcp_auth, mcp_name_shim, mcp_stdio, task_io, task_lifecycle as lifecycle  # noqa: E402
 
 SECRET = "relay-secret-do-not-leak"
 AGENT = "@cl:s.space"
@@ -551,13 +551,9 @@ class OnlyTheOwnersSessionHasRoomTools(ConnectBase):
         self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_OPENED))
         rc, out = self.claim("task-c", "team", "collaborator: true\n")
         self.assertEqual((rc, "admission" in out), (1, False), out)
-        self.assertIn("never submitted to this session", out["refused"])
-        run, = isolated_runs(self.home)
-        self.assertEqual(run["argv"], list(inbox.isolated.TURN_ARGV))
-        self.assertIn("--strict-mcp-config", run["argv"])
-        self.assertNotIn("--mcp-config", run["argv"])
-        self.assertFalse({k for k in run["env"] if k.startswith("AG2_MCP")}, "nothing of the tools reaches its turn")
-        self.assertTrue((self.results / "task-c.txt").exists(), "and it is answered")
+        self.assertIn(inbox.TOOLS_SESSION_LIVE, out["refused"])
+        self.assertEqual(isolated_runs(self.home), [], "no turn is started beside the session either")
+        self.assertEqual((self.results / "task-c.txt").read_text(), task_io.NON_OWNER_REFUSED, "it is told so")
         self.tighten()
         self.assertEqual(self.call(), (True, ""), "the owner's turn is not closed by it")
 
@@ -596,8 +592,8 @@ class OnlyTheOwnersSessionHasRoomTools(ConnectBase):
         cli.config_path().write_text(changed)
         rc, out = self.claim("task-c2", "team", "collaborator: true\n")
         self.assertEqual((rc, "admission" in out), (1, False), out)
-        self.assertIn("never submitted to this session", out["refused"])
-        self.assertEqual(len(isolated_runs(self.home)), 1)
+        self.assertIn(inbox.TOOLS_SESSION_LIVE, out["refused"])
+        self.assertEqual(isolated_runs(self.home), [])
         cli.config_path().write_text("not a config\n")
         rc, out = self.claim("task-c3", "team", "collaborator: true\n")
         self.assertEqual((rc, "admission" in out), (1, False), "an unreadable config admits nobody: %s" % out)
@@ -634,8 +630,8 @@ class OnlyTheOwnersSessionHasRoomTools(ConnectBase):
                 self.assertIsNone(inbox.tools_generation(self.root, gen), "pid and start time are both needed")
                 rc, out = self.claim("task-c%d" % i, "team", "collaborator: true\n")
                 self.assertEqual((rc, "admission" in out), (1, False), "kept outside the session: %s" % out)
-                self.assertIn("never submitted to this session", out["refused"])
-        self.assertEqual(len(isolated_runs(self.home)), len(halves))
+                self.assertIn(inbox.TOOLS_SESSION_LIVE, out["refused"])
+        self.assertEqual(isolated_runs(self.home), [], "and no turn is started for it on a doubt")
         self.tighten()
         rc, out = self.claim("task-o", "owner")
         self.phase("task-o", lifecycle.TURN_CONFIRMED)
@@ -725,12 +721,12 @@ class OnlyTheOwnersSessionHasRoomTools(ConnectBase):
         for over in ({}, {"ALLOW_COLLABORATOR": "0"}, {"ALLOW_NON_OWNER": "0"},
                      {"ALLOW_COLLABORATOR": "0", "ALLOW_NON_OWNER": "1"}, {"ALLOW_COLLABORATOR": None, "ALLOW_NON_OWNER": "0"}):
             lines = []
-            got = hold_mod.room_tools_argv(dict(base, **over), self.root, self.root, entry=self.fail, log=lines.append)
+            got = hold_mod.room_tools_argv(dict(base, **over), self.root, self.root, entry=self.no_exchange, log=lines.append)
             self.assertEqual(got, [], over)
             self.assertIn("serves collaborators or other non-owners", lines[0])
             self.assertTrue(hold_mod.tools_conversation(dict(base, **over)), "still the owner's alone: never shared")
 
-    def fail(self, *a, **kw):
+    def no_exchange(self, *a, **kw):
         raise AssertionError("no token exchange is attempted")
 
     def test_the_gate_reads_the_config_the_session_was_started_from(self):
@@ -740,6 +736,67 @@ class OnlyTheOwnersSessionHasRoomTools(ConnectBase):
         with mock.patch.dict(os.environ):
             os.environ.pop(hold_mod.ENV_CONFIG_DIR, None)
             self.assertNotIn("os.environ[", hold_mod.gate_argv(self.root)[3])
+
+    def test_loosening_either_setting_while_the_tools_session_runs_starts_nothing_for_a_non_owner(self):
+        self.with_tools()
+        senders = (("team", "collaborator: true\n"), ("team", ""), ("guest", ""))
+        n = 0
+        for over in ({"ALLOW_COLLABORATOR": "1"}, {"ALLOW_NON_OWNER": "1"},
+                     {"ALLOW_COLLABORATOR": "1", "ALLOW_NON_OWNER": "1"}):
+            self.tighten(**over)
+            for tier, extra in senders:
+                with self.subTest(over=over, tier=tier, extra=extra):
+                    n, task_id = n + 1, "task-n%d" % n
+                    rc, out = self.claim(task_id, tier, extra)
+                    self.assertEqual((rc, "admission" in out), (1, False), out)
+                    self.assertTrue((self.results / (task_id + ".txt")).exists(), "answered, by the refusal")
+        self.assertEqual(isolated_runs(self.home), [], "no non-owner process was started while it runs")
+        rc, out = self.claim("task-o", "owner")
+        self.assertEqual((rc, out.get("admission")), (0, "owner"), "the owner is still served: %s" % out)
+
+    def test_once_the_tools_session_is_gone_the_usual_non_owner_flow_is_back(self):
+        self.with_tools()
+        self.loosen()
+        rc, out = self.claim("task-g1", "guest")
+        self.assertIn(inbox.TOOLS_SESSION_LIVE, out["refused"])
+        self.assertEqual(isolated_runs(self.home), [])
+        # The preview left safely: its process stopped, and the next start (without the tools) cleared the mark.
+        self.assertTrue(hold_mod.mark_tools_generation(self.root))
+        self.assertIs(inbox.tools_generation(self.root, inbox._generation(self.root)), False)
+        rc, out = self.claim("task-g2", "guest")
+        self.assertEqual((rc, "admission" in out), (1, False), out)
+        self.assertIn("never submitted to this session", out["refused"])
+        run, = isolated_runs(self.home)
+        self.assertIn("--strict-mcp-config", run["argv"])
+        self.assertFalse({k for k in run["env"] if k.startswith("AG2_MCP")}, "nothing of the tools reaches its turn")
+        rc, out = self.claim("task-c", "team", "collaborator: true\n")
+        self.assertEqual((rc, out.get("admission")), (0, "collaborator"), "the shared session, as before: %s" % out)
+
+    def test_an_install_that_never_had_the_preview_serves_non_owners_as_before(self):
+        self.loosen(ROOM_TOOLS_PREVIEW="", ROOM_TOOLS_SESSION="")
+        rc, out = self.claim("task-c", "team", "collaborator: true\n")
+        self.assertEqual((rc, out.get("admission")), (0, "collaborator"), out)
+        rc, out = self.claim("task-g", "guest")
+        self.assertIn("never submitted to this session", out["refused"])
+        self.assertEqual(len(isolated_runs(self.home)), 1)
+
+    def test_a_resumed_preview_conversation_stays_the_owners_alone_whoever_the_install_serves(self):
+        # The session runs on a conversation that once had the tools (hold marks it), on an install that now
+        # serves everyone and has the preview off: nobody but the owner is answered while it runs.
+        resumed = dict(self.conf, ROOM_TOOLS_PREVIEW="", ROOM_TOOLS_SESSION="", OWNER_ONLY_SESSIONS=SESSION_ID,
+                       SESSION_ID=SESSION_ID)
+        self.assertTrue(hold_mod.tools_conversation(resumed))
+        self.assertFalse(hold_mod.tools_session(resumed))
+        self.with_tools()       # what hold writes for a start on such a conversation
+        self.loosen(ROOM_TOOLS_PREVIEW="", ROOM_TOOLS_SESSION="", OWNER_ONLY_SESSIONS=SESSION_ID)
+        for i, (tier, extra) in enumerate((("team", "collaborator: true\n"), ("guest", ""))):
+            rc, out = self.claim("task-r%d" % i, tier, extra)
+            self.assertEqual((rc, "admission" in out), (1, False), out)
+            self.assertIn(inbox.TOOLS_SESSION_LIVE, out["refused"])
+        self.assertEqual(isolated_runs(self.home), [])
+        rc, out = self.claim("task-o", "owner")
+        self.phase("task-o", lifecycle.TURN_CONFIRMED)
+        self.assertEqual(self.call(), (False, inbox.ROOM_TOOLS_OPENED), "and it has no tools")
 
     def test_a_gate_that_cannot_answer_refuses(self):
         def gated(raw, run):

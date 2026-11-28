@@ -303,8 +303,14 @@ A conversation that had the tools holds their results. When the preview is
 turned off, or the install starts serving others again, the next install leaves
 that conversation: the session goes back to the earlier one or a new one, and
 the tools' conversation is remembered (`OWNER_ONLY_SESSIONS`) as the owner's
-alone. Resumed later by its id, it runs without the tools and a collaborator's
-task is answered outside it. It never becomes the session collaborators share.
+alone. Resumed later by its id, it runs without the tools. It never becomes the
+session collaborators share.
+
+While a session started with the tools, or on a conversation that had them,
+still runs, `claim` answers every non-owner task with the owner-only refusal and
+starts nothing for it: no turn in the session and no separate `claude -p` turn
+beside it, whatever the install now allows. The usual non-owner flow is back
+once that session has stopped and the next one starts on another conversation.
 
 ## HMAC policy (mirrors `src/task_envelope.py`)
 
