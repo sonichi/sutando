@@ -29,6 +29,7 @@ except ImportError:
     from local_task_protocol import reply_action_text     # the repo's src/ on sys.path
 
 from . import recovery
+from .instance_actions import ACTION_KIND as INSTANCE_ACTION_KIND, parse as parse_instance_action
 from .manager import HitlManager
 from .schema import Action, ActionReply, HumanRequirement, MalformedActionError, StaleRequirementError, STATUS_IN_PROGRESS
 
@@ -159,6 +160,15 @@ class HitlReplyHandler:
             self.last_reason = "a recovery card is answered only in the room it was posted in"
             self._log(f"hitl: {reply.hitl_id} recovery tap from another room rejected")
             return claimed
+        pending = self._manager.get(reply.hitl_id)
+        offered = next((a for a in (pending.actions if pending is not None else [])
+                        if a.id == reply.action_id), None)
+        if offered is not None and offered.kind == INSTANCE_ACTION_KIND \
+                and parse_instance_action(offered.id) is None:
+            self.last_outcome = "rejected"
+            self.last_reason = "invalid managed instance action"
+            self._log(f"hitl: reply for {reply.hitl_id} rejected — {self.last_reason}")
+            return claimed
         try:
             action = self._manager.apply_action(reply)
         except (StaleRequirementError, MalformedActionError) as e:
@@ -183,7 +193,8 @@ class HitlReplyHandler:
             note = "; a turn follows"
         # A recovery id the card maps to a dialog option is a keystroke the monitor drives.
         keyed = ((req.subject or {}).get("option_for_action") or {}) if req is not None else {}
-        if action.kind == TUI_ACTION_KIND and self._workspace is not None and req is not None:
+        if action.kind in (TUI_ACTION_KIND, INSTANCE_ACTION_KIND) \
+                and self._workspace is not None and req is not None:
             note = f"; driver action {write_driver_action(self._workspace, req, action).name}"
         elif (recovery.is_recovery(action.id) and action.kind == recovery.kind_of(action.id)
               and action.id not in keyed and self._workspace is not None):

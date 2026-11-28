@@ -24,6 +24,7 @@ from hitl.schema import (  # noqa: E402
     HumanRequirement,
 )
 from hitl.replies import (  # noqa: E402
+    INSTANCE_ACTION_KIND,
     REPLY_FIELD,
     HitlReplyHandler,
     actions_dir,
@@ -286,6 +287,39 @@ class ReplyHandlerTests(unittest.TestCase):
                          {"session": "core-2", "socket": "/tmp/s.sock", "guard": "g7", "action_id": "1"})
         # The jump action is the client's, never the driver's.
         self.h.offer(event(reply_for(self.mgr.get(tui.id), "open_terminal"), eid="$e3"))
+        self.assertEqual(len(list(actions_dir(self.ws).glob("*.json"))), 1)
+
+    def test_remote_instance_desired_action_is_validated_before_the_driver_file(self):
+        from hitl import instance_actions
+        action_id = instance_actions.action_id("scratch", "stopped")
+        req = self.mgr.create(HumanRequirement(
+            kind="managed_instance", runtime="host", message="Stop Scratch?", guard="instance:g1",
+            device={"id": "host"}, actions=[Action(
+                id=action_id,
+                kind=INSTANCE_ACTION_KIND,
+                label="Stop",
+            )],
+        ))
+        self.h.offer(event(reply_for(req, action_id), eid="$instance"))
+        [path] = list(actions_dir(self.ws).glob("*.json"))
+        body = json.loads(path.read_text())
+        self.assertEqual(body["action_id"], "instance.set_desired:scratch:stopped")
+        self.assertEqual(body["guard"], "instance:g1")
+        with self.assertRaises(ValueError):
+            instance_actions.action_id("../scratch", "running")
+        self.assertIsNone(instance_actions.parse(None))
+
+        bad = self.mgr.create(HumanRequirement(
+            kind="managed_instance", runtime="host", message="Bad", guard="instance:g2",
+            device={"id": "host"}, actions=[Action(
+                id="instance.set_desired:../scratch:running",
+                kind=INSTANCE_ACTION_KIND,
+                label="Start",
+            )],
+        ))
+        self.h.offer(event(reply_for(bad, "instance.set_desired:../scratch:running"), eid="$bad"))
+        self.assertEqual(self.h.last_outcome, "rejected")
+        self.assertEqual(self.mgr.get(bad.id).status, "pending")
         self.assertEqual(len(list(actions_dir(self.ws).glob("*.json"))), 1)
 
     def test_turn_on_action_is_reported_after_an_applied_click_and_only_then(self):
