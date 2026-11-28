@@ -90,8 +90,9 @@ LOCAL_STATE_FILES = ("claude-local-plugin.json", "claude-local-supervisor.json",
 LOCAL_FEATURE_FILES = ("model.json", "account.json", "model-apply.log", "model-apply.lock", "quota-card.json",
                        "quota-room.json", "quota-seen.json", "account-remote.log")
 # Their directories: the cards this agent posted (issued_cards' ledger), the card-mark answers kept for a
-# staging retry, and the account switches asked of the desktop app (account_remote). Each a plain directory.
-STATE_OPTIONAL_DIRS = frozenset(("agent-cards", "card-marks", "account-remote"))
+# staging retry, the account switches asked of the desktop app (account_remote), and the session's AG2 Space
+# room tools (hold.ROOM_TOOLS_DIR: the MCP shim, descriptor, proxy log and --mcp-config). Each a plain directory.
+STATE_OPTIONAL_DIRS = frozenset(("agent-cards", "card-marks", "account-remote", "room-tools"))
 STATE_ALLOWED = frozenset(("format", "claims", "settled-ids", "rate.jsonl", "done", "collaborator-turns.json")
                           + LOCAL_STATE_FILES + LOCAL_FEATURE_FILES) | STATE_OPTIONAL_DIRS
 # Optional records the adapters rewrite in place: when present, each must be a plain file.

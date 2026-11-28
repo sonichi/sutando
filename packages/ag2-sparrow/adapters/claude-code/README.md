@@ -278,6 +278,51 @@ every submission as "The ag2space-inbox plugin sent a message", and the
 header line is the first line of that frame, so a second copy inside the body
 is visibly inside the data.
 
+## Room tools preview (`--room-tools-preview`)
+
+Off by default. With `--mcp-proxy-command` and the agent's own token file, the
+preview gives the session the AG2 Space room tools (`ag2-space`, acting as the
+agent). It is on only when all of these hold; anything missing or unknown means
+no tools:
+
+- `--room-tools-preview` was passed at install;
+- the install serves nobody but the owner: both `--no-allow-collaborator` and
+  `--no-allow-non-owner`, recorded as `ALLOW_COLLABORATOR=0` and
+  `ALLOW_NON_OWNER=0`. A key that is empty, absent or anything else counts as
+  serving them. The install defaults serve both, so a default install gets no
+  tools, and `install` prints a `NOTE mcp:` saying so;
+- the session is the conversation install started for the tools, one with no
+  earlier turn in it. A conversation with history is never given them.
+
+Each room-tool call is checked again by the name shim's gate (`inbox
+room-tools`): the install must still read as above, the running session must be
+the one started with the tools, and a turn of the owner's must be confirmed in
+it. So an install loosened while the session runs on closes the tools at once.
+
+A conversation that had the tools holds their results. When the preview is
+turned off, or the install starts serving others again, the next install leaves
+that conversation: the session goes back to the earlier one or a new one, and
+the tools' conversation is remembered (`OWNER_ONLY_SESSIONS`) as the owner's
+alone. Resumed later by its id, it runs without the tools. It never becomes the
+session collaborators share.
+
+That record must outlive the install config, which `uninstall` removes while
+the transcripts stay. So each such conversation also gets its own empty file,
+named by its id, in the folder `ag2-sparrow-owner-only-sessions` (0700, files
+0600) in the Claude config dir, beside the transcripts, before it can hold a
+tool's result; a conversation that cannot be recorded there is not given the
+tools. One file per conversation, created and never rewritten, so two agents
+sharing a Claude config dir cannot overwrite each other's record. A later install reads it back, so after
+uninstall and reinstall, `--resume-session <that id>` is still the owner's
+alone. If the record is there but cannot be read, a resumed conversation cannot
+be shown never to have had the tools and is treated as the owner's alone.
+
+While a session started with the tools, or on a conversation that had them,
+still runs, `claim` answers every non-owner task with the owner-only refusal and
+starts nothing for it: no turn in the session and no separate `claude -p` turn
+beside it, whatever the install now allows. The usual non-owner flow is back
+once that session has stopped and the next one starts on another conversation.
+
 ## HMAC policy (mirrors `src/task_envelope.py`)
 
 Sutando stamps every task `envelope_hmac: v1:<hex>` on the line after `id:`:

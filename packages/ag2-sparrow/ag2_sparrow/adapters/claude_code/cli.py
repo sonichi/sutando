@@ -34,6 +34,7 @@ from ...connect_bridge import (DECLARATION, EXTERNAL, SEAT_ENV_KEEP, STATUS_MAX_
                                seat_child_env, seat_env, seat_file, served_elsewhere, statuses, url_vault_key,
                                vault_key, worker_name)
 from ...connect_common import EXIT_CHILD_HELD, EXIT_HELD, EXIT_UNUSABLE, Shape, _v  # noqa: F401
+from ...mcp_stdio import mcp_proxy_command
 from ... import claude_local_accepter as accepter, claude_local_card as card, claude_local_records as records
 from . import account as accounts, detector, hmac_policy, hold, inbox, launcher, trust
 from .shape import AUTOARM_VAR, BRIDGE, HITL_ROOT_NAME, LOCAL, PLUGIN, SESSION_NAME, resolve_plugin_dir  # noqa: F401
@@ -203,7 +204,9 @@ RECORDED = (("CLAUDE", "claude", str), ("PLUGIN_DIR", "plugin_dir", lambda v: v 
             ("HMAC_KEY_FILE", "hmac_key_file", str), ("PERMISSION_MODE", "permission_mode", str), ("TMUX", "tmux", str),
             ("HMAC_STRICT", "no_hmac_strict", lambda v: v == hmac_policy.OPT_OUT),
             (inbox.ALLOW_NON_OWNER, "non_owner", lambda v: "0" if v == "0" else ""),
-            (inbox.ALLOW_COLLABORATOR, "collaborator", lambda v: "0" if v == "0" else ""))
+            (inbox.ALLOW_COLLABORATOR, "collaborator", lambda v: "0" if v == "0" else ""),
+            ("MCP_PROXY_COMMAND", "mcp_proxy_command", str),
+            ("ROOM_TOOLS_PREVIEW", "room_tools_preview", lambda v: v == "1"))
 
 
 # Install and connect ran, but a kept session id stayed instead of --resume-session's.
@@ -223,6 +226,101 @@ def resume_outcome(rc: int) -> int:
     return EXIT_RESUME_NOT_APPLIED
 
 
+PREVIEW_NOTE = ("NOTE mcp: room tools preview. It is on only while nobody but you is served "
+                "(--no-allow-collaborator and --no-allow-non-owner): only your own tasks run in the agent's session. "
+                "Install again without --room-tools-preview to turn it off.")
+
+
+OWNER_ALONE_NOTE = ("NOTE mcp: the room tools preview needs an install that serves nobody but the owner: both "
+                    "--no-allow-collaborator and --no-allow-non-owner. This one serves others, so the session gets "
+                    "no AG2 Space tools; a conversation that had them stays the owner's alone, and while a session "
+                    "started with them still runs, nobody but the owner is answered: stop the job first.")
+
+
+def owner_only_sessions(cfg: dict) -> list:
+    """The conversations that once had the room tools (OWNER_ONLY_SESSIONS): each holds their results, so a
+    session on one is the owner's alone for good, whatever the preview says now."""
+    return [s for s in (cfg.get("OWNER_ONLY_SESSIONS") or "").split() if SESSION_ID_RE.match(s)]
+
+
+def room_tools_session(old: dict, values: dict, session_id: str, kept: str, resume: str, live_server, stop_cmd: str,
+                       mint=None) -> dict:
+    """`_room_tools_session`'s answer plus OWNER_ONLY_SESSIONS: a conversation that is, or stops being, the
+    tools' one is remembered there and beside its transcript (hold.keep_owner_only, which outlives an uninstall),
+    so resuming it later never makes it the session collaborators share."""
+    got = _room_tools_session(old, values, session_id, kept, resume, live_server, stop_cmd, mint)
+    home = values.get("CLAUDE_CONFIG_DIR") or ""
+    was, history, durable = old.get("ROOM_TOOLS_SESSION") or "", owner_only_sessions(old), hold.owner_only_kept(home)
+    if got["ROOM_TOOLS_SESSION"] and not hold.keep_owner_only(home, got["ROOM_TOOLS_SESSION"]):
+        # Recorded before the conversation can hold a tool's result, or it never gets the tools.
+        print("NOTE mcp: the conversation started for the AG2 Space tools could not be recorded as the owner's "
+              f"alone under {hold.claude_home(home)}: it runs without the tools")
+        got = dict(got, ROOM_TOOLS_SESSION="")
+    if was and was != got["ROOM_TOOLS_SESSION"] and was not in history:
+        history.append(was)
+    now = got.get("SESSION_ID", session_id)
+    if durable is None and resume and now == resume and now not in history:
+        # The record cannot be read, so this conversation cannot be shown never to have had the tools.
+        history.append(now)
+    history += sorted(i for i in durable or () if SESSION_ID_RE.match(i) and i not in history)
+    for one in history:
+        hold.keep_owner_only(home, one)
+    if now in history and now != got["ROOM_TOOLS_SESSION"]:
+        print(f"NOTE mcp: the conversation {now} once had the AG2 Space tools, or cannot be shown not to have: it "
+              "stays the owner's alone (nobody else is answered while a session on it runs), and it runs without "
+              "the tools")
+    return dict(got, OWNER_ONLY_SESSIONS=" ".join(history))
+
+
+def _room_tools_session(old: dict, values: dict, session_id: str, kept: str, resume: str, live_server, stop_cmd: str,
+                        mint=None) -> dict:
+    """Which conversation may carry the AG2 Space tools: only one started for them, with no earlier turn of any
+    sender in it. {SESSION_ID?, ROOM_TOOLS_SESSION, EARLIER_SESSION_ID}: an install that turns the tools on
+    starts a new conversation (the earlier one stays on disk, named by EARLIER_SESSION_ID, and is never given
+    the tools); while the old session is not proven gone, or when the owner names a conversation to resume,
+    the tools stay off and the command says so. Turning the preview off goes back to the earlier conversation."""
+    earlier = old.get("EARLIER_SESSION_ID") or ""
+    # A preview the owner turns on (--room-tools-preview): the proxy command alone, which the desktop app
+    # records at every install and update, changes nothing.
+    was = old.get("ROOM_TOOLS_SESSION") or ""
+    asked = values.get("ROOM_TOOLS_PREVIEW") == "1" and values.get("MCP_PROXY_COMMAND") and values.get("TOKEN_ENV_FILE")
+    if asked and not hold.owner_alone(values):
+        print(OWNER_ALONE_NOTE)
+    if not (asked and hold.owner_alone(values)):
+        if not (kept and kept == was):
+            return {"ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": earlier}
+        # The preview is turned off while the tools' conversation is the session: it must never become the
+        # one collaborators share, so the session leaves it, once its process is proven gone.
+        if live_server():
+            print(f"NOTE mcp: the room tools preview is off, and the session that had the tools ({kept}) is not "
+                  f"proven gone: it stays the owner's alone, without the tools; stop the job ({stop_cmd}), then "
+                  "install again to leave it")
+            return {"ROOM_TOOLS_SESSION": was, "EARLIER_SESSION_ID": earlier}
+        if earlier:
+            print(f"the room tools preview is off: back to the earlier conversation ({earlier}), without the tools")
+            return {"SESSION_ID": earlier, "ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": ""}
+        fresh = (mint or mint_session_id)()
+        print("the room tools preview is off: a new conversation, without the tools (there was none before the "
+              f"preview); the one that had them ({kept}) is kept")
+        return {"SESSION_ID": fresh, "ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": ""}
+    if kept and kept == (old.get("ROOM_TOOLS_SESSION") or ""):
+        return {"ROOM_TOOLS_SESSION": kept, "EARLIER_SESSION_ID": earlier}
+    print(PREVIEW_NOTE)
+    if not kept:        # a conversation minted by this install: nobody has spoken in it
+        return {"ROOM_TOOLS_SESSION": session_id, "EARLIER_SESSION_ID": earlier}
+    if resume and kept == resume:
+        print(f"NOTE mcp: the AG2 Space tools are not given to a conversation that already has history ({resume}); "
+              "it runs without them")
+        return {"ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": earlier}
+    if live_server():
+        print(f"NOTE mcp: the AG2 Space tools start with a new conversation, and the old session ({kept}) is not "
+              f"proven gone: it runs on without them; stop the job ({stop_cmd}), then install again")
+        return {"ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": earlier}
+    fresh = (mint or mint_session_id)()
+    print(f"starting a new conversation for the AG2 Space tools; the earlier one ({kept}) is kept, without them")
+    return {"SESSION_ID": fresh, "ROOM_TOOLS_SESSION": fresh, "EARLIER_SESSION_ID": kept}
+
+
 def install(args) -> int:
     _UNAPPLIED.clear()
     return resume_outcome(_install(args))
@@ -234,6 +332,10 @@ def _install(args) -> int:
         return cb.install_token_stdin(args, LOCAL, lambda: connect_preflight(args, login=False), _install, COMMAND,
                                       work=None, inbox=None, bridge_state_dir=None)
     problem = cb.recorded_install_args(args, LOCAL, RECORDED)
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return EXIT_UNUSABLE
+    proxy, problem = mcp_proxy_command(getattr(args, "mcp_proxy_command", None))
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
@@ -290,7 +392,12 @@ def _install(args) -> int:
               inbox.ALLOW_COLLABORATOR: "0" if args.collaborator == "0" else "1", "AGENT_ID": agent_id, "BRIDGE": mode,
               "TOKEN_ENV_FILE": where["token_file"],
               "TOKEN_VAULT_KEY": vault_key(segment) if mode not in (UNIT, EXTERNAL) and not where["token_file"] else "",
-              "BRIDGE_STATE_DIR": str(state), "TMUX": tmux}
+              "BRIDGE_STATE_DIR": str(state), "TMUX": tmux, "MCP_PROXY_COMMAND": proxy,
+              "ROOM_TOOLS_PREVIEW": "1" if getattr(args, "room_tools_preview", False) else "",
+              "ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": "", "OWNER_ONLY_SESSIONS": ""}
+    if proxy and not where["token_file"]:
+        print("NOTE mcp: --mcp-proxy-command acts as the agent through its own token file; this install has none "
+              "(--token-env-file), so the session gets no AG2 Space tools")
     resume = resume_session_arg(args)
     problem = resume_problem(values["CLAUDE_CONFIG_DIR"], resume, kept_session_id(local)) if resume else ""
     if problem:
@@ -325,7 +432,12 @@ def _install(args) -> int:
             kept = resume
             print(f"resuming the existing conversation {resume}")
         session_id = kept or mint_session_id()
-        return dict(values, SESSION_ID=session_id)
+        revised = dict(values, SESSION_ID=session_id)
+        # Merged once: the tools' own conversation, when one is started, replaces the session id above.
+        revised.update(room_tools_session(old or {}, values, session_id, kept, resume, live_server,
+                                          cm.stop_command(local)))
+        return revised
+
     def installed() -> int:
         rc = cm.install(local, values, root, root_id=getattr(args, "root_identity", None), revise=revise,
                         precheck=lambda r: inbox.root_problem(r) or records.agent_problem(r, agent_id),
@@ -870,6 +982,15 @@ def session_options(p) -> None:
     ses.add_argument("--resume-session", metavar="UUID", help="host this existing Claude Code conversation (its "
                      "transcript must be under the config dir's projects/, and no other process may have it open) "
                      "instead of a new one; replaces a kept id only once the old session is proven gone")
+    p.add_argument("--mcp-proxy-command", help="the stdio ag2-mcp-proxy command line ('<node> <the desktop app's "
+                   "engine/ag2-mcp-proxy.mjs>'), each path quoted when it has a space: recorded only. The session gets "
+                   "the AG2 Space tools as this agent, for the owner's turns alone, only with --room-tools-preview, "
+                   "both --no-allow-collaborator and --no-allow-non-owner, and the agent's own token file "
+                   "(default: none, no AG2 Space tools)")
+    p.add_argument("--room-tools-preview", action="store_true",
+                   help="preview, off by default: with --mcp-proxy-command and both --no-allow-collaborator and "
+                        "--no-allow-non-owner, start a new conversation that has the AG2 Space tools and takes only "
+                        "the owner's tasks (the earlier conversation is kept, without the tools)")
     p.add_argument("--claude", default="claude", help="the claude executable (default: claude on PATH)")
     p.add_argument("--tmux", help="the tmux executable, 3.2 or newer, recorded for every later command (default: the "
                    "recorded one, else PATH, the desktop app's engine/bin, %s)" % ", ".join(launcher.TMUX_DIRS))

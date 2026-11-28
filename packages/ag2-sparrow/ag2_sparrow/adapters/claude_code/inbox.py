@@ -130,6 +130,43 @@ def _installed_on(key, environ=None) -> bool:
         return False
 
 
+def owner_alone(environ=None) -> bool:
+    """Whether the installed config, as it reads now, has the room tools preview on and serves nobody but the
+    owner: both opt-outs exactly "0". Missing, anything else, or a config that cannot be read: False."""
+    try:
+        cfg = cm.read_config(_installed_config(environ))
+    except (OSError, ValueError):
+        return False
+    return cfg.get("ROOM_TOOLS_PREVIEW") == "1" and cfg.get(ALLOW_COLLABORATOR) == "0" and cfg.get(ALLOW_NON_OWNER) == "0"
+
+
+TOOLS_MARK = ("state", "room-tools", "session.json")    # hold.mark_tools_generation writes it
+TOOLS_SESSION_LIVE = "the session that has, or had, the room tools is still running: owner only until it is stopped"
+
+
+def tools_generation(root, generation) -> "bool | None":
+    """Whether the live session process `generation` ({pid, start}) was started with the AG2 Space tools: True
+    when hold's mark names exactly it (pid and start time), False when there is no mark or a whole one names
+    another process (an earlier start), None when the mark is there but cannot be read or is incomplete. Read from the running generation, never from the
+    install config, which can change or be unreadable while the session runs on."""
+    path = os.path.join(root, *TOOLS_MARK)
+    try:
+        with open(path, encoding="utf-8") as f:
+            mark = json.load(f)
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError):
+        return None
+    # Both halves name a process: a mark missing its pid or its start time, or a live generation whose start is
+    # not known, proves nothing either way. That is unknown, never a verified record of an earlier start.
+    pid, start = (mark.get("pid"), mark.get("start")) if isinstance(mark, dict) else (None, None)
+    whole = isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and start not in (None, "") \
+        and isinstance(start, (str, int, float)) and not isinstance(start, bool)
+    if not whole or not generation.get("pid") or generation.get("start") in (None, ""):
+        return None
+    return (pid, start) == (generation["pid"], generation["start"])
+
+
 def allow_non_owner(environ=None) -> bool:
     """The installed non-owner setting: on unless install recorded --no-allow-non-owner."""
     return _installed_on(ALLOW_NON_OWNER, environ)
@@ -437,14 +474,20 @@ def claim(root, task_id) -> dict:
             if kind is None:
                 outcome = lc.complete_without_call(task_id, refusal_body(root, headers), why)
                 raise Refused("%s not admitted (%s); the owner-only refusal is %s" % (task_id, why, outcome))
+            # While the session started with the room tools runs on (or its mark cannot be read), nobody but the
+            # owner is served: not in it, and not by a turn started beside it, nor by a card, whatever the install allows.
+            if kind != task_io.OWNER and tools_generation(root, generation) is not False:
+                outcome = lc.complete_without_call(task_id, refusal_body(root, headers), TOOLS_SESSION_LIVE)
+                raise Refused("%s not admitted (%s); the owner-only refusal is %s" % (task_id, TOOLS_SESSION_LIVE, outcome))
             carded, body = card_matter(root, task_id)
             if carded:
                 # A tap on the model card, or the owner's /model: answered here, never submitted to the session.
                 outcome = lc.complete_without_call(task_id, body, "card: %s" % carded)
                 raise Refused("%s answered by its card (%s); its answer is %s" % (task_id, carded, outcome))
+            outside = kind == task_io.RESTRICTED
             try:
                 attempt = lc.prepare(task_id, INTERRUPTED_BODY, mode=lifecycle.LOCAL, generation=generation)
-                if kind == task_io.RESTRICTED:
+                if outside:
                     # CALLING before the turn: a crash is answered as interrupted by the next start's recovery.
                     lc.mark_calling(task_id, attempt)
             except lifecycle.AttemptInProgress as e:
@@ -455,7 +498,7 @@ def claim(root, task_id) -> dict:
             if state in lifecycle.TERMINAL:
                 _settle_terminal(lc, task_id)
             terminal = resolved(lc, task_id)[0]
-    if verdict == "call" and not lost and kind == task_io.RESTRICTED:
+    if verdict == "call" and not lost and outside:
         return _isolated_claim(root, lc, task_id, attempt, generation, headers)
     if lost:
         # After claims.lock, as every mirror write; a mirror that fails is the hard answer, the Mod retries.
@@ -680,6 +723,61 @@ def inflight(root) -> dict:
     return {"tasks": tasks}
 
 
+ROOM_TOOLS_NO_OWNER = "no turn of the owner's is running in this session, so no room tool is called"
+ROOM_TOOLS_NOT_OWNERS = "this session was not started with the AG2 Space tools, so no room tool is called"
+ROOM_TOOLS_NO_SESSION = "no live session holds this root, so no room tool is called"
+ROOM_TOOLS_UNREAD = "the session's records could not be read, so no room tool is called"
+ROOM_TOOLS_OPENED = ("the install no longer has the room tools preview on with only the owner served, so no "
+                     "room tool is called")
+
+
+def room_tools_refusal(root) -> str:
+    """Why a room-tool call is refused right now, '' when it may go on (the name shim's turn gate runs
+    `inbox room-tools` before every `tools/call`). A call needs the owner's own authorization, read from the
+    records, never assumed from finding nobody else: the live session process is the one hold started with
+    the tools (tools_generation), and a turn of the owner's (the task's attested tier) is confirmed in it and
+    its answer not yet staged: TURN_CONFIRMED. A claim only prepared, being sent or already answered is not
+    that. A mark, claim or task that cannot be read refuses. Read under claims.lock, changing nothing."""
+    # Read at every call: an install loosened while this session runs on closes the tools at once.
+    if not owner_alone():
+        return ROOM_TOOLS_OPENED
+    lc = _lifecycle(root)
+    try:
+        generation = _generation(root)
+    except Refused:
+        return ROOM_TOOLS_NO_SESSION
+    marked = tools_generation(root, generation)
+    if marked is not True:
+        return ROOM_TOOLS_UNREAD if marked is None else ROOM_TOOLS_NOT_OWNERS
+    live = (generation["pid"], generation.get("start"))
+    with records.flocked(records.claims_lock_path(root)):
+        for task_id in lc.claims.ids():
+            try:
+                rec = lc.claims.load(task_id)
+            except lifecycle.ClaimUnreadable:
+                return ROOM_TOOLS_UNREAD
+            gen = (rec or {}).get("generation") or {}
+            if not rec or rec.get("claim_mode") != lifecycle.LOCAL or (gen.get("pid"), gen.get("start")) != live \
+                    or rec.get("phase") != lifecycle.TURN_CONFIRMED:
+                continue
+            try:
+                headers, _, _ = task_io.parse_task(os.path.join(root, "tasks", task_id + ".txt"))
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return ROOM_TOOLS_UNREAD
+            # Another sender's claim here is its own turn outside this session (claim), never the authorization.
+            if task_io.turn_policy(headers, True, True).kind == task_io.OWNER:
+                return ""
+    return ROOM_TOOLS_NO_OWNER
+
+
+def room_tools(root) -> dict:
+    """The turn gate's answer, as the name shim reads it: {"allowed": true}, or false with `why`."""
+    why = room_tools_refusal(root)
+    return {"allowed": not why, "why": why}
+
+
 def stage(root, task_id, turn_id, body: bytes) -> dict:
     lc = _lifecycle(root)
     with _claims_step(root, lc, task_id, "stage"):
@@ -789,6 +887,8 @@ def main(args) -> int:
             out = park(root, args.task_id, args.turn_id, args.detail)
         elif verb == "inflight":
             out = inflight(root)
+        elif verb == "room-tools":
+            out = room_tools(root)
         elif verb == "progress":
             gen = task_io.holder_consumer(root) if args.bind_generation else None
             out = progress(root, args.session_id, args.nonce, args.intake, args.reason,
@@ -823,7 +923,7 @@ def main(args) -> int:
 
 
 def add_parser(sub) -> None:
-    p = sub.add_parser("inbox", help="the Mod's lifecycle verbs (claim, interrupt, authorize, confirm, stage, publish, park, inflight, "
+    p = sub.add_parser("inbox", help="the Mod's lifecycle verbs (claim, interrupt, authorize, confirm, stage, publish, park, inflight, room-tools, "
                        "progress, check-inode, envelope); never by hand")
     p.add_argument("--root", help="the work root (default: AG2_SPARROW_ROOT, else the cwd's parent)")
     v = p.add_subparsers(dest="verb", required=True)
@@ -837,6 +937,7 @@ def add_parser(sub) -> None:
     u = v.add_parser("publish"); u.add_argument("task_id")
     k = v.add_parser("park"); k.add_argument("task_id"); k.add_argument("turn_id"); k.add_argument("--detail", default="no result")
     v.add_parser("inflight")
+    v.add_parser("room-tools")
     g = v.add_parser("progress")
     g.add_argument("--session-id"); g.add_argument("--nonce"); g.add_argument("--intake", choices=("open", "stopped"))
     g.add_argument("--reason"); g.add_argument("--bind-generation", action="store_true")

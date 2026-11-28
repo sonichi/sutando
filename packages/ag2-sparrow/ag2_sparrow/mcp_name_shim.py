@@ -9,7 +9,9 @@ on under the server's own name. It also enforces the turn's grant (TOOLS_ENV, th
 grants): a `tools/list` answer keeps only granted tools, and a `tools/call` for any other name, or a malformed
 one, is answered with a JSON-RPC error and never forwarded. No grant named means none granted. With GRANT_ENV set
 (codex-local, whose server outlives a turn), a call is forwarded only while that file holds a live per-turn grant
-naming this server's launch (LAUNCH_ENV) and the tool: between turns, or with none, it is refused. Only METHODS and
+naming this server's launch (LAUNCH_ENV) and the tool: between turns, or with none, it is refused. With GATE_ENV
+(claude-local: a command the connector names), every `tools/call` also runs that command first and is forwarded
+only when it answers {"allowed": true}. Only METHODS and
 `notifications/*` reach the server, plus the client's answers to the server's own requests; any other request,
 and a line that is not a JSON-RPC object, is answered with an error, any other notification dropped. Server
 lines pass through as they came, and the child's environment is this process's (the proxy scrubs its own).
@@ -37,6 +39,9 @@ LOG_ENV = "AG2_MCP_LOG"
 STATUS_ENV, TURN_ENV = "AG2_MCP_SHIM_STATUS", "AG2_MCP_SHIM_TURN"
 TOOLS_ENV = "AG2_MCP_SHIM_TOOLS"
 GRANT_ENV, LAUNCH_ENV = "AG2_MCP_SHIM_GRANT", "AG2_MCP_SHIM_LAUNCH"
+GATE_ENV = "AG2_MCP_SHIM_GATE"
+GATE_TIMEOUT_S = 10.0
+GATE_UNCHECKED = "the turn's sender could not be checked, so no room tool is called"
 NOT_GRANTED = -32601
 PARSE_ERROR, INVALID_REQUEST = -32700, -32600
 # The client methods forwarded; any other request is answered with an error, any other notification dropped.
@@ -78,6 +83,33 @@ def grant_of(environ=None):
     """The Grant every call must pass when GRANT_ENV is set (even empty: then none passes); None when unset."""
     env = os.environ if environ is None else environ
     return Grant(env.get(GRANT_ENV) or "", env.get(LAUNCH_ENV) or "") if GRANT_ENV in env else None
+
+
+def turn_gate(environ=None, run=subprocess.run):
+    """None, or the check every `tools/call` passes first: '' to forward it, else why it is refused. GATE_ENV
+    holds a command (a JSON list of words) that prints one JSON object: {"allowed": true}, or `why` it is not.
+    A command that cannot run, times out, exits non-zero or prints anything else refuses (fail closed)."""
+    raw = (os.environ if environ is None else environ).get(GATE_ENV)
+    if not raw:
+        return None
+
+    def check():
+        try:
+            argv = json.loads(raw)
+            if not (isinstance(argv, list) and argv and all(isinstance(a, str) for a in argv)):
+                raise ValueError("not a command")
+            done = run(argv, capture_output=True, text=True, timeout=GATE_TIMEOUT_S, stdin=subprocess.DEVNULL)
+            if done.returncode != 0:    # whatever it printed: a gate that failed allowed nothing
+                raise ValueError("exit %s" % done.returncode)
+            out = json.loads(done.stdout)
+        except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+            note("the turn gate could not run (%s)" % type(e).__name__)
+            return GATE_UNCHECKED
+        if isinstance(out, dict) and out.get("allowed") is True:
+            return ""
+        why = out.get("why") if isinstance(out, dict) else None
+        return why[:300] if isinstance(why, str) and why else GATE_UNCHECKED
+    return check
 
 
 class Status:
@@ -126,10 +158,11 @@ class Names:
     """The aliases handed out so far: alias -> server name (a later tools/list may add or change them), and the
     server names this turn grants (`allowed`)."""
 
-    def __init__(self, allowed=frozenset(), grant=None):
+    def __init__(self, allowed=frozenset(), grant=None, gate=None):
         self.to_server = {}
         self.allowed = frozenset(allowed)
         self.grant = grant      # a Grant every call must also pass, or None
+        self.gate = gate        # a check every call must also pass ('' to forward), or None
         self.lock = threading.Lock()
 
     def rename_tools(self, tools):
@@ -197,6 +230,9 @@ def _refused(m, names):
         if not names.turn_ok(params["name"]):
             note("refused a call with no live turn grant")
             return NOT_GRANTED, "no live turn grant: tools act only during the turn that granted them"
+        why = names.gate() if names.gate else ""
+        if why:
+            return NOT_GRANTED, why
     return None
 
 
@@ -274,7 +310,7 @@ def main(argv=None, stdin=None, stdout=None, popen=subprocess.Popen):
         note("the server did not start (%s)" % type(e).__name__)
         status.exited(127)
         return 127
-    names, pending, out_lock = Names(granted(), grant_of()), set(), threading.Lock()
+    names, pending, out_lock = Names(granted(), grant_of(), turn_gate()), set(), threading.Lock()
 
     def pump_out():
         for line in child.stdout:

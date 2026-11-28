@@ -12,13 +12,17 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
-from ... import claude_local_records as records, claude_model_switch, connect_common as cm, task_io
+from ... import (claude_local_records as records, claude_model_switch, connect_common as cm, mcp_auth, mcp_name_shim,
+                 mcp_stdio, task_io)
+from ...bounded_file_read import read_regular
 from ...file_lock import locked_file
 from . import inbox
 from .shape import LOCAL, resolve_plugin_dir
@@ -63,6 +67,35 @@ def set_title(token: str, out=None) -> None:
 def claude_home(config_dir: str) -> str:
     """CLAUDE_CONFIG_DIR as the session runs it: the recorded one, else the CLI's default."""
     return config_dir or os.path.join(os.path.expanduser("~"), ".claude")
+
+
+SESSION_FILE_RE = re.compile(r"^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$")   # an id that is safe as a file name
+OWNER_ONLY_STORE = "ag2-sparrow-owner-only-sessions"    # a folder under the Claude home, beside the transcripts
+
+
+def owner_only_kept(config_dir: str) -> "set | None":
+    """The conversations recorded beside their transcripts as the owner's alone: one empty file each, named by
+    the id, so two agents sharing a Claude home never overwrite each other's. It outlives an uninstall, as the
+    transcripts do. Empty when there is no record; None when one is there but cannot be read."""
+    try:
+        return set(os.listdir(os.path.join(claude_home(config_dir), OWNER_ONLY_STORE)))
+    except FileNotFoundError:
+        return set()
+    except OSError:
+        return None
+
+
+def keep_owner_only(config_dir: str, session_id: str) -> bool:
+    """Record `session_id` there (its own 0600 file, created, never rewritten); True once it is there."""
+    store = os.path.join(claude_home(config_dir), OWNER_ONLY_STORE)
+    if not SESSION_FILE_RE.match(session_id):
+        return False
+    try:
+        os.makedirs(store, mode=0o700, exist_ok=True)
+        os.close(os.open(os.path.join(store, session_id), os.O_WRONLY | os.O_CREAT, 0o600))
+    except OSError:
+        return False
+    return os.path.isfile(os.path.join(store, session_id))
 
 
 def transcript_path(config_dir: str, session_id: str) -> str:
@@ -171,6 +204,174 @@ def claude_argv(cfg: dict, session_id: str) -> list:
             cfg.get("PERMISSION_MODE") or "bypassPermissions", flag, session_id] + (["--model", model] if model else [])
 
 
+# The AG2 Space room tools as this agent (MCP_PROXY_COMMAND): the shim, the descriptor, the proxy's log and the
+# `--mcp-config` file live in one directory of the root's state (task_lifecycle.STATE_OPTIONAL_DIRS names it).
+ROOM_TOOLS_DIR = ("state", "room-tools")
+MCP_CONFIG_NAME = "ag2-mcp-config.json"
+# What the shim grants the session started for the tools (tools_session): only the owner's tasks enter it, and
+# the shim's turn gate (GATE_ENV) still forwards a call only while one of them is in flight.
+ROOM_TOOLS = mcp_auth.OWNER_TOOLS
+# The descriptor's token exchange runs before the session starts: well inside the launcher's wait for its
+# consumer (launcher.CONSUMER_WAIT_S, 30 s), so a slow relay costs the tools, never the session.
+ROOM_TOOLS_EXCHANGE_S = 12.0
+CLAUDE_JSON_MAX = 64 << 20
+
+
+def exchange_run(argv, **kw):
+    """subprocess.run for the descriptor exchange, bounded by ROOM_TOOLS_EXCHANGE_S."""
+    return subprocess.run(argv, **dict(kw, timeout=min(kw.get("timeout") or ROOM_TOOLS_EXCHANGE_S,
+                                                        ROOM_TOOLS_EXCHANGE_S)))
+
+
+def _servers_of(path, *keys) -> set:
+    """The names under `keys` (a path into the JSON object at `path`, ending at an mcpServers mapping); an empty
+    set when the file or the path is not there. ValueError for a file Claude Code could not read either."""
+    text, why = read_regular(path, CLAUDE_JSON_MAX)
+    if text is None:
+        if why:
+            raise ValueError("%s was refused (%s)" % (path, why))
+        return set()
+    node = json.loads(text)
+    for key in keys:
+        node = node.get(key) if isinstance(node, dict) else None
+    return set(node) if isinstance(node, dict) else set()
+
+
+def configured_servers(cfg: dict, cwd: str) -> set:
+    """The MCP servers the session's Claude Code already loads by name, without --strict-mcp-config: the user
+    scope (`mcpServers` of <CLAUDE_CONFIG_DIR, else ~>/.claude.json), the local scope (its
+    `projects[<cwd>].mcpServers`) and the project scope (<cwd>/.mcp.json). A plugin's servers are named
+    `plugin:<plugin>:<name>` and never collide. ValueError when one of them cannot be read."""
+    config_dir = cfg.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~")
+    claude_json = os.path.join(config_dir, ".claude.json")
+    names = _servers_of(claude_json, "mcpServers")
+    for project in {cwd, os.path.realpath(cwd)}:
+        names |= _servers_of(claude_json, "projects", project, "mcpServers")
+    return names | _servers_of(os.path.join(cwd, ".mcp.json"), "mcpServers")
+
+
+def write_mcp_config(state: str, entry: dict) -> str:
+    """`<state>/ag2-mcp-config.json` (0600): Claude Code's `--mcp-config` with the one stdio server `entry`
+    (mcp_stdio.stdio_entry's: the shim, the proxy's command line, the descriptor's path). No secret is in it."""
+    path = os.path.join(state, MCP_CONFIG_NAME)
+    server = {"type": "stdio", "command": entry["command"], "args": list(entry["args"]),
+              "env": {e["name"]: e["value"] for e in entry["env"]}}
+    cm._write(Path(path), json.dumps({"mcpServers": {entry["name"]: server}}, indent=2) + "\n", 0o600)
+    return path
+
+
+def gate_argv(root: str) -> list:
+    """The inbox CLI's `room-tools` verb for `root`, run from this very package, isolated (-I), as mcp_stdio
+    runs its own helpers: what the name shim runs before each room-tool call."""
+    pkg = str(Path(__file__).resolve().parents[3])
+    # The gate reads the install config this session was started from, whatever env the MCP server is given.
+    conf = os.environ.get(ENV_CONFIG_DIR) or ""
+    code = ("import os, sys; %ssys.path.insert(0, %r); from ag2_sparrow.adapters.claude_code import cli; "
+            "raise SystemExit(cli.main(sys.argv[1:]))" % ("os.environ[%r] = %r; " % (ENV_CONFIG_DIR, conf) if conf else "", pkg))
+    return [sys.executable, "-I", "-c", code, "inbox", "--root", root, "room-tools"]
+
+
+def tools_conversation(cfg: dict, session_id=None) -> bool:
+    """Whether `session_id` (default: the configured one) is a conversation that has, or once had, the room
+    tools: the one install started for them (ROOM_TOOLS_SESSION) or one it left since (OWNER_ONLY_SESSIONS).
+    Only the owner's tasks ever enter it, whether or not the tools are on now: it holds their results."""
+    mine = cfg.get("SESSION_ID") or "" if session_id is None else session_id
+    if not mine or mine != (cfg.get("SESSION_ID") or ""):
+        return False
+    return mine == (cfg.get("ROOM_TOOLS_SESSION") or "") or mine in (cfg.get("OWNER_ONLY_SESSIONS") or "").split()
+
+
+def owner_alone(cfg: dict) -> bool:
+    """Whether the install serves nobody but the owner: both opt-outs recorded, each exactly "0". A key that is
+    missing or holds anything else counts as serving them (inbox.owner_alone reads the same from the live config)."""
+    return cfg.get(inbox.ALLOW_COLLABORATOR) == "0" and cfg.get(inbox.ALLOW_NON_OWNER) == "0"
+
+
+def tools_session(cfg: dict, session_id=None) -> bool:
+    """Whether this start gets the tools: the conversation install started for them, with the preview on and
+    nobody but the owner served."""
+    mine = cfg.get("SESSION_ID") or "" if session_id is None else session_id
+    return (cfg.get("ROOM_TOOLS_PREVIEW") == "1" and owner_alone(cfg) and bool(mine)
+            and mine == (cfg.get("ROOM_TOOLS_SESSION") or "") and mine == (cfg.get("SESSION_ID") or ""))
+
+
+def room_tools_argv(cfg: dict, root: str, cwd: str, entry=None, log=None, session_id=None) -> list:
+    """`--mcp-config <file>` adding the ag2-space MCP server as this agent to the session, or []: with no
+    MCP_PROXY_COMMAND (an install from before it, or the desktop passed none), no TOKEN_ENV_FILE of the agent's
+    own, an `ag2-space` server the agent's Claude Code config already has (kept; ours would shadow or merge
+    into it), a config that cannot be read, or a failed token exchange. Each is one line in `log`; none stops
+    the session, which then starts without the tools. Rebuilt at every start (a restart is a new hold)."""
+    log = log or (lambda line: print("hold: " + line, file=sys.stderr))
+    proxy, token_file = cfg.get("MCP_PROXY_COMMAND") or "", cfg.get("TOKEN_ENV_FILE") or ""
+    if not proxy:
+        return []
+    if not token_file:
+        log("ag2-space MCP tools not offered: no TOKEN_ENV_FILE (the agent's own token file)")
+        return []
+    if cfg.get("ROOM_TOOLS_PREVIEW") == "1" and not owner_alone(cfg):
+        log("ag2-space MCP tools not offered: the install serves collaborators or other non-owners; they need "
+            "both --no-allow-collaborator and --no-allow-non-owner")
+        return []
+    if not tools_session(cfg, session_id):
+        log("ag2-space MCP tools not offered: this conversation was not started for them (it may hold other "
+            "senders' turns); install again with --mcp-proxy-command once the job is stopped")
+        return []
+    try:
+        # Recorded at install: an app update can move the bundled node, and the server would then fail to
+        # start on every session with nothing said.
+        exe = (shlex.split(proxy) or [""])[0]
+        if not (os.path.isfile(exe) and os.access(exe, os.X_OK)):
+            log("ag2-space MCP tools not offered: the recorded proxy's executable is gone (%s); install again "
+                "with --mcp-proxy-command" % exe)
+            return []
+        names = configured_servers(cfg, cwd)
+        if mcp_auth.SERVER_NAME in names:
+            log("ag2-space MCP tools not offered: the agent's Claude Code config already has an %s server"
+                % mcp_auth.SERVER_NAME)
+            return []
+        state = os.path.join(root, *ROOM_TOOLS_DIR)
+        os.makedirs(state, mode=0o700, exist_ok=True)
+        if os.path.islink(state) or not os.path.isdir(state):
+            log("ag2-space MCP tools not offered: %s is not a directory" % state)
+            return []
+        got, why = (entry or mcp_stdio.stdio_entry)(proxy, token_file, cfg.get("AGENT_ID") or "", state,
+                                                    run=exchange_run, turn=uuid.uuid4().hex, tools=ROOM_TOOLS)
+        if got is None:
+            log("ag2-space MCP tools not offered: " + why)
+            return []
+        # Defence in depth beside the owner-only session: the shim runs `inbox room-tools` before every call and
+        # forwards it only while a task of the owner's is in flight here.
+        gate = {"name": mcp_name_shim.GATE_ENV, "value": json.dumps(gate_argv(os.path.abspath(root)))}
+        got = dict(got, env=list(got["env"]) + [gate])
+        path = write_mcp_config(state, got)
+    except Exception as e:     # the tools never cost the session its start
+        log("ag2-space MCP tools not offered: %s: %s" % (type(e).__name__, str(e)[:200]))
+        return []
+    log("ag2-space MCP tools offered (%d tools granted)" % len(ROOM_TOOLS))
+    return ["--mcp-config", path]
+
+
+TOOLS_MARK = ROOM_TOOLS_DIR + ("session.json",)
+
+
+def mark_tools_generation(root, pid=None, session_id="", start_time=None) -> bool:
+    """Record that the session process `pid` (with its start time) runs the room tools' conversation, so
+    admission and the gate read it from the running generation, never from a config that may have changed
+    since. With no pid: remove the mark (another conversation). False when it could not be written or removed."""
+    path = Path(root).joinpath(*TOOLS_MARK)
+    try:
+        if pid is None:
+            path.unlink(missing_ok=True)
+            return True
+        start = (start_time or task_io.start_time)(pid)
+        if start in (None, ""):     # half a mark is read as unknown: say it could not be written
+            return False
+        cm._write(path, json.dumps({"pid": pid, "start": start, "session_id": session_id}) + "\n", 0o600)
+        return True
+    except OSError:
+        return False
+
+
 TITLE_OFF_VAR = "CLAUDE_CODE_DISABLE_TERMINAL_TITLE"
 
 
@@ -268,7 +469,20 @@ def _held(root, cfg, session_id, nonce, env, popen, state) -> int:
         picked = settle_wanted(cfg.get("ROOT"))
         if picked:
             print("hold: starting on %s, the model picked while the session could not switch" % picked, file=sys.stderr)
-        child, pipe["go_w"] = spawn_shim(claude_argv(cfg, session_id), child_env(env, inode), popen)
+        # Last: --mcp-config takes every word after it, and nothing positional follows.
+        plain = claude_argv(cfg, session_id)
+        tools = room_tools_argv(cfg, root, os.path.join(root, "tasks"), session_id=session_id)
+        child, pipe["go_w"] = spawn_shim(plain + tools, child_env(env, inode), popen)
+        # Before the gated child's go byte: a session on the tools' conversation is marked owner-only, tools on
+        # or not, and is not started when it cannot be marked. Any other start clears an older mark.
+        if tools_conversation(cfg, session_id):
+            if not mark_tools_generation(root, child.pid, session_id):
+                reap(child, pipe["go_w"])
+                raise OSError("the session's owner-only mark could not be written, and without it a "
+                              "collaborator's task could enter the conversation that has the room tools' results")
+        elif not mark_tools_generation(root):
+            print("hold: an older owner-only mark could not be removed; collaborators' tasks stay outside this "
+                  "session until it is", file=sys.stderr)
         return child
 
     def started(child):

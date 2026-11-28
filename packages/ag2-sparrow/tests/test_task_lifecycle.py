@@ -3291,7 +3291,7 @@ class LocalClaimTest(Base):
         for name in ("isolated-turns.json", "model-switch.json", "model-switch.lock", "model.json", "account.json",
                      "model-apply.log", "model-apply.lock"):
             (state / name).write_text("{}")
-        for name in ("agent-cards", "card-marks"):
+        for name in ("agent-cards", "card-marks", "room-tools"):     # room-tools: hold.ROOM_TOOLS_DIR
             (state / name).mkdir()
             (state / name / "anything.json").write_text("{}")
         (state / "model.json.tmp").write_text("{}")             # a record's own temp, mid-replace
@@ -3312,6 +3312,10 @@ class LocalClaimTest(Base):
         (state / "card-marks").write_text("")
         self.assertIn("not a plain directory", self.lc.prepare_work_dir(str(self.work)))
         (state / "card-marks").unlink()
+        shutil.rmtree(state / "room-tools")
+        (state / "room-tools").write_text("")
+        self.assertIn("not a plain directory", self.lc.prepare_work_dir(str(self.work)))
+        (state / "room-tools").unlink()
         (state / "somebody-elses.json").write_text("{}")
         self.assertIn("not this adapter's state", self.lc.prepare_work_dir(str(self.work)))
 
