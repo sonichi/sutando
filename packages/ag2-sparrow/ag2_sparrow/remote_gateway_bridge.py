@@ -71,6 +71,7 @@ import hashlib
 import hmac
 import io
 import http.client
+import inspect
 import json
 import math
 import os
@@ -2325,7 +2326,7 @@ PROACTIVE_ROOM_KEEP: Callable[[], bool] | None = None
 OWNS_UNADDRESSED: Callable[[], bool] | None = None
 # Host-injected (path) -> bool: an owner-directed file this lane delivers although it owns no
 # unaddressed ones (a worker's lane, its worker's files). None: only `owns_unaddressed` decides.
-PROACTIVE_OWN_FILE: Callable[[Path], bool] | None = None
+PROACTIVE_OWN_FILE: Callable[..., bool] | None = None
 # Host hook: whether this lane posts a decision card (a HumanRequirement). None: the primary posts every card.
 CARD_CLAIM: Callable[[object], bool] | None = None
 # Host-injected () -> the worker every task this lane queues is addressed to (`requested_worker`),
@@ -2505,15 +2506,31 @@ def owns_unaddressed() -> bool:
         return not GATEWAY_INSTANCE
 
 
-def owner_directed_is_mine(path: Path) -> bool:
+def _takes_body(hook) -> bool:
+    """Whether the host's own-file hook takes the claimed body beside the path. Read from its signature,
+    never from a TypeError: one raised inside the check is a failed check, and the note waits."""
+    try:
+        params = list(inspect.signature(hook).parameters.values())
+    except (TypeError, ValueError):
+        return True     # no signature to read: the current two-argument call
+    if any(p.kind is p.VAR_POSITIONAL for p in params):
+        return True
+    return len([p for p in params if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]) >= 2
+
+
+def owner_directed_is_mine(path: Path, text: "str | None" = None) -> bool:
     """Whether this lane delivers the owner-directed file `path`: the primary delivers every one
-    (`owns_unaddressed`); any other lane only one the host names as its own (PROACTIVE_OWN_FILE)."""
+    (`owns_unaddressed`); any other lane only one the host names as its own (PROACTIVE_OWN_FILE).
+    `text` is the body already read from a claimed file: its live name is gone while the claim is
+    held, so a host that reads the file is given the body instead of a path it cannot open."""
     if owns_unaddressed():
         return True
     if PROACTIVE_OWN_FILE is None:
         return False
     try:
-        return bool(PROACTIVE_OWN_FILE(path))
+        if text is None or not _takes_body(PROACTIVE_OWN_FILE):
+            return bool(PROACTIVE_OWN_FILE(path))
+        return bool(PROACTIVE_OWN_FILE(path, text))
     except Exception as e:  # noqa: BLE001 - an unanswerable host keeps the primary-only rule
         _log_backoff(("own-file", type(e).__name__), f"own-file check failed ({diagnostics.describe(e)})")
         return False
@@ -2882,24 +2899,32 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # A card click's `space.ag2.card_click`, one JSON line (branch below). Above "task" so a
                 # body cannot claim it; the agent acts on a card command only with it.
                 "card_click",
-                "task",
-                # Context enrichment (AG2 broker writer side): human room/sender
-                # names + reply reference. Serialized only when the gateway sends
-                "room_name", "sender_name", "reply_to_event", "reply_to_me", "reply_to_sender",
-                "addressed_to",
+                # The broker's mention and thread facts (true|false branch below). Above "task" so
+                # any engine's strict parser reads them and a body cannot claim them.
+                "mentions", "mentions_you", "replied_to", "replied_to_you",
+                "thread_starter", "you_in_thread",
+                # The broker's reply, thread and roster context (room_members is capped; the count
+                # is the true total). Above "task" for the same reason as the facts above.
+                "reply_to_me", "reply_to_sender", "addressed_to", "addressed_via",
                 # Ingress only: the backend inherits the route by task id, so a
                 # reply echoing these back could name a thread it was not asked in.
                 "thread_root", "source_room_id",
-                # Room-membership context (gateway writer side, same contract):
-                # a capped one-line mxid list + the true joined total, and the
-                # broker's own dm|room verdict so a skill need not count members.
                 "room_members", "room_member_count", "channel_kind",
+                "task",
+                # Context enrichment (AG2 broker writer side): human room/sender
+                # names + reply reference. Serialized only when the gateway sends
+                "room_name", "sender_name", "reply_to_event",
                 "source_message_id", "user_id", "interaction_type",
                 # Platform-signed metadata pointer — serialized as a one-line
                 # JSON header by a dedicated branch below (dict, not scalar).
                 "platform_card",
                 # A room question this agent is asked: one line of quoted room data (branch below).
                 "room_question")
+
+# Which engine-specific prelude an owner task carries: "sutando" (default) or "none" for an
+# engine without Sutando's skills. Anything else keeps the default, so a typo never drops it.
+_TASK_PRELUDE_RAW = str(os.environ.get("SPARROW_TASK_PRELUDE") or "").strip().lower()
+TASK_PRELUDE = "none" if _TASK_PRELUDE_RAW == "none" else "sutando"
 
 # A card click's bounds: the card id as the backend forwards it, the action as the client caps a reply.
 _CARD_CLICK_MAX = {"card_id": 200, "action": 1000}
@@ -6889,6 +6914,14 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
         elif f == "owner_mentioned":
             if task.get(f) == "true":  # the broker's exact string only; nothing else is a claim
                 lines.append("owner_mentioned: true")
+        elif f == "addressed_via":
+            if task.get(f) == "owner":  # the broker's one value; anything else is no claim
+                lines.append("addressed_via: owner")
+        elif f in ("mentions_you", "replied_to_you", "you_in_thread"):
+            _mv = task.get(f)
+            _mv = ("true" if _mv else "false") if isinstance(_mv, bool) else _mv
+            if _mv in ("true", "false"):
+                lines.append(f"{f}: {_mv}")
         elif f == "picker_args":
             # Present-but-unusable is preserved as a refusing stamp, like
             # picker_command: dropping it makes `add` + bad args a valid add.
@@ -6960,7 +6993,7 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
         lines.extend(_signal_task_media_lines(str(RESULTS_DIR / tid)))
     # ===SKILL INSTRUCTIONS=== (owner-tier only): prose/numbered lines only, no
     # header-shaped lines, so appending after access_tier keeps it the last one.
-    if sender_tier == "owner":
+    if sender_tier == "owner" and TASK_PRELUDE == "sutando":
         # Template lives in result_markers.render_skill_prelude (single owner):
         # a dedup requeue re-renders it there from the stored header (#3613).
         lines.extend(render_skill_prelude(
@@ -9064,7 +9097,8 @@ def _post_proactive() -> None:
         if route == "foreign" or (
                 route == "send" and room_override is not None
                 and not _room_is_deliverable_here(room_override)) or (
-                route == "send" and room_override is None and (not owner_directed_is_mine(f) or not proactive_room())):
+                route == "send" and room_override is None
+                and (not owner_directed_is_mine(f, claimed_text) or not proactive_room())):
             # Hand back rather than eat: a foreign target seen only post-claim, or one that vanished
             # and left an unaddressed body this instance may not own or cannot place.
             _hand_back(claim, f)

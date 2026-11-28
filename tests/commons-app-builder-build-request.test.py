@@ -229,6 +229,13 @@ def run(room, text, adaptation=None, ledger=None):
 
 # --------------------------------------------------------------------------- the literal examples
 SPEC = (_SKILL / "BUILD_REQUEST.md").read_text(encoding="utf-8")
+_flat = " ".join(SPEC.split())
+check("spec-exit-3-rerun-is-conditional-on-the-description",
+      "After `action` exits 3, if the step's Action description says a repeated `operation_id` is"
+      " safe, run that step again unchanged, with the same id" in _flat
+      and "Never run it with a new id. Otherwise read the page or rows back before deciding" in _flat)
+check("spec-never-sends-the-reader-to-operation-inspect",
+      _flat.count("operation.inspect") == _flat.count("`operation.inspect` does not know these writes") == 1)
 blocks = re.findall(r"```commons-app-build\n(.*?)\n```", SPEC, re.S)
 requests = [json.loads(b) for b in blocks if '"mode"' in b]
 replies = [json.loads(b) for b in blocks if '"status"' in b]

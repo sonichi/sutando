@@ -34,7 +34,7 @@ COMMAND = "ag2-sparrow-antigravity-local"
 ENV_KEEP = ("PATH", "HOME", "USER", "LANG", "TMPDIR", "SHELL")
 REQUIRED_KEYS = ("ACP_COMMAND", "CWD", "INBOX_DIR", "RESULTS_DIR")
 CONFIG_KEYS = ("ACP_COMMAND", "CWD", "SESSION_STORE", "INBOX_DIR", "RESULTS_DIR",
-               "ALLOW_NON_OWNER", "ALLOW_OWNER_SHELL_WEB", "MCP_PROXY_COMMAND") + cb.CONFIG_KEYS
+               "ALLOW_NON_OWNER", "ALLOW_COLLABORATOR", "ALLOW_OWNER_SHELL_WEB", "MCP_PROXY_COMMAND") + cb.CONFIG_KEYS
 LOCAL = Shape(name=SHAPE, command=COMMAND, description="Antigravity CLI on Sparrow",
               cli="Antigravity CLI", min_version=(0, 0, 0), version_anchor=r"^\d",
               version_note="the ACP wake and the sign-in are checked by verify, not by a version",
@@ -102,6 +102,8 @@ def connector_argv(cfg: dict, root: str, root_fd: int) -> list:
         argv += ["--session-store", cfg["SESSION_STORE"]]
     if cfg.get("ALLOW_NON_OWNER") == "1":
         argv.append("--allow-non-owner")
+    if cfg.get("ALLOW_COLLABORATOR") == "0":
+        argv.append("--no-allow-collaborator")
     if cfg.get("ALLOW_OWNER_SHELL_WEB") == "1":
         argv.append("--allow-owner-shell-web")
     if cfg.get("TOKEN_ENV_FILE"):
@@ -177,6 +179,16 @@ RECORDED = (("ACP_COMMAND", "acp_command", str), ("CWD", "cwd", str),
             ("MCP_PROXY_COMMAND", "mcp_proxy_command", str))
 
 
+def collaborator_choice(args, local: Shape) -> str:
+    """ALLOW_COLLABORATOR's value: '1' or '0' as the flag given, else the job's own recorded one (a missing or
+    older config: '1'), so a repair, a reinstall and an updated app's --replace-install never drop an opt-out."""
+    if getattr(args, "allow_collaborator", False):
+        return "1"
+    if getattr(args, "no_allow_collaborator", False):
+        return "0"
+    return "0" if load_config(local)[0].get("ALLOW_COLLABORATOR") == "0" else "1"
+
+
 def signed_in_problem(args, acp: str, agent_id: str = "") -> str:
     """'' when the agent answers and is signed in (checked once per install), else why not. `agent_id` is
     the agent being installed: with it the check also counts a Gemini API key saved for that agent in the
@@ -225,6 +237,7 @@ def install(args) -> int:
               "SESSION_STORE": str(Path(args.session_store).expanduser().resolve()) if args.session_store else "",
               "INBOX_DIR": str(Path(root) / "tasks"), "RESULTS_DIR": str(Path(root) / "results"),
               "ALLOW_NON_OWNER": "1" if args.allow_non_owner else "",
+              "ALLOW_COLLABORATOR": collaborator_choice(args, local),
               "ALLOW_OWNER_SHELL_WEB": "1" if getattr(args, "allow_owner_shell_web", False) else "", "AGENT_ID": where["agent_id"],
               "MCP_PROXY_COMMAND": proxy,
               "BRIDGE": mode if mode != EXTERNAL else "", "TOKEN_ENV_FILE": where["token_file"], "TOKEN_VAULT_KEY": "",
@@ -338,8 +351,12 @@ def verify(args, factory=gc.AcpClient) -> int:
     store = cfg.get("SESSION_STORE") or str(Path(cm.work_root(cfg)) / "state" / gc.SESSIONS_NAME)
     print(f"INFO sessions: {store} (the owner's and each collaborator's resumed per room, never retired; any "
           "other non-owner's turn is a throwaway session)")
-    print("INFO team (attested collaborator): the owner's turn, on the owner's agy account: the working directory, "
-          "agy's own home, the owner's permission policy")
+    if cfg.get("ALLOW_COLLABORATOR") == "0":
+        print("INFO team (attested collaborator): opted out (--no-allow-collaborator): served as a guest is, never "
+              "the shared session")
+    else:
+        print("INFO team (attested collaborator): the owner's turn, on the owner's agy account: the working "
+              "directory, agy's own home, the owner's permission policy, the shared session")
     print("INFO guests, plain team and unknown tiers: served, each turn in its own temporary directory and agy "
           "home, deny-all rules, read-only (plan) mode, no file operations")
     print("INFO owner shell and web: " + ("on (--allow-owner-shell-web): the owner's turns may run commands and "
@@ -409,6 +426,12 @@ def session_options(p) -> None:
     p.add_argument("--allow-non-owner", action="store_true",
                    help="no effect, kept so existing configs parse: an attested collaborator always gets the "
                    "owner's turn, any other non-owner an isolated read-only one (all on the owner's agy sign-in)")
+    co = p.add_mutually_exclusive_group()
+    co.add_argument("--allow-collaborator", action="store_true",
+                    help="an attested collaborator (Team) shares the owner's turn and shared session (the default)")
+    co.add_argument("--no-allow-collaborator", action="store_true",
+                    help="opt out: an attested collaborator is served as a guest is (an isolated read-only turn), "
+                    "never the owner's session, history, tools or sign-in; a repair or an app update keeps it")
     p.add_argument("--allow-owner-shell-web", action="store_true",
                    help="let the owner's turns run shell commands and fetch or search the web, as a local Claude "
                    "Code agent may, and an attested collaborator's turn run as the owner's (never plain Team's or a "

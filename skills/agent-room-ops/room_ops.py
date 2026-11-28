@@ -22,6 +22,8 @@ graceful-degrade); this file is the unified CLI that dispatches to them.
     python3 room_ops.py events list
     python3 room_ops.py events pull [--cursor N] [--wait S]
     python3 room_ops.py events stream [--cursor-file PATH] [--once] [--max-events N]
+    python3 room_ops.py action describe|read|execute <room> room.commons.<x> [--args JSON | --args-file PATH]
+                               (--task-file TASK | --no-task) [--operation-id ID] [--agent mxid]  # Commons Actions
     python3 room_ops.py capabilities                                 # supported commands + say flags
 
 Every subcommand prints a structured JSON result and **exits 0** for any
@@ -52,6 +54,7 @@ import rooms as _rooms     # noqa: E402
 import members as _members # noqa: E402
 import events as _events   # noqa: E402
 import history as _history # noqa: E402
+import action as _action   # noqa: E402
 import _gateway            # noqa: E402
 
 
@@ -287,6 +290,26 @@ def _run(argv):
     p.add_argument("--pages", type=int, default=20)
     p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
 
+    p = sub.add_parser("action", help="run one room.commons.* Action as this session's own agent")
+    p.add_argument("verb", choices=sorted(_action.TOOLS))
+    p.add_argument("room_id")
+    p.add_argument("action", help="the Action's name; only room.commons.* is sent")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--args", dest="args_json", default=None, metavar="JSON",
+                   help="the Action's arguments, a JSON object")
+    g.add_argument("--args-file", dest="args_file", default=None, metavar="PATH",
+                   help="a UTF-8 file holding the Action's arguments, a JSON object")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--task-file", dest="action_task_file", default=None, metavar="TASK",
+                   help="the task an execute answers: the person who asked it (its asked_by or "
+                        "user_id header) is sent as asked_by, so the write is held to their rights")
+    g.add_argument("--no-task", dest="no_task", action="store_true",
+                   help="execute work nobody asked for, with the agent's own rights and no asked_by; "
+                        "an execute needs this or --task-file")
+    p.add_argument("--operation-id", dest="operation_id", default=None,
+                   help="execute: reuse the id of an earlier attempt to retry it without acting twice")
+    p.add_argument("--agent", dest="agent_mxid", default=os.environ.get("AGENT_MXID"))
+
     sub.add_parser("capabilities", help="print, as JSON, the subcommands and `say` flags this "
                                         "copy supports, so a caller can pick a capable copy")
 
@@ -305,7 +328,10 @@ def _run(argv):
         say_flags = sorted(o for act in sub.choices["say"]._actions for o in act.option_strings
                            if o.startswith("--") and o != "--help")
         print(json.dumps({"ok": True, "commands": sorted(sub.choices), "say": say_flags,
-                          "say_extra_content_checked": True}, indent=2))
+                          "say_extra_content_checked": True,
+                          "action": {"verbs": sorted(_action.TOOLS), "actions": "room.commons.*",
+                                     "asked_by_from": "--task-file",
+                                     "execute_needs_one_of": ["--task-file", "--no-task"]}}, indent=2))
         return 0
     if a.cmd == "read":
         res = _read.read_room(a.room_id, a.agent_mxid, a.limit, before=a.before,
@@ -369,6 +395,20 @@ def _run(argv):
             _kw["thread_root"] = a.thread_root
         res = _say.say(a.message, a.room_id, a.agent_mxid, **_kw)
         _record_say(res)
+    elif a.cmd == "action":
+        try:
+            raw = Path(a.args_file).read_text(encoding="utf-8") if a.args_file else (a.args_json or "{}")
+            arguments = json.loads(raw)
+        except (OSError, UnicodeError, ValueError) as e:
+            print(json.dumps({"ok": False, "state": "not_sent",
+                              "reason": f"the Action's arguments are not readable JSON ({type(e).__name__})"}))
+            return 2
+        res = _action.run(a.verb, a.room_id, a.action, arguments, task_file=a.action_task_file,
+                          no_task=a.no_task,
+                          agent_mxid=a.agent_mxid, operation_id=a.operation_id)
+        # Unlike the older verbs, a Commons Action that did not complete never exits 0.
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+        return 0 if res.get("ok") else 1
     elif a.cmd == "grant":
         import grant as _grant
         try:
