@@ -13064,6 +13064,13 @@ def _pin_scope_flag(scope: str) -> str:
     return "-g" if scope == GLOBAL_PIN_SCOPE else f"-t '={scope}'"
 
 
+def _marked_not_core(socket: str, sess: str) -> bool:
+    """True only for a session its launcher marked not-a-core (SUTANDO_CORE_SESSION set empty,
+    as a pool worker's is): it may pin its own --model. Unset or unreadable stays a core candidate."""
+    res = _run_tmux(socket, "show-environment", "-t", f"={sess}", "SUTANDO_CORE_SESSION")
+    return res is not None and res.returncode == 0 and (res.stdout or "").strip() == "SUTANDO_CORE_SESSION="
+
+
 def _core_argv_pins(socket: str, sessions: list) -> list:
     """[(session, model)] for live cores pinned via argv; (session, None) when no
     argv could be read. argv is immutable, so a tmux clear cannot undo a pin."""
@@ -13318,6 +13325,7 @@ def check_core_model_pin() -> dict:
                 "detail": (f"could not enumerate core tmux sessions ({e}), so no core "
                            f"argv was inspected — the tmux env is clear, but a clear "
                            f"cannot move a running core off a pinned model")}
+    sessions = [s for s in sessions if not _marked_not_core(socket, s)]
     return _interpret_core_model_pin(pinned, socket,
                                      _core_argv_pins(socket, sessions),
                                      _settings_model_pins(),

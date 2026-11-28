@@ -2408,17 +2408,23 @@ def _storage_dirs(record: Mapping, worker: str, workspace: Optional[Path], *,
     return root / "tasks", root / "results"
 
 
-def _record_or_none(workspace: Optional[Path]) -> Optional[dict]:
+def _record_or_none(workspace: Optional[Path], *, strict: bool = False) -> Optional[dict]:
+    """The record, read only; None when it is unreadable, which `strict` raises instead (SchemaError or
+    OSError)."""
     try:
         return _read_record(record_path(workspace))
     except (SchemaError, OSError):
+        if strict:
+            raise
         return None
 
 
-def worker_dirs(worker: str, workspace: Optional[Path] = None) -> "Optional[tuple[Path, Path]]":
+def worker_dirs(worker: str, workspace: Optional[Path] = None, *,
+                strict: bool = False) -> "Optional[tuple[Path, Path]]":
     """The worker's stable task/results folders once its state is "own", shared by all its identities;
-    None for shared storage, a switch not yet committed, or an unreadable record."""
-    record = _record_or_none(workspace)
+    None for shared storage, a switch not yet committed, or an unreadable record unless `strict`, which
+    raises."""
+    record = _record_or_none(workspace, strict=strict)
     return _storage_dirs(record, worker, workspace) if record else None
 
 
@@ -2437,9 +2443,11 @@ def worker_dirs_state(worker: str, workspace: Optional[Path] = None) -> str:
     return _storage_state(record, worker) if record else ""
 
 
-def worker_target_dirs(worker: str, workspace: Optional[Path] = None) -> "Optional[tuple[Path, Path]]":
-    """The folders `worker` is switching to or is on (any folder state); None otherwise."""
-    record = _record_or_none(workspace)
+def worker_target_dirs(worker: str, workspace: Optional[Path] = None, *,
+                       strict: bool = False) -> "Optional[tuple[Path, Path]]":
+    """The folders `worker` is switching to or is on (any folder state); None otherwise, or when
+    unreadable unless `strict`, which raises."""
+    record = _record_or_none(workspace, strict=strict)
     return _storage_dirs(record, worker, workspace, states=WORKER_DIRS_STATES) if record else None
 
 
@@ -3644,7 +3652,8 @@ SESSION_ENV = frozenset((
     "SUTANDO_TMUX_SOCKET", "SUTANDO_TMUX_SESSION", "SUTANDO_TASKS_DIR", "SUTANDO_RESULTS_DIR",
     "SUTANDO_WORKSPACE_DIR", "SUTANDO_INBOX_KIND", "SUTANDO_INBOX_RESOLVER", "SUTANDO_INBOX_RESOLVER_TIMEOUT",
     "SUTANDO_CLAUDE_WORKING_DIR", "SUTANDO_CODEX_WORKING_DIR", "SUTANDO_WORKER_BOOTSTRAP",
-    "SUTANDO_POOL_DELIVERY_SCRIPT", "SUTANDO_WORKER_PLUGIN_DIRS", "SUTANDO_WATCHER_CMD", "SUTANDO_WATCHER_BEAT",
+    "SUTANDO_POOL_DELIVERY_SCRIPT", "SUTANDO_WORKER_PLUGIN_DIRS", "SUTANDO_WORKER_MODEL",
+    "SUTANDO_WATCHER_CMD", "SUTANDO_WATCHER_BEAT",
     "SUTANDO_TASK_WATCH_MOD", "SUTANDO_TASK_WATCH_MOD_WORKER", "SUTANDO_TASK_EVENT_HANDLER",
     "SUTANDO_CLAUDE_SESSION_ID", "SUTANDO_CLAUDE_RESUME", "AG2_MCP_WORKER_CREDENTIAL",
 ))

@@ -60,6 +60,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`claude_account.py`** — Which Claude account a config dir is signed in to, as a non-reversible digest, and the config dir the Sutando core runs under.
 - **`claude_config_dir.sh`** — Shared CLAUDE_CONFIG_DIR resolution for start-cli.sh and startup.sh.
 - **`claude_hooks_settings.py`** — Sutando-owned hook entries in a project-level Claude Code settings.json: install one idempotently, prune dead copies of the same hook, and re-point hooks a moved install left on its old path.
+- **`claude_model_name.py`** — Model names the Claude CLI's `--model` and `/model` accept: an alias or a `claude-*` id.
 - **`claude_model_switch.py`** — What switching Claude Code's model by typing `/model` relies on: which model names may be typed, the two texts Claude Code answers with, and whether its input box is empty (read by the core's own parser, src/pane_composer.py).
 - **`claude_routing.sh`** — Whether Claude sessions are routed through the local credential proxy or call Anthropic directly.
 - **`claude_signed_in.py`** — Detect a Claude config dir that is not signed in on its own, and tell the owner how to sign it in.
