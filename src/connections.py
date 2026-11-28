@@ -4699,7 +4699,7 @@ def _env_file_with(path: Path, key: str, value: str) -> str:
 
 def mcp_descriptor_path(workspace: Optional[Path], mcp_config: Optional[Path] = None) -> Path:
     """The agent MCP descriptor a terminal-run core reads: the `AG2_MCP_DESCRIPTOR` its Claude Code
-    MCP config (`mcp_config`, default `<claude home>/.claude.json`) names inside the workspace, else
+    MCP config (`mcp_config`, default `claude_config_file()`) names inside the workspace, else
     `state/ag2-mcp.json`. A descriptor outside the workspace is the desktop host's and never chosen."""
     ws = _workspace(workspace).resolve()
     for named in _claude_config_descriptors(mcp_config):
@@ -4726,15 +4726,22 @@ def _named_descriptors(servers) -> "list[Path]":
 
 
 def _claude_config_descriptors(mcp_config: Optional[Path]) -> "list[Path]":
-    """Descriptors the Claude Code MCP config (`mcp_config`, default `<claude home>/.claude.json`) names."""
+    """Descriptors the Claude Code MCP config (`mcp_config`, default `claude_config_file()`) names."""
     return _named_descriptors(_claude_config_servers(mcp_config))
+
+
+def claude_config_file(environ: Optional[Mapping[str, str]] = None) -> Path:
+    """The file Claude Code keeps its user-scope `mcpServers` in: `$CLAUDE_CONFIG_DIR/.claude.json`,
+    else `.claude.json` in the home folder itself (not in `~/.claude`)."""
+    environ = os.environ if environ is None else environ
+    folder = (environ.get("CLAUDE_CONFIG_DIR") or "").strip()
+    return (Path(folder).expanduser() if folder else Path.home()) / ".claude.json"
 
 
 def _claude_config_servers(mcp_config: Optional[Path]):
     """The Claude Code MCP config's `mcpServers` table; {} when unreadable."""
     if mcp_config is None:
-        from util_paths import claude_home_path
-        mcp_config = claude_home_path(".claude.json")
+        mcp_config = claude_config_file()
     try:
         return json.loads(Path(mcp_config).read_text(encoding="utf-8")).get("mcpServers") or {}
     except (OSError, ValueError, AttributeError):
@@ -4742,7 +4749,7 @@ def _claude_config_servers(mcp_config: Optional[Path]):
 
 
 def moved_mcp_servers(mcp_config: Optional[Path] = None, space_of=None) -> "list[dict]":
-    """Claude Code MCP entries (`mcp_config`, default `<claude home>/.claude.json`) whose `url` is the
+    """Claude Code MCP entries (`mcp_config`, default `claude_config_file()`) whose `url` is the
     MCP endpoint of a server that moved, in entry order: [{name, server, successor, mcp_url}], `mcp_url`
     the successor's endpoint ('' when it registers none). Such an entry is refused on every connect; a
     proxy entry is not listed, its descriptor being what `repoint_mcp_descriptor` moves."""
@@ -4764,16 +4771,14 @@ def moved_mcp_servers(mcp_config: Optional[Path] = None, space_of=None) -> "list
 
 def mcp_remove_command(name: str, mcp_config: Optional[Path] = None) -> str:
     """The shell command that removes the user-scope MCP entry `name` from the Claude Code config
-    `mcp_config` (default as `moved_mcp_servers`): the name shell-quoted as one argument, and
-    `CLAUDE_CONFIG_DIR=<the config's folder>` in front unless that folder is stock Claude Code's, so
-    the command edits the file that was read from whichever shell it is pasted into."""
+    `mcp_config` (default `claude_config_file()`), pinned to that file whatever shell it is pasted
+    into: `CLAUDE_CONFIG_DIR=<its folder>` in front, or `env -u CLAUDE_CONFIG_DIR` for the home
+    folder's own `.claude.json`; the name is shell-quoted as one argument after `--`."""
     import shlex
-    from util_paths import claude_home_path
-    config = Path(mcp_config) if mcp_config is not None else claude_home_path(".claude.json")
-    folder = Path(os.path.abspath(config.expanduser())).parent
-    stock = Path(os.path.abspath(claude_home_path(vanilla=True).expanduser()))
-    own = "" if os.path.realpath(folder) == os.path.realpath(stock) else f"CLAUDE_CONFIG_DIR={shlex.quote(str(folder))} "
-    return f"{own}claude mcp remove --scope user {shlex.quote(name)}"
+    config = Path(os.path.abspath((Path(mcp_config) if mcp_config is not None else claude_config_file()).expanduser()))
+    at_home = config == Path(os.path.abspath(Path.home() / ".claude.json"))
+    pin = "env -u CLAUDE_CONFIG_DIR" if at_home else f"CLAUDE_CONFIG_DIR={shlex.quote(str(config.parent))}"
+    return f"{pin} claude mcp remove --scope user -- {shlex.quote(name)}"
 
 
 def _codex_config_path(environ: Mapping[str, str]) -> Optional[Path]:

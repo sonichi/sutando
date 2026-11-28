@@ -4,7 +4,7 @@
 `connections.moved_mcp_servers` lists the config's `url` entries on the MCP endpoint of a server
 with a successor; `scripts/connections.py moved-mcp-servers` prints one line per entry with the
 successor and the remove command (`connections.mcp_remove_command`: the name shell-quoted as one
-argument, `CLAUDE_CONFIG_DIR` in front when the config is not stock Claude Code's). A proxy entry, an entry on a live server and an unreadable
+argument after `--`, and pinned to the file that was read). A proxy entry, an entry on a live server and an unreadable
 config list nothing.
 
 Run: python3 tests/connections-moved-mcp-servers.test.py
@@ -78,59 +78,73 @@ class TheDetector(Base):
 
 
 class TheRemoveCommand(Base):
-    NAMES = ("plain", "Old Space", "$HOME", "`id`", "$(id)", "it's", 'say "hi"', "-rf", "--scope", "a;b|c&d", "tab\there",
-             "back\\slash", "*", "~", "!!", "")
+    NAMES = ("plain", "Old Space", "$HOME", "`id`", "$(id)", "it's", 'say "hi"', "-x", "-rf", "--scope", "--", "a;b|c&d",
+             "tab\there", "back\\slash", "*", "~", "!!", "")
+    TAIL = ["claude", "mcp", "remove", "--scope", "user", "--"]
 
-    def stock(self):
-        home = self.root / "stock"
-        home.mkdir(exist_ok=True)
-        return mock.patch.dict(os.environ, {"SOURCE_CLAUDE_CONFIG_DIR": str(home)}), home
+    def setUp(self):
+        super().setUp()
+        self.home = self.root / "home"
+        self.home.mkdir()
+        patcher = mock.patch.dict(os.environ, {"HOME": str(self.home)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
 
-    def test_the_name_parses_back_as_one_literal_argument(self):
-        patch, home = self.stock()
-        with patch:
-            for name in self.NAMES:
-                argv = shlex.split(C.mcp_remove_command(name, home / ".claude.json"))
-                self.assertEqual(argv, ["claude", "mcp", "remove", "--scope", "user", name], name)
+    def test_the_name_parses_back_as_one_literal_argument_after_the_option_terminator(self):
+        for name in self.NAMES:
+            for config in (self.home / ".claude.json", self.root / "seat" / ".claude.json"):
+                argv = shlex.split(C.mcp_remove_command(name, config))
+                self.assertEqual(argv[-7:], self.TAIL + [name], name)
 
-    def test_a_shell_runs_the_command_with_the_literal_name(self):
-        patch, home = self.stock()
+    def test_the_home_folders_own_file_gets_no_folder_assignment(self):
+        self.assertEqual(C.mcp_remove_command("x", self.home / ".claude.json"),
+                         "env -u CLAUDE_CONFIG_DIR claude mcp remove --scope user -- x")
+        self.assertEqual(C.mcp_remove_command("x"), "env -u CLAUDE_CONFIG_DIR claude mcp remove --scope user -- x")
+
+    def test_any_config_folder_is_named_as_one_env_assignment(self):
+        stock = self.home / ".claude"
+        with mock.patch.dict(os.environ, {"SOURCE_CLAUDE_CONFIG_DIR": str(self.root / "seat")}):
+            for folder in (self.root / "seat", stock, self.root / "seat's $dir with `ticks`"):
+                argv = shlex.split(C.mcp_remove_command("x", folder / ".claude.json"))
+                self.assertEqual(argv, [f"CLAUDE_CONFIG_DIR={folder}"] + self.TAIL + ["x"])
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.root / "seat")}):
+            self.assertEqual(shlex.split(C.mcp_remove_command("x"))[0], f"CLAUDE_CONFIG_DIR={self.root / 'seat'}")
+
+    def test_a_relative_config_is_named_by_its_absolute_folder(self):
+        first = shlex.split(C.mcp_remove_command("x", Path("rel") / ".claude.json"))[0]
+        self.assertEqual(first, f"CLAUDE_CONFIG_DIR={Path.cwd() / 'rel'}")
+
+    def test_a_shell_with_another_folder_inherited_still_reaches_the_file_that_was_read(self):
         fake = self.root / "bin" / "claude"
         fake.parent.mkdir()
         fake.write_text('#!/bin/sh\nprintf "%s\\n" "$#" "${CLAUDE_CONFIG_DIR-unset}"; for a in "$@"; do printf "%s\\0" "$a"; done\n')
         fake.chmod(0o755)
-        env = {"PATH": f"{fake.parent}:/usr/bin:/bin", "HOME": str(self.root)}
         own = self.root / "seat's $dir"
-        with patch:
+        for inherited in ({}, {"CLAUDE_CONFIG_DIR": str(self.root / "some other folder")}):
+            env = {"PATH": f"{fake.parent}:/usr/bin:/bin", "HOME": str(self.home), **inherited}
             for name in self.NAMES:
-                for config, folder in ((home / ".claude.json", "unset"), (own / ".claude.json", str(own))):
+                for config, folder in ((self.home / ".claude.json", "unset"), (own / ".claude.json", str(own))):
                     r = subprocess.run(["/bin/sh", "-c", C.mcp_remove_command(name, config)], env=env,
                                        capture_output=True, text=True, timeout=30, cwd=self.root)
                     count, seen, rest = r.stdout.split("\n", 2)
                     self.assertEqual((r.returncode, count, seen, rest.split("\0")[:-1]),
-                                     (0, "5", folder, ["mcp", "remove", "--scope", "user", name]), (name, r.stderr))
+                                     (0, "6", folder, self.TAIL[1:] + [name]), (name, inherited, r.stderr))
 
-    def test_the_stock_folder_gets_no_prefix(self):
-        patch, home = self.stock()
-        with patch:
-            self.assertEqual(C.mcp_remove_command("x", home / ".claude.json"), "claude mcp remove --scope user x")
-            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(home)}):
-                self.assertEqual(C.mcp_remove_command("x"), "claude mcp remove --scope user x")
 
-    def test_another_folder_is_named_as_one_env_assignment(self):
-        patch, _ = self.stock()
-        with patch:
-            for folder in (self.root / "seat", self.root / "seat's $dir with `ticks`"):
-                argv = shlex.split(C.mcp_remove_command("x", folder / ".claude.json"))
-                self.assertEqual(argv, [f"CLAUDE_CONFIG_DIR={folder}", "claude", "mcp", "remove", "--scope", "user", "x"])
-            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.root / "seat")}):
-                self.assertEqual(shlex.split(C.mcp_remove_command("x"))[0], f"CLAUDE_CONFIG_DIR={self.root / 'seat'}")
+class TheDefaultConfig(Base):
+    def test_without_a_config_folder_it_is_the_home_folders_own_file(self):
+        home = self.root / "home"
+        (home / ".claude").mkdir(parents=True)
+        (home / ".claude" / ".claude.json").write_text(json.dumps({"mcpServers": {"nested": {"url": OLD_MCP}}}))
+        (home / ".claude.json").write_text(json.dumps({"mcpServers": {"root": {"url": OLD_MCP}}}))
+        with mock.patch.dict(os.environ, {"HOME": str(home), "CLAUDE_HOME": str(home / ".claude")}):
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            self.assertEqual(C.claude_config_file(), home / ".claude.json")
+            self.assertEqual([e["name"] for e in C.moved_mcp_servers()], ["root"])
 
-    def test_a_relative_config_is_named_by_its_absolute_folder(self):
-        patch, _ = self.stock()
-        with patch:
-            first = shlex.split(C.mcp_remove_command("x", Path("rel") / ".claude.json"))[0]
-        self.assertEqual(first, f"CLAUDE_CONFIG_DIR={Path.cwd() / 'rel'}")
+    def test_with_a_config_folder_it_is_that_folders_file(self):
+        self.assertEqual(C.claude_config_file({"CLAUDE_CONFIG_DIR": str(self.root)}), self.root / ".claude.json")
 
 
 class TheCli(Base):
@@ -144,7 +158,7 @@ class TheCli(Base):
         self.assertEqual((r.returncode, r.stderr), (0, ""), r.stderr)
         self.assertEqual(r.stdout.splitlines(), [
             f'MCP server "Old Space" connects to {OLD}, which moved to {NEW} ({NEW_MCP}); it will not connect. '
-            f"Remove it with: CLAUDE_CONFIG_DIR={self.root} claude mcp remove --scope user 'Old Space'"])
+            f"Remove it with: CLAUDE_CONFIG_DIR={self.root} claude mcp remove --scope user -- 'Old Space'"])
         self.assertNotIn("hush", r.stdout)
         self.assertEqual(self.config.read_bytes(), before, "the config is only read")
 
