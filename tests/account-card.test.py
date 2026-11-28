@@ -3,7 +3,10 @@
 
 - The card names the core's account masked: a Codex core's from codex_account, a Claude core's from
   `claude auth status --json`. A Codex core's card has a "Use" button per other account in the
-  desktop's store and always "Add another account"; a Claude core's has only the latter.
+  desktop's store and always "Add another account"; a Claude core's has only the latter, unless the desktop's
+  marker in the core's Claude folder says it switches the core (ag2space-cinny-desktop#1348): then the
+  desktop's saved Claude accounts are listed, a "Use" pick leaves a `"target":"core"` request there, and a
+  detached `await-core` tells the desktop's answer, or withdraws a request left unclaimed for 90 s.
 - `post` saves the signed-in Codex account in the store in the desktop's format and key rule
   (16 hex of sha256(account id)), folder 0700 and file 0600.
 - Only the owner's tap in the DM on a card this agent posted acts. "Add another account" points to
@@ -161,7 +164,8 @@ class Base(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
         self.ws, self.home, self.app = root / "ws", root / "codex-home", root / "app-support"
-        for d in (self.ws, self.home, self.app):
+        self.cdir = root / "claude-core"  # the core's Claude config dir (CLAUDE_CONFIG_DIR)
+        for d in (self.ws, self.home, self.app, self.cdir):
             d.mkdir()
         self.store = self.app / "accounts" / "codex"
         self.agent_homes = []      # local Codex agents' homes on this computer
@@ -172,6 +176,7 @@ class Base(unittest.TestCase):
         for target, name, value in ((acc, "_owner_dm", lambda ws, core: DM),
                                     (acc, "runtime", lambda: self.RUNTIME),
                                     (acc, "codex_home", lambda: self.home),
+                                    (acc, "claude_core_dir", lambda: self.cdir),
                                     (acc, "local_codex_homes", lambda user_home=None: list(self.agent_homes)),
                                     (connections, "read_rows", lambda ws=None: [CORE])):
             patch = mock.patch.object(target, name, value)
@@ -519,6 +524,201 @@ class ClaudeCard(Base):
         rc, out = self.tap("Use x", card_click=json.dumps({"card_id": acc.CARD_ID, "action": "Use x"}))
         self.assertNotEqual(out.get("status"), "started")
         self.assertEqual(self.launch.calls, [])
+
+
+def ckey(email: str) -> str:
+    """The desktop's key of a saved Claude account: 16 hex of the SHA-256 of its email."""
+    return hashlib.sha256(email.encode()).hexdigest()[:16]
+
+
+MARKER = {"v": 2, "runtimes": ["claude"], "target": "core"}
+NONCE = "0f8fad5b-d9cb-469f-a165-70867728950e"
+
+
+class ClaudeCoreSwitch(Base):
+    """A Claude core whose Claude folder the desktop watches (#1348): saved accounts listed, a pick is a request."""
+    RUNTIME = "claude"
+
+    def setUp(self):
+        super().setUp()
+        self.mark(MARKER)
+        index = self.app / "accounts" / "claude" / "index.json"
+        index.parent.mkdir(parents=True)
+        index.write_text(json.dumps({ckey("susan@example.com"): "susan@example.com (max)",
+                                     ckey("bob@work.io"): "bob@work.io (pro)", "not-a-key": "x@y.z"}))
+
+    def mark(self, body):
+        (self.cdir / acc.CONSUMER).write_text(body if isinstance(body, str) else json.dumps(body))
+
+    def request(self):
+        return json.loads((self.cdir / acc.REQUEST).read_text())
+
+    def test_the_menu_lists_the_saved_accounts_with_the_one_in_use_marked_and_inert(self):
+        rc, out = self.post()
+        self.assertEqual((rc, out["status"]), (0, "posted"))
+        card = self.fake.cards()[0]
+        self.assertIsNone(ac.problem(card))
+        menu = account_menu(card)
+        self.assertEqual([(i["label"], i.get("command"), i.get("disabled", False)) for i in menu],
+                         [("susan@example.com (current)", None, True),
+                          ("bob@work.io", f"card:account:core:{ckey('bob@work.io')}", False),
+                          ("Add account…", "card:account:core:add", False)])
+        self.assertEqual(acc.offered_keys(self.ws, "$card1"), [ckey("susan@example.com"), ckey("bob@work.io")])
+        self.assertIn("Pick an account to switch to", card["text"])
+        self.assertNotIn("(pro)", json.dumps(card))
+
+    def test_without_the_cores_marker_the_card_is_as_before(self):
+        for body in (None, "not json", {**MARKER, "v": 1}, {**MARKER, "v": True}, {**MARKER, "v": "2"},
+                     {**MARKER, "runtimes": ["codex"]}, {**MARKER, "runtimes": "claude"},
+                     {"v": 2, "runtimes": ["claude", "codex"]}, {**MARKER, "target": "worker"}):
+            with self.subTest(body=body):
+                self.mark(MARKER)
+                # A card from while the desktop watched; its marker then gone or wrong.
+                self.run_(["post", "--room", DM, "--reply-to", f"$ask-{len(self.outputs)}"])
+                event = f"$card{len(self.fake.calls)}"
+                if body is None:
+                    (self.cdir / acc.CONSUMER).unlink()
+                else:
+                    self.mark(body)
+                rc, out = self.tap("Use bob@work.io", event=event, source_message_id=f"$tap-{len(self.outputs)}")
+                self.assertEqual((rc, out["say"]), (2, acc.NOT_CODEX))
+                self.assertFalse((self.cdir / acc.REQUEST).exists())
+                self.assertEqual(self.launch.calls, [])
+                self.run_(["post", "--room", DM, "--reply-to", f"$ask-{len(self.outputs)}"])
+                self.assertEqual([i["label"] for i in account_menu(self.fake.cards()[-1])], ["Add account…"])
+
+    def test_a_pick_leaves_the_request_for_the_desktop_and_starts_the_watcher(self):
+        self.post()
+        rc, out = self.tap("Use bob@work.io")
+        self.assertEqual((rc, out["status"]), (0, "started"), out)
+        path = self.cdir / acc.REQUEST
+        req = self.request()
+        self.assertEqual(sorted(req), ["at", "key", "nonce", "target", "v"])
+        self.assertEqual((req["v"], req["key"], req["target"]), (2, ckey("bob@work.io"), "core"))
+        self.assertIsInstance(req["at"], int)
+        self.assertRegex(req["nonce"], r"^[A-Za-z0-9-]{8,64}$")
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertEqual(sorted(os.listdir(self.cdir)), [acc.CONSUMER, acc.REQUEST], "no temp file left")
+        said = "Switching the core to bob@work.io… the core restarts once; I'll confirm here."
+        self.assertEqual(out["say"], said)
+        self.assertEqual(self.fake.cards()[-1]["text"], said)
+        argv, kw = self.launch.calls[0]
+        self.assertEqual(argv[-7:], ["await-core", "--room", DM, "--key", ckey("bob@work.io"), "--nonce", req["nonce"]])
+        self.assertTrue(kw["start_new_session"])
+        # The same tap again, or another while a request waits: no second request.
+        rc, out = self.tap("Use bob@work.io")
+        self.assertEqual(out["say"], acc.ACTED)
+        rc, out = self.tap("Use bob@work.io", source_message_id="$again")
+        self.assertEqual(out["say"], acc.WAITING)
+        self.assertEqual(self.request()["nonce"], req["nonce"])
+        self.assertEqual(len(self.launch.calls), 1)
+
+    def test_a_claim_still_held_refuses_a_new_request(self):
+        self.post()
+        (self.cdir / (acc.CLAIMED % NONCE)).write_text("{}")
+        rc, out = self.tap("Use bob@work.io")
+        self.assertEqual(out["say"], acc.WAITING)
+        self.assertFalse((self.cdir / acc.REQUEST).exists())
+
+    def test_a_key_the_card_did_not_offer_or_no_longer_saved_starts_nothing(self):
+        self.post()
+        # A button not on the card, and the account in use (no command): no tap matches them.
+        for said in ("Use mallory@evil.io", "susan@example.com (current)"):
+            with self.subTest(said=said):
+                rc, out = self.tap(said)
+                self.assertNotEqual(out.get("status"), "started", out)
+        # A key on the card that this card's record does not hold (another card's button): gone.
+        ledger = self.ws.joinpath(*acc.ISSUED)
+        kept = json.loads(ledger.read_text())
+        kept["cards"]["$card1"]["keys"] = [ckey("susan@example.com")]
+        ledger.write_text(json.dumps(kept))
+        rc, out = self.tap("Use bob@work.io")
+        self.assertEqual((rc, out["say"]), (2, acc.GONE))
+        # An offered key the desktop no longer saves: gone too.
+        self.post()
+        (self.app / "accounts" / "claude" / "index.json").write_text("{}")
+        rc, out = self.tap("Use bob@work.io", event="$card2", source_message_id="$tap2")
+        self.assertEqual((rc, out["say"]), (2, acc.GONE))
+        self.assertFalse((self.cdir / acc.REQUEST).exists())
+        self.assertEqual(self.launch.calls, [])
+
+    def test_a_tap_on_the_account_in_use_by_a_client_ignoring_disabled_changes_nothing(self):
+        self.post()
+        headers = {"channel_id": DM, "reply_to_event": "$card1", "source_message_id": "$t"}
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            rc = acc.claude_pick(self.ws, headers, ckey("susan@example.com"), self.cdir, 100.0, core=CORE,
+                                 execute=self.fake.execute, popen=self.launch, run=self.claude_run)
+        self.assertEqual(json.loads(out.getvalue())["say"], "Already using susan@example.com — nothing to change.")
+        self.assertEqual(rc, 0)
+        self.assertFalse((self.cdir / acc.REQUEST).exists())
+
+    def watch(self, answer=None, *, claim=False, write_at=0.0):
+        """`await-core` against a fake clock: the desktop's `answer` appears at `write_at` s."""
+        acc.write_core_request(self.cdir, ckey("bob@work.io"), NONCE, 100.0)
+        clock = [0.0]
+
+        def sleep(s):
+            clock[0] += s
+            if claim and (self.cdir / acc.REQUEST).exists():
+                os.rename(self.cdir / acc.REQUEST, self.cdir / (acc.CLAIMED % NONCE))
+            if answer is not None and clock[0] >= write_at:
+                (self.cdir / (acc.RESULT % NONCE)).write_text(json.dumps({"v": 2, "nonce": NONCE, **answer}))
+                (self.cdir / (acc.CLAIMED % NONCE)).unlink(missing_ok=True)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = acc.main(["--workspace", str(self.ws), "await-core", "--room", DM, "--key", ckey("bob@work.io"),
+                           "--nonce", NONCE], core=CORE, execute=lambda *a, **k: self.fake.execute(*a, **k),
+                          sleep=sleep, clock=lambda: clock[0])
+        return rc, json.loads(out.getvalue()), clock[0]
+
+    def test_the_watcher_tells_each_answer(self):
+        for answer, state, words in (
+                ({"ok": True, "label": "bob@work.io", "verified": True}, "done", "Now using bob@work.io."),
+                ({"ok": True, "label": "bob@work.io", "verified": False}, "info",
+                 "Switched to bob@work.io; not yet confirmed."),
+                ({"ok": True}, "info", "Switched to bob@work.io; not yet confirmed."),
+                ({"ok": False, "error": "that account is not saved on this Mac for this agent"}, "error",
+                 "Could not switch: that account is not saved on this Mac for this agent")):
+            with self.subTest(answer=answer):
+                self.fake.calls.clear()
+                rc, out, _ = self.watch(answer, claim=True, write_at=200.0)
+                self.assertEqual((out["status"], out["outcome"], out["say"]), ("posted", state, words))
+                self.assertEqual(rc, 0 if state == "done" else 1)
+                self.assertEqual(self.fake.cards()[-1]["text"], words)
+                self.assertEqual(self.fake.calls[-1][3], DM)
+                self.assertEqual(sorted(os.listdir(self.cdir)), [acc.CONSUMER], "the answer is taken in")
+
+    def test_an_unclaimed_request_is_withdrawn_after_90_s(self):
+        rc, out, waited = self.watch()
+        self.assertEqual((out["outcome"], out["say"]), ("error", acc.UNCLAIMED))
+        self.assertEqual(out["say"], "The app on the computer didn't pick this up. Nothing changed.")
+        self.assertGreaterEqual(waited, acc.UNCLAIMED_S)
+        self.assertLess(waited, acc.UNCLAIMED_S + 5)
+        self.assertEqual(sorted(os.listdir(self.cdir)), [acc.CONSUMER], "the request is taken back")
+
+    def test_a_request_claimed_in_time_is_waited_on_past_90_s(self):
+        rc, out, waited = self.watch({"ok": True, "verified": True}, claim=True, write_at=300.0)
+        self.assertEqual(out["say"], "Now using bob@work.io.")
+        self.assertGreaterEqual(waited, 300.0)
+
+    def test_a_claim_never_answered_is_told_as_not_known(self):
+        rc, out, waited = self.watch(claim=True)
+        self.assertEqual((out["outcome"], out["say"]), ("info", acc.UNTOLD))
+        self.assertTrue((self.cdir / (acc.CLAIMED % NONCE)).exists(), "only the desktop removes its claim")
+
+    def test_a_withdraw_leaves_a_newer_request_alone(self):
+        acc.write_core_request(self.cdir, ckey("bob@work.io"), "other-nonce-1", 100.0)
+        self.assertFalse(acc.withdraw_core_request(self.cdir, NONCE))
+        self.assertEqual(self.request()["nonce"], "other-nonce-1")
+        with self.assertRaises(FileExistsError):
+            acc.write_core_request(self.cdir, ckey("bob@work.io"), NONCE, 100.0)
+
+    def test_the_watcher_refuses_a_malformed_nonce(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = acc.main(["--workspace", str(self.ws), "await-core", "--room", DM, "--key", ckey("bob@work.io"),
+                           "--nonce", "../x"], core=CORE)
+        self.assertEqual(rc, 2)
 
 
 class Taps(Base):
