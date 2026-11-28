@@ -31,7 +31,8 @@ import threading
 import time
 import uuid
 
-from ... import account_switch, card_desk, connector_cards, held_start, live_view, model_switch, quota_notice, signin_watch
+from ... import (account_switch, card_desk, connector_cards, desktop_accounts, held_start, live_view, model_switch,
+                 quota_notice, signin_watch)
 from ...acp_host import quoted
 from ...collaborator_turn import TIER_BLOCK_END, TIER_BLOCK_HEADER, TIER_REWRITES, stage_own_attachments, with_staged_paths
 from ...relay_loop import count_arg
@@ -40,6 +41,7 @@ from ...task_io import (AUDIENCE_RULE, DONE_KEEP, NON_OWNER_NOTE, NON_OWNER_REFU
                         make_dirs, non_owner_note, parse_task, pid_alive, exit_code, record_done, refusal_body,
                         release_lock,
                         root_path, start_time, stop_requested, turn_policy, write_atomic)
+from ..claude_code import account_remote
 from . import device_login
 
 CLIENT = {"name": "ag2-sparrow-codex", "version": "0.1.0"}
@@ -252,6 +254,10 @@ def limit_reset(snapshot, now=None) -> "float | None":
 # finishes on any device; the browser sign-in only finishes on this computer (owner 11-27).
 SWITCH_ANYWHERE = True
 USAGE_READ_S = 10.0     # `account/rateLimits/read`: a usage read before a card ask waits no longer than this
+NOT_SAVED = "That account is no longer saved on this computer. Send /account for a new card."
+SWITCH_BUSY = "A switch is already waiting for the app on this computer. Send /account again in a minute."
+SWITCH_ASKED = ("Switching to %s… The app on this computer makes the switch; I move to the new account as soon "
+                "as it does. Send /account to see which account I'm on.")
 
 
 def usage_state(answer, now=None) -> "dict | None":
@@ -526,7 +532,51 @@ class Connector:
             self._accounts.remote = device_login.Remote(self._accounts, self.args.state, self.root,
                                                         getattr(self.args, "codex", "codex"), child_env(), log)
             self._accounts.switch_anywhere = SWITCH_ANYWHERE
+            if getattr(self.args, "agent_id", None):
+                # The desktop's dropdown on the phone: the accounts the app saved for this agent, a pick switched by it.
+                self._accounts.saved, self._accounts.pick = self.saved_accounts, self.pick_saved
         return self._accounts
+
+    def saved_accounts(self) -> dict:
+        """{key: address} of the Codex accounts the desktop app saved for this agent; none when this agent's
+        Codex home is not its own (a switch there would change another login)."""
+        try:
+            home = device_login.own_home(child_env(), device_login.installed_homes())
+        except device_login.Refused:
+            return {}
+        return desktop_accounts.codex_saved(self.args.agent_id, home)
+
+    def pick_saved(self, key, sent, result_file) -> str:
+        """The owner picked saved account `key` on a card that offered it: ask the desktop app to switch to it
+        (account_remote's request in CODEX_HOME), shown in place of the card; signin_settle then restarts Codex."""
+        accounts, agent_card = self.accounts, connector_cards._core()[0]
+        room, tapped = str(sent.get("channel_id") or ""), card_desk.tapped_event(sent)
+        if agent_card.owner_may_act(sent) is not None or card_desk.in_room(sent) \
+                or not account_switch.offered_on(self.root, tapped, key):
+            accounts.publish(result_file, quoted(account_switch.UNMATCHED) + "\n")
+            return "account-unknown"
+        try:
+            home = device_login.own_home(child_env(), device_login.installed_homes())
+        except device_login.Refused as e:
+            accounts.say(room, accounts.card("error", "Could not switch: %s" % e), result_file, tapped)
+            return "account-refused"
+        email = desktop_accounts.codex_saved(self.args.agent_id, home).get(key)
+        if not email:
+            accounts.say(room, accounts.card("error", NOT_SAVED), result_file, tapped)
+            return "account-not-saved"
+        # The request file of Claude Code's phone switch (account_remote, v2), in CODEX_HOME: one at a time.
+        if account_remote.request_nonce(home) is not None or account_remote.claimed_any(home):
+            accounts.say(room, accounts.card("info", SWITCH_BUSY), result_file, tapped)
+            return "account-busy"
+        try:
+            account_remote.write_request(home, key, str(uuid.uuid4()), time.time())
+        except OSError as e:
+            log("switch request not written:", "%s: %s" % (type(e).__name__, str(e)[:200]))
+            accounts.say(room, accounts.card("error", "Could not switch: the request for the app could not be "
+                                                            "written."), result_file, tapped)
+            return "account-not-asked"
+        accounts.say(room, accounts.card("pending", SWITCH_ASKED % email), result_file, tapped)
+        return "account-switching"
 
     @property
     def quota(self):
@@ -1571,6 +1621,8 @@ def build_parser():
     ap.add_argument("--codex", default="codex", help="the codex executable the app-server is started from (default: "
                                                      "codex on PATH; a launcher passes the exact path it checked)")
     ap.add_argument("--model", default=None)
+    ap.add_argument("--agent-id", default=None, help="the agent's id, by which the desktop app keeps the accounts it "
+                                                     "saved for it (the account card lists them to switch to)")
     ap.add_argument("--bridge-state", default=None, help="the bridge's state dir, where the model card is queued for "
                                                          "posting (default: <work>.bridge/state)")
     ap.add_argument("--sandbox", default=NON_OWNER_SANDBOX, choices=["read-only", "workspace-write", "danger-full-access"],

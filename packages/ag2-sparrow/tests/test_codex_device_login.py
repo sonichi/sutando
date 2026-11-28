@@ -21,7 +21,8 @@ from unittest import mock
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE))
-from ag2_sparrow import account_switch, connector_cards, detached_login, signin_watch  # noqa: E402
+from ag2_sparrow import account_switch, connector_cards, desktop_accounts, detached_login, signin_watch  # noqa: E402
+from ag2_sparrow.adapters.claude_code import account_remote  # noqa: E402
 from ag2_sparrow.adapters.codex import codex_connector as cc, device_login as dl  # noqa: E402
 
 from test_codex_connector import CardWorld, metrics, result, run_connector  # noqa: E402
@@ -938,6 +939,77 @@ class CardInvariantTest(Home, unittest.TestCase):
                 self.assertEqual(self.shown, set(), "every code card withdrawn in the end")
                 if (self.home / "auth.json").exists():
                     (self.home / "auth.json").unlink()
+
+
+class SavedMenuTest(Home, CardWorld, unittest.TestCase):
+    """Owner 11-27: the phone's Codex account card is the desktop's dropdown, listing the accounts the app saved
+    for this agent (current one checked) plus "Add account…"; a pick asks the app to switch through CODEX_HOME."""
+
+    AGENT = "@codex-bot:s.space"
+
+    def setUp(self):
+        Home.setUp(self)
+        CardWorld.setUp(self)
+        (self.home / "stub-account").write_text("alice@example.com")
+        self.CARD = account_switch.CARD
+        self.appdata = Path(self.tmp.name) / "appdata"
+        self.store = self.appdata.joinpath(*desktop_accounts.CODEX_STORE) / desktop_accounts.saved_key(self.AGENT)
+        patch = mock.patch.object(desktop_accounts, "app_data_dirs", lambda *a, **k: [self.appdata])
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def save(self, *emails):
+        self.store.mkdir(parents=True, exist_ok=True)
+        for e in emails:
+            (self.store / (desktop_accounts.saved_key(e) + ".json")).write_text(json.dumps({"label": e, "auth": "x"}))
+
+    def ask(self, event):
+        self.dm("task-ask-" + event[1:], "/account")
+        self.assertEqual(run_connector(self.work, once=1, extra=["--codex", str(self.codex), "--agent-id", self.AGENT]), 0)
+        ((_, card),) = self.posted(event)
+        return card
+
+    def pick(self, tid, said, event):
+        self.dm(tid, said, reply_to=event, click=said)
+        self.assertEqual(run_connector(self.work, once=1, extra=["--codex", str(self.codex), "--agent-id", self.AGENT]), 0)
+        return result(self.work, tid)
+
+    def test_the_card_lists_the_saved_accounts_as_one_menu_with_the_one_in_use_checked(self):
+        self.save("bob@example.org", "alice@example.com")
+        card = self.ask("$card1")
+        (row,) = card["groups"][0]["rows"]
+        (menu,) = row["actions"]
+        self.assertEqual((row["title"], menu["kind"], menu["label"]), ("Account", "menu", "alice@example.com"))
+        self.assertEqual([(i["label"], i.get("command"), i.get("disabled")) for i in menu["items"]],
+                         [("✓ alice@example.com", "card:account:agent:" + desktop_accounts.saved_key("alice@example.com"), True),
+                          ("bob@example.org", "card:account:agent:" + desktop_accounts.saved_key("bob@example.org"), None),
+                          (account_switch.ADD_ITEM, "card:account:agent:add", None)])
+        self.assertNotIn("Switch account", [b["label"] for b in card.get("buttons") or []], "the dropdown, not buttons")
+
+    def test_with_none_saved_the_menu_holds_only_add_account(self):
+        card = self.ask("$card1")
+        self.assertEqual([i["label"] for i in account_switch.menu_items(card)], [account_switch.ADD_ITEM])
+
+    def test_a_pick_writes_the_apps_switch_request_in_codex_home_and_says_switching_in_place(self):
+        self.save("bob@example.org", "alice@example.com")
+        self.ask("$card1")
+        self.assertEqual(self.pick("task-pick", "Use bob@example.org", "$card1"), account_switch.ANSWERED)
+        req = json.loads((self.home / account_remote.REQUEST).read_text())
+        self.assertEqual((req["v"], req["key"]), (2, desktop_accounts.saved_key("bob@example.org")))
+        self.assertEqual(oct((self.home / account_remote.REQUEST).stat().st_mode & 0o777), "0o600")
+        ((_, shown),) = self.posted("$card2")
+        self.assertEqual((shown["state"], shown["text"]), ("pending", cc.SWITCH_ASKED % "bob@example.org"))
+        self.assertEqual(self.ops()[-1], ("edit", "$card1"), "in place of the card tapped")
+
+    def test_a_pick_on_another_card_is_refused_and_writes_nothing(self):
+        self.save("bob@example.org", "alice@example.com")
+        self.ask("$card1")
+        said = "Use bob@example.org"
+        self.pick("task-stale", said, "$elsewhere")
+        self.assertEqual(metrics(self.work)[-1]["card"], "account-card-expired", "a fresh card, nothing switched")
+        self.assertFalse((self.home / account_remote.REQUEST).exists())
+        self.assertIn("couldn't match that button", self.pick("task-guest", said, "$card1", tier="guest"))
+        self.assertFalse((self.home / account_remote.REQUEST).exists())
 
 
 if __name__ == "__main__":
