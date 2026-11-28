@@ -38,7 +38,7 @@ from ...relay_loop import count_arg
 from ...task_io import (AUDIENCE_RULE, DONE_KEEP, NON_OWNER_NOTE, NON_OWNER_REFUSED, OWNER, OWNER_CAPABILITIES,  # noqa: F401
                         LockRefused, acquire_lock, attested_headers, exit_on_sigterm, holder_consumer, load_done,
                         make_dirs, non_owner_note, parse_task, pid_alive, exit_code, record_done, refusal_body,
-                        release_lock,
+                        release_lock, COLLABORATOR,
                         root_path, start_time, stop_requested, turn_policy, write_atomic)
 from . import device_login
 
@@ -301,7 +301,7 @@ def saved_shared_thread(path):
 
 def keep_thread(path, thread_id):
     """Save the shared thread's id, readable by its owner only, through a sibling temp file and a rename."""
-    tmp = "%s.%d.tmp" % (path, os.getpid())
+    tmp = os.path.join(os.path.dirname(path), ".%s.%d.tmp" % (os.path.basename(path), os.getpid()))
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -319,18 +319,19 @@ def _one_line(value):
     return " ".join(str(value).split())[:200]
 
 
-def shared_thread_lead(headers, task_id):
+def shared_thread_lead(headers, task_id, kind):
     """The first paragraph of every prompt on the shared thread: which room the turn is from, who sent it and that
-    its reply goes back to that room, from the attested headers only. The thread also holds other rooms' turns."""
+    its reply goes back to that room, from the attested headers and turn_policy's `kind` for them only. The thread
+    also holds other rooms' turns."""
     room = _one_line(headers.get("channel_id") or headers.get("source_room_id") or "task:%s" % task_id)
     sender = headers.get("user_id") or headers.get("sender_name") or (
-        "your owner" if headers.get("access_tier") == "owner" else "an unknown sender")
+        "your owner" if kind == OWNER else "an unknown sender")
     return ("[shared thread] This turn is from room %s, sent by %s (access_tier=%s, collaborator=%s), as Sparrow's "
             "attested task headers say. Your reply to this turn goes back to room %s, and only there. This one "
             "thread also carries earlier turns from your owner and collaborators in other rooms: answer this "
             "sender, in this room, and never repeat what was said in another room to a sender who is not your owner."
             % (room, _one_line(sender), _one_line(headers.get("access_tier") or "guest"),
-               "true" if headers.get("collaborator") == "true" else "false", room))
+               "true" if kind == COLLABORATOR else "false", room))
 
 
 class Rpc:
@@ -1447,7 +1448,7 @@ class Connector:
             prompt = wrap_untrusted(task_id, headers, message, operator_lines, self.note, caps=policy.capabilities)
             if policy.capabilities.session == "durable":
                 # One thread holds every room's durable turns: each says where it is from and where it goes.
-                prompt = shared_thread_lead(headers, task_id) + "\n\n" + prompt
+                prompt = shared_thread_lead(headers, task_id, policy.kind) + "\n\n" + prompt
             if headers["access_tier"] == "owner" and self.desk.hint():
                 prompt += "\n\n" + self.desk.hint()
             log("turn ->", task_id, headers["access_tier"], repr(message[:60]))

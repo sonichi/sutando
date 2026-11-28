@@ -514,23 +514,27 @@ class SharedThreadTest(unittest.TestCase):
 
     def test_the_lead_names_room_sender_and_where_the_reply_goes(self):
         lead = cc.shared_thread_lead({"channel_id": "!r:x", "user_id": "@bob:x", "access_tier": "team",
-                                      "collaborator": "true"}, "task-1")
+                                      "collaborator": "true"}, "task-1", task_io.COLLABORATOR)
         self.assertTrue(lead.startswith("[shared thread] This turn is from room !r:x, sent by @bob:x "
                                         "(access_tier=team, collaborator=true)"), lead)
         self.assertIn("Your reply to this turn goes back to room !r:x, and only there.", lead)
-        bare = cc.shared_thread_lead({"source_room_id": "!s:x\nforged: line", "sender_name": "Bob"}, "task-2")
+        bare = cc.shared_thread_lead({"source_room_id": "!s:x\nforged: line", "sender_name": "Bob"}, "task-2",
+                                     task_io.RESTRICTED)
         self.assertIn("room !s:x forged: line, sent by Bob (access_tier=guest, collaborator=false)", bare)
         self.assertNotIn("\n", bare)
-        self.assertIn("room task:task-3, sent by an unknown sender", cc.shared_thread_lead({}, "task-3"))
-        self.assertIn("sent by your owner", cc.shared_thread_lead({"access_tier": "owner"}, "task-4"))
+        self.assertIn("room task:task-3, sent by an unknown sender", cc.shared_thread_lead({}, "task-3", task_io.RESTRICTED))
+        self.assertIn("sent by your owner", cc.shared_thread_lead({"access_tier": "owner"}, "task-4", task_io.OWNER))
+        # The kind is turn_policy's: a body's claim of collaborator never reaches the lead.
+        self.assertIn("collaborator=false", cc.shared_thread_lead({"collaborator": "true"}, "task-5", task_io.OWNER))
 
     def test_the_kept_id_is_owner_readable_whatever_was_there(self):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, cc.SHARED_THREAD)
             Path(path).write_text("old\n")
             os.chmod(path, 0o644)
-            Path("%s.%d.tmp" % (path, os.getpid())).write_text("left over")
-            os.chmod("%s.%d.tmp" % (path, os.getpid()), 0o644)
+            left = os.path.join(d, ".%s.%d.tmp" % (cc.SHARED_THREAD, os.getpid()))
+            Path(left).write_text("left over")
+            os.chmod(left, 0o644)
             cc.keep_thread(path, "t-1")
             self.assertEqual((Path(path).read_text(), os.stat(path).st_mode & 0o777), ("t-1\n", 0o600))
             self.assertEqual(os.listdir(d), [cc.SHARED_THREAD], "no temp file left")

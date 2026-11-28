@@ -2162,7 +2162,7 @@ class BoundaryGuardTest(SpyMixin, unittest.TestCase):
         self.assertEqual(self.by_module(seen, os.path.join("codex", "codex_connector.py")) - LOCK_FILES,
                          {"state", "results", "tasks", "results/<task>.txt",
                           "results/.<task>.txt.<tmp>", "state/done", "state/.done.<tmp>", "state/threads",
-                          "state/threads/<key>", "state/threads/.<key>.<tmp>", "state/metrics.jsonl",
+                          "state/thread", "state/.thread.<tmp>", "state/metrics.jsonl",
                           "state/app-server-stub.stderr", "state/live-view.log"})
 
     def strings(self, tree):
