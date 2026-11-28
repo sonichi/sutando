@@ -355,6 +355,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`voice-session-end.ts`** — When the user hangs up, the core gets a task about that call: when it ran, how it ended, and what was said.
 - **`voice-task-status-writer.ts`** — Writes the relay agent's task table out for the status page, the way bodhi's history stores write the conversation: the table lives in memory and calls back after each change; this writes asynchronously, one write at a time, coalescing changes that arrive while a write is in flight (the last state wins).
 - **`voice_room_membership.py`** — The gateway bridge's room-membership verifier for room-bound voice sessions.
+- **`wait_store.py`** — Wait markers: one pending owner request that resumes once something outside the core finishes.
 - **`watch-tasks-stream.sh`** — Streaming task watcher — the canonical task-detection path.
 - **`watcher-rearm-session-hint.sh`** — SessionStart(compact|resume) hook: when no ready session-role watcher holds this session's inbox, inject the exact command that re-arms it.
 - **`watcher_identity.py`** — Watcher identity: is a process THE task watcher, and which inbox does it read?
