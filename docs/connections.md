@@ -691,6 +691,20 @@ enabled identity whose token cannot be read (`no_token`, exit 1), answers every 
 refusal rather than mint as the core. A Codex worker's proxy inherits no environment, so it does
 not yet take this path.
 
+A seat's Claude config can also hold an MCP entry that connects straight to a server (`url`, no
+proxy). When that server has moved, the entry is refused on every connect, and the move re-points
+only the proxy's descriptor. `scripts/connections.py moved-mcp-servers`
+(`connections.moved_mcp_servers`) lists such entries with the successor's endpoint and the
+`claude mcp remove` command (`connections.mcp_remove_command`: the name shell-quoted after `--`,
+and the command pinned to the file that was read, `CLAUDE_CONFIG_DIR=<folder>` in front, or
+`env -u CLAUDE_CONFIG_DIR` for `.claude.json` in the home folder itself, which is what Claude Code
+uses with no config folder set and what the check reads by default); only user-scope entries are
+checked, and a `--mcp-config` file not named `.claude.json` is named as the file to edit, with no
+command. `env -u` is not POSIX `env`, but macOS and GNU both have it. The check, the proxy-descriptor
+lookup and the lane lookup share one default file (`connections.claude_config_file`):
+`$CLAUDE_CONFIG_DIR/.claude.json`, else `.claude.json` in the home folder. The Claude worker launcher prints one warning per entry when the seat
+starts, and never edits the config.
+
 The proxy decides whom it acts as once, when the seat starts. A worker given its own agent while
 its seat runs keeps acting as the core's, and once the worker's credential exists every call
 fails with "descriptor changed during the call": the identity changed under the seat, and the fix

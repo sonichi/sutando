@@ -199,6 +199,8 @@ if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
     echo "  ✓ CLAUDE_CONFIG_DIR=$_own_ccd (this worker's own)"
   fi
 fi
+# After the folder is final: a seat's MCP entry on a server that moved is refused on every connect.
+worker_mcp_moved_servers "$REPO" "$WORKER_PY" "${CLAUDE_CONFIG_DIR:-}"
 resolve_claude_settings_args
 apply_claude_obs_metering
 apply_claude_tmux_defaults
