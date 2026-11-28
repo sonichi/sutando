@@ -306,6 +306,28 @@ class RoomToolsTest(World, unittest.TestCase):
         self.assertEqual(self.runs, [])
         self.assertEqual(self.grants, [None, None])
 
+    def test_a_sandbox_a_collaborator_could_write_state_through_gets_no_tools(self):
+        for n, sandbox in enumerate(("workspace-write", "danger-full-access")):
+            with self.subTest(sandbox=sandbox):
+                self.save_owner("own-0001")
+                tid = "task-chat-w%d" % n
+                write_task(self.work, tid, "[[config]] owner", **DM)
+                err = self.serve(1, "--sandbox", sandbox)
+                self.assertTrue(result(self.work, tid).rstrip().endswith(" config=null"), "no tools")
+                self.assertIn("ag2-space MCP tools not offered: a collaborator's turn (--sandbox %s)" % sandbox, err)
+                self.assertIsNone(self.grants[-1])
+                self.assertNotIn(mcp_stdio.ROOM_TOOLS_HINT, self.prompts[-1])
+        self.assertEqual(self.runs, [], "no token exchange either")
+        self.assertFalse((Path(self.state()) / mcp_stdio.SHIM_NAME).exists(), "and no launcher is written")
+
+    def test_a_writable_sandbox_with_no_collaborator_admitted_keeps_the_tools(self):
+        self.save_owner("own-0001")
+        write_task(self.work, "task-chat-o", "[[config]] owner", **DM)
+        self.serve(1, "--sandbox", "workspace-write", "--no-allow-collaborator")
+        cfg = config_of(result(self.work, "task-chat-o"))
+        self.assertEqual(cfg, self.expected_server(cfg))
+        self.assertEqual(self.grants[0]["launch"], mcp_stdio.launch_of(cfg))
+
     def test_a_failed_exchange_runs_the_turn_without_the_tools(self):
         self.save_owner("own-0001")
         self.desc = dict(self.desc, env_file="/other/agent.env")    # not the agent's own token file
@@ -399,6 +421,24 @@ class RoomToolsUnitTest(World, unittest.TestCase):
                                "thread/start": RuntimeError("thread/start: server pipe closed")})
         with self.assertRaises(RuntimeError), contextlib.redirect_stderr(io.StringIO()):
             c.start_thread(task_io.OWNER_CAPABILITIES, False, self.tools)
+
+    def test_an_unknown_or_missing_sandbox_offers_nothing_and_never_reads_the_config(self):
+        owner = task_io.OWNER_CAPABILITIES
+        for sandbox in ("workspace-write", "danger-full-access", "some-new-mode", "", None):
+            c, calls = self.connector({"config/read": {"config": {"mcp_servers": {}}}})
+            c.args.sandbox = sandbox
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(c.room_tools(owner, "/w"), {}, sandbox)
+            self.assertIn("--sandbox %s" % (sandbox or "unknown"), err.getvalue())
+            self.assertEqual(calls, [], "refused before anything is asked or exchanged")
+            c.args.allow_collaborator = False       # no collaborator turn is ever served durable
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertTrue(c.room_tools(owner, "/w"), sandbox)
+        c, _ = self.connector({"config/read": {"config": {"mcp_servers": {}}}})
+        del c.args.allow_collaborator, c.args.sandbox      # neither known: collaborators assumed, sandbox unknown
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(c.room_tools(owner, "/w"), {})
+        self.assertIn("--sandbox unknown", err.getvalue())
 
     tools = {"mcp_servers": {"ag2-space": {"env": {shim.LAUNCH_ENV: "l1"}}}}
     READ = {"config": {"mcp_servers": {}}}

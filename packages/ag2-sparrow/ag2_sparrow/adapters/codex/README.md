@@ -213,6 +213,10 @@ live only on a thread no collaborator's turn is ever routed to:
 - The shared thread (`state/thread`: collaborators' turns, the owner's room turns, and the owner's DM when
   there is no owner-only conversation) is never opened with the tools: no `ag2-space` entry, no grant, no
   prompt hint. Team and guest threads never get them either.
+- Off until the agent's state is known to be the owner's alone: the grant, the launcher and the owner-only
+  thread's id live under `state/`, and a collaborator's turn runs commands in `--sandbox`. Tools are offered
+  only with `--sandbox read-only` (the default) or `--no-allow-collaborator`; `workspace-write`,
+  `danger-full-access` or a sandbox this connector does not recognise gets none, and `install` says so.
 - Defence in depth: the shim forwards a call only under a live per-turn grant (`state/ag2-mcp-grant.json`),
   written for an owner turn on a tools thread and removed when the turn ends. A resume Codex refuses, or
   does not answer in time, with the entry is retried on the same thread without it, and a start refused

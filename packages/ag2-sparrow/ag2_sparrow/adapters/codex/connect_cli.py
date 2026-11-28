@@ -232,6 +232,9 @@ def install(args) -> int:
     if proxy and not where["token_file"]:
         print("NOTE mcp: --mcp-proxy-command acts as the agent through its own token file; with --work there is "
               "none, so turns get no AG2 Space tools")
+    if proxy and args.sandbox != "read-only" and values["ALLOW_COLLABORATOR"] != "0":
+        print("NOTE mcp: with --sandbox %s a collaborator's turn could write the agent's state, so turns get no "
+              "AG2 Space tools; --sandbox read-only or --no-allow-collaborator keeps them" % args.sandbox)
     if args.sandbox == "workspace-write":
         print("NOTE sandbox: workspace-write lets an owner turn write under the work root; a turn retried after "
               "the app-server dies can repeat side effects the first attempt already made")
