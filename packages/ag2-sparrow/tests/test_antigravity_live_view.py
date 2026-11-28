@@ -142,8 +142,15 @@ class SlowLog(unittest.TestCase):
             release.set()
             self.assertTrue(view.drain(5))
         lines = self.path.read_text().splitlines()
-        self.assertLessEqual(len(lines), live_view.QUEUE_MAX + 2)
-        self.assertTrue(any("not shown" in ln for ln in lines), lines[-3:])
+        notices = [ln for ln in lines if "not shown" in ln]
+        shown = [ln for ln in lines if "not shown" not in ln]
+        self.assertTrue(notices, lines[-3:])
+        # One line can be in the writer's hands while the queue is full. Whether the writer took its first
+        # line before or after the first drop decides if the drops are reported in one notice or two, so
+        # count the lines, not the notices: every line is either shown or counted as not shown.
+        self.assertLessEqual(len(shown), live_view.QUEUE_MAX + 1)
+        left_out = sum(int(ln.split()[1]) for ln in notices)
+        self.assertEqual(len(shown) + left_out, live_view.QUEUE_MAX + 50)
 
     def test_a_log_path_that_is_not_a_regular_file_is_never_written(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
