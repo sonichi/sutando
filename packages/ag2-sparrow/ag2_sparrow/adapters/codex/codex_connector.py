@@ -283,11 +283,15 @@ def child_env():
 
 
 def thread_seed(spec):
-    """`--thread-id [CHANNEL_ID=]THREAD`: the thread the shared thread resumes when none is saved yet. The
-    channel part of the older form no longer picks a room: every room's durable turns share one thread."""
+    """`--thread-id THREAD`: the thread the shared thread resumes when none is saved yet. The older
+    `CHANNEL_ID=THREAD` named one owner channel's own thread; it never seeds the thread every room shares."""
     if not spec:
         return None
-    return spec.split("=", 1)[-1].strip() or None
+    if "=" in spec:
+        log("--thread-id %s names one channel's thread (the older form); the shared thread does not resume it"
+            % spec.split("=", 1)[0][:80])
+        return None
+    return spec.strip() or None
 
 
 def saved_shared_thread(path):
@@ -1600,9 +1604,9 @@ def build_parser():
                          "room's kept thread with --cwd and --sandbox, framed by the non-owner note.")
     no.add_argument("--no-allow-non-owner", dest="allow_non_owner", action="store_false",
                     help="refuse those senders with a plain line instead")
-    ap.add_argument("--thread-id", default=None, metavar="[CHANNEL_ID=]THREAD",
-                    help="resume THREAD as the shared thread when none is saved yet (a CHANNEL_ID= prefix, from "
-                         "when each room had its own thread, is accepted and ignored)")
+    ap.add_argument("--thread-id", default=None, metavar="THREAD",
+                    help="resume THREAD as the shared thread when none is saved yet (the older CHANNEL_ID=THREAD, "
+                         "one owner channel's thread, is accepted and not resumed)")
     ap.add_argument("--resume-thread", default=None, metavar="THREAD",
                     help="the owner's own Codex conversation to continue as the shared thread, from the first "
                          "owner turn in any room (taken once); collaborators then share it too")

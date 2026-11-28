@@ -298,19 +298,39 @@ class TierPolicyTest(unittest.TestCase):
                              [cc.SHARED_THREAD, "threads"], "no file is named after a room")
 
     def test_thread_id_seeds_the_shared_thread_only_while_none_is_saved(self):
-        self.assertEqual(cc.thread_seed("!a:x=T1"), "T1", "the older CHANNEL_ID= form still names its thread")
         self.assertEqual(cc.thread_seed("T1"), "T1")
-        self.assertIsNone(cc.thread_seed("!a:x="))
+        self.assertIsNone(cc.thread_seed(" "))
         self.assertIsNone(cc.thread_seed(None))
         with tempfile.TemporaryDirectory() as d:
             now = time.time()
             write_task(d, "task-chat-a", "room A", channel="!a:x", mtime=now - 20)
             write_task(d, "task-chat-b", "room B", channel="!b:x", mtime=now - 10)
-            self.assertEqual(run_connector(d, once=2, extra=["--thread-id", "!a:x=bound-0001"]), 0)
+            self.assertEqual(run_connector(d, once=2, extra=["--thread-id", "bound-0001"]), 0)
             self.assertEqual([m["thread"] for m in metrics(d)], ["bound-0001", "bound-0001"], "both rooms share it")
             write_task(d, "task-chat-c", "after a restart", channel="!c:x")
             self.assertEqual(run_connector(d, once=1, extra=["--thread-id", "other-0002"]), 0)
             self.assertEqual(metrics(d)[-1]["thread"], "bound-0001", "the saved shared thread wins over a seed")
+
+    def test_an_older_channel_bound_thread_id_never_becomes_the_shared_thread(self):
+        # Upgrade: an install from when `--thread-id CHANNEL_ID=THREAD` gave the owner's DM its own thread.
+        # A collaborator's room shares the new thread, so that DM's conversation must not seed it.
+        with tempfile.TemporaryDirectory() as d:
+            now = time.time()
+            (Path(d) / "state" / "threads").mkdir(parents=True)
+            old = Path(d) / "state" / "threads" / "dm-file"
+            old.write_text("owner-dm-0001\n")
+            write_task(d, "task-chat-c", "collaborator", channel="!room:x", kind="room", mtime=now - 20)
+            write_task(d, "task-chat-o", "owner", channel="!dm:x", kind="dm", mtime=now - 10)
+            with mock.patch.object(cc, "log", wraps=cc.log) as spy:
+                self.assertEqual(run_connector(d, once=2, extra=["--thread-id", "!dm:x=owner-dm-0001"]), 0)
+            threads = [m["thread"] for m in metrics(d)]
+            self.assertNotIn("owner-dm-0001", threads)
+            self.assertEqual(len(set(threads)), 1, "both rooms are on one new shared thread")
+            self.assertEqual((Path(d) / "state" / cc.SHARED_THREAD).read_text().strip(), threads[0])
+            self.assertEqual(old.read_text(), "owner-dm-0001\n", "the older per-room file is left as it was")
+            said = " ".join(" ".join(map(str, c.args)) for c in spy.call_args_list)
+            self.assertIn("!dm:x names one channel's thread", said)
+            self.assertNotIn("owner-dm-0001", said, "the log names the channel, not the thread")
 
     def test_resume_thread_carries_the_owners_conversation_into_the_shared_thread_once(self):
         with tempfile.TemporaryDirectory() as d:
@@ -758,7 +778,7 @@ class EndToEndStubTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             write_task(d, "task-chat-1", "one")
             with mock.patch.object(cc, "log", wraps=cc.log) as spy:
-                self.assertEqual(run_connector(d, once=1, extra=["--thread-id", "local-chat=stale-0001"]), 0)
+                self.assertEqual(run_connector(d, once=1, extra=["--thread-id", "stale-0001"]), 0)
             self.assertEqual(metrics(d)[0]["status"], "completed")
             self.assertNotEqual(metrics(d)[0]["thread"], "stale-0001")
             self.assertTrue(any("thread/resume failed" in " ".join(map(str, c.args)) for c in spy.call_args_list))
@@ -767,7 +787,7 @@ class EndToEndStubTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             write_task(d, "task-chat-1", "one")
             with mock.patch.object(cc, "log", wraps=cc.log) as spy:
-                rc = run_connector(d, once=1, extra=["--thread-id", "local-chat=hang-0001", "--turn-timeout", "1"])
+                rc = run_connector(d, once=1, extra=["--thread-id", "hang-0001", "--turn-timeout", "1"])
             self.assertEqual(rc, 0)
             self.assertEqual(metrics(d)[0]["status"], "completed")
             self.assertTrue(any("thread/resume failed" in " ".join(map(str, c.args)) for c in spy.call_args_list))
