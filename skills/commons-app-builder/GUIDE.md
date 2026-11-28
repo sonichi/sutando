@@ -13,7 +13,10 @@ This guide uses only the `room.commons.*` Actions and the page's `window.artifac
 arguments vary by room and deployment (for example `databases.mutate` op `summon` and
 `apps.scaffold` template `auto` are not on every server). Every write needs a fresh
 `operation_id`; reuse one only to retry the same call with the same arguments. After an
-unknown outcome, call `operation.inspect` before resending.
+unknown outcome, if the Action's description says a repeated `operation_id` is safe, send the
+identical request again with the same `operation_id`: it applies at most once and answers the
+first result. Never resend it with a new id. Otherwise, or if you cannot resend it unchanged,
+read the page or rows back before deciding. `operation.inspect` does not know these writes.
 
 | Want | Action |
 | --- | --- |
@@ -49,7 +52,9 @@ the whole call.
 | `db.onChange(db, fn, {bodies?})` | Calls `fn(snapshot)` with the same shape as `read` (`null` once the database is gone), with changes coalesced. Returns an unsubscribe function. |
 | `members()` | Resolves to the room's joined members, `[{id, name, avatar, kind}]` (at most 200). |
 | `personId(cell)` | Resolves to the `me.id`-style id of a joined member named in a person or `created_by` cell, else `null`. |
-| `state.get/set/delete/keys/all/on(key \| "*", fn)` | Shared, persisted room state: JSON values up to 4 KB, at most 500 keys, keys matching `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`. |
+| `state.get/keys/all/on(key \| "*", fn)` | Shared, persisted state that belongs to this page, not the room: JSON values up to 4,096 bytes, at most 500 keys, keys matching `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`. `get` returns the cached value. |
+| `state.read(key)` / `state.set(key, value, options?)` / `state.delete(key, options?)` | Ask the host. `read` resolves to `{key, exists, revision, value}`; `set` and `delete` resolve once saved (see "Saving state"). |
+| `state.draft(key)` | The last `set` or `delete` of that key not yet acknowledged, `{key, value, deleted, operation_id, expected_revision?}`, or `undefined`. |
 | `emit(name, data)` / `on(name, fn)` | One-shot events, at most 20 a second. Only viewers online at that moment see them. |
 | `pages.list()` / `pages.read(kind)` | Read-only access to the room's pages. |
 | `agent.list()` | Resolves to the viewer's own agents, `[{id, name, kind, userId?}]` (see "Asking an agent from an app"). |
@@ -62,6 +67,23 @@ bytes per write. A page's first write asks the viewer "may this page edit data i
 they answer, writes are refused with "waiting for the viewer's answer", and `members()` and
 `personId()` reject with "page permission required". A "no" gives "not allowed by the viewer".
 Editing the page asks again.
+
+**Saving state.** `options` may hold only `expected_revision` (a `revision` from `read`) and
+`operation_id` (`[A-Za-z0-9_-]{1,128}`); anything else is refused as `INVALID_ARGUMENT`. A failed
+`set` or `delete` rejects with an error carrying `code` and `refused`. Once the request has left
+the page it also carries `draft`, on `STATE_REQUEST_TIMEOUT` too; a refusal the page makes itself
+(`INVALID_ARGUMENT`, `STATE_REQUEST_PENDING`, `TOO_MANY_STATE_REQUESTS`) has none.
+`current_revision` comes only with a server refusal such as `REVISION_CONFLICT`. `refused: true`
+means this call saved nothing:
+`REVISION_CONFLICT` (read again and merge), `STATE_NOT_SYNCED` (retry once the page syncs),
+`STATE_REQUEST_REFUSED`, `INVALID_ARGUMENT` or `TOO_MANY_STATE_REQUESTS`. `STATE_REQUEST_PENDING`
+refuses only this call: the same `operation_id` is still in flight and may still save, so don't
+treat it as a non-save or switch IDs. `refused: false` (`STATE_REQUEST_UNCONFIRMED`,
+`STATE_REQUEST_TIMEOUT`) means it may have been saved: retry the identical request (same key, same
+`set` or `delete`, value and `expected_revision`) with the `operation_id` of the retained `draft`.
+Anything that changes the request, a rebase onto a new revision included, needs a new ID. Keep the
+viewer's input on any failure. Without `expected_revision`, a `set` shows in `state.get` at once;
+with it, only after the acknowledgement.
 
 **The sandbox.** The frame is `allow-scripts` on an opaque origin. It has no network (`fetch`,
 XHR and WebSocket fail), `localStorage` throws, `alert`, `confirm` and `prompt` are blocked,
@@ -287,8 +309,15 @@ me" buttons.
   minute per person and agent) and refuses an agent that is not the viewer's.
 - It resolves to `{ok: true, eventId}`, a dispatch receipt, or `{ok: false, reason}`. Reasons
   include `declined`, `page permission required`, `agent not owned or unavailable`,
-  `too many agent requests`, `another request is in progress` and `request outcome unknown`
-  (retry with the same `key`).
+  `too many agent requests`, `another request is in progress`, `request outcome unknown` and
+  `send outcome unknown`. Both mean it may have been sent, so never make a new `key`. After
+  `request outcome unknown`, retry with the same key: it reuses the original request and the
+  viewer confirms again. That promises no dispatch or receipt: it can still be declined, refused
+  or stay unresolved. After `send outcome unknown`, a retry sends nothing; check for the original
+  task. This holds only while this browser profile's ledger is intact. After a storage reset, or on
+  another browser or device, the same key can send again if the original went by DM or the Action
+  is no longer offered; there, leave the outcome unresolved and check for the original task
+  instead of retrying.
 
 **2. `artifact.room.post` asks an agent in the room, as the viewer.** Use it when the ask should
 be seen by the room, or the agent is not the viewer's.
@@ -423,6 +452,8 @@ and "ask my agent") and a **task board** (a person hands a task to their own age
 reports on the row).
 `templates/README.md` says which to pick and how to create one. Copy and adapt rather than
 starting from an empty file, then still follow steps 2, 6 and 7 for the app you ship.
+These files live in the Sutando repository under `skills/commons-app-builder/templates/`; if
+you have only this guide, it is enough to build without them.
 
 ## Patterns from apps that shipped
 
