@@ -835,8 +835,8 @@ class Connector:
             return {}
         open_to = self.grant_state_open_to()
         if open_to:
-            log("ag2-space MCP tools not offered: %s could write the grant, launcher and thread files under "
-                "state/ (--sandbox read-only or --no-allow-collaborator keeps them the owner's)" % open_to)
+            log("ag2-space MCP tools not offered: %s could read the agent's credentials or write the grant, "
+                "launcher and thread files under state/ (--no-allow-collaborator keeps them the owner's)" % open_to)
             return {}
         if not token_file:
             log("ag2-space MCP tools not offered: no --token-env-file (the agent's own token file)")
@@ -870,17 +870,14 @@ class Connector:
                                                 "startup_timeout_sec": ROOM_TOOLS_STARTUP_S}}}
 
     def grant_state_open_to(self):
-        """Who besides the owner could write state/ (the per-turn grant, the shim launcher, the owner-only
-        thread's id), or "": nobody, as far as this connector can prove. A collaborator's turn runs commands in
-        --sandbox; only read-only is known to stop its writes there (workspace-write's roots come from Codex's
-        own config, which is not read here), so any other or unrecognised sandbox counts as open unless no
-        collaborator is admitted (--no-allow-collaborator: such a turn is then restricted, always read-only)."""
-        if getattr(self.args, "allow_collaborator", True) is False:
+        """Who besides the owner could reach the agent's credentials or write state/ (the per-turn grant, the
+        launcher, the owner-only thread's id), or "": nobody. A collaborator's turn runs commands in the owner's
+        folder under --sandbox, and no sandbox there stops reads (read-only was measured not to), so an install
+        that admits collaborators is open. One that does not (--no-allow-collaborator, read as exactly False)
+        serves every non-owner turn restricted: started only under CONFINED_PROFILE, else not run (Unconfined)."""
+        if getattr(self.args, "allow_collaborator", None) is False:
             return ""
-        sandbox = getattr(self.args, "sandbox", None)
-        if sandbox == NON_OWNER_SANDBOX:
-            return ""
-        return "a collaborator's turn (--sandbox %s)" % (sandbox or "unknown")
+        return "a collaborator's turn"
 
     def bind_launch(self, tools):
         """Remember which ag2-space launch the thread now open runs with (none when it runs without the tools)."""

@@ -534,7 +534,7 @@ class Install(Base):
         self.assertEqual(rc, 0, err)
         self.assertEqual(cm.read_config(cli.config_path())["RESUME_THREAD"], thread, "matched and kept lowercase")
 
-    def test_a_sandbox_a_collaborator_could_write_state_through_is_told_it_gets_no_tools(self):
+    def test_an_install_that_admits_collaborators_is_told_it_gets_no_tools(self):
         engine = self.home / "Application Support" / "engine"   # a space in the path, as the desktop's
         engine.mkdir(parents=True)
         node = engine / "node"
@@ -542,13 +542,13 @@ class Install(Base):
         node.chmod(0o755)
         proxy = shlex.join([str(node), str(engine / "ag2-mcp-proxy.mjs")])
         runner = self.runner()
-        rc, out, err = self.install_with(runner, False, "--mcp-proxy-command", proxy, "--sandbox", "workspace-write")
+        for sandbox in ("read-only", "workspace-write"):
+            rc, out, err = self.install_with(runner, False, "--mcp-proxy-command", proxy, "--sandbox", sandbox)
+            self.assertEqual(rc, 0, out + err)
+            self.assertIn("NOTE mcp: a collaborator's turn could read the agent's credentials", out, sandbox)
+        rc, out, err = self.install_with(runner, False, "--mcp-proxy-command", proxy, "--no-allow-collaborator")
         self.assertEqual(rc, 0, out + err)
-        self.assertIn("NOTE mcp: with --sandbox workspace-write a collaborator's turn could write", out)
-        rc, out, err = self.install_with(runner, False, "--mcp-proxy-command", proxy, "--sandbox", "workspace-write",
-                                         "--no-allow-collaborator")
-        self.assertEqual(rc, 0, out + err)
-        self.assertNotIn("could write the agent's state", out)
+        self.assertNotIn("a collaborator's turn could read", out)
 
     def test_mcp_proxy_command_is_checked_recorded_listed_and_handed_on_with_the_token_file(self):
         engine = self.home / "Application Support" / "engine"   # a space in the path, as the desktop's
@@ -569,7 +569,6 @@ class Install(Base):
         rc, out, err = self.install_with(runner, False, "--mcp-proxy-command", proxy)
         self.assertEqual(rc, 0, out + err)
         self.assertIn("NOTE mcp:", out, "--work has no token file of the agent's own")
-        self.assertNotIn("could write the agent's state", out, "read-only: nothing a collaborator can write")
         cfg = cm.read_config(cli.config_path())
         self.assertEqual(shlex.split(cfg["MCP_PROXY_COMMAND"]), shlex.split(proxy))
         self.assertNotIn("--mcp-proxy-command", cli.connector_argv(cfg, str(self.work), 7), "no token file: no tools")

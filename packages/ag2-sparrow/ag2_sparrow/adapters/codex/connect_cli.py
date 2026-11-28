@@ -232,9 +232,9 @@ def install(args) -> int:
     if proxy and not where["token_file"]:
         print("NOTE mcp: --mcp-proxy-command acts as the agent through its own token file; with --work there is "
               "none, so turns get no AG2 Space tools")
-    if proxy and args.sandbox != "read-only" and values["ALLOW_COLLABORATOR"] != "0":
-        print("NOTE mcp: with --sandbox %s a collaborator's turn could write the agent's state, so turns get no "
-              "AG2 Space tools; --sandbox read-only or --no-allow-collaborator keeps them" % args.sandbox)
+    if proxy and values["ALLOW_COLLABORATOR"] != "0":
+        print("NOTE mcp: a collaborator's turn could read the agent's credentials or write its state, so turns get "
+              "no AG2 Space tools while collaborators are admitted; --no-allow-collaborator turns them on")
     if args.sandbox == "workspace-write":
         print("NOTE sandbox: workspace-write lets an owner turn write under the work root; a turn retried after "
               "the app-server dies can repeat side effects the first attempt already made")
@@ -476,7 +476,7 @@ def session_options(p) -> None:
                         "shared thread that collaborators and other rooms use")
     p.add_argument("--mcp-proxy-command", help="the stdio ag2-mcp-proxy command line ('<node> <the desktop app's "
                    "engine/ag2-mcp-proxy.mjs>'), each path quoted when it has a space: the owner-only thread of the "
-                   "owner's DM, which no collaborator uses, gets the AG2 Space tools as this agent (needs "
+                   "owner's DM gets the AG2 Space tools as this agent, only with --no-allow-collaborator (needs "
                    "--token-env-file; default: none)")
 
 
