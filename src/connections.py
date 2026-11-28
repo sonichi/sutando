@@ -4773,9 +4773,12 @@ def mcp_remove_command(name: str, mcp_config: Optional[Path] = None) -> str:
     """The shell command that removes the user-scope MCP entry `name` from the Claude Code config
     `mcp_config` (default `claude_config_file()`), pinned to that file whatever shell it is pasted
     into: `CLAUDE_CONFIG_DIR=<its folder>` in front, or `env -u CLAUDE_CONFIG_DIR` for the home
-    folder's own `.claude.json`; the name is shell-quoted as one argument after `--`."""
+    folder's own `.claude.json`; the name is shell-quoted as one argument after `--`. '' for a file
+    not named `.claude.json`, which no `claude mcp remove` targets."""
     import shlex
     config = Path(os.path.abspath((Path(mcp_config) if mcp_config is not None else claude_config_file()).expanduser()))
+    if config.name != ".claude.json":
+        return ""
     at_home = config == Path(os.path.abspath(Path.home() / ".claude.json"))
     pin = "env -u CLAUDE_CONFIG_DIR" if at_home else f"CLAUDE_CONFIG_DIR={shlex.quote(str(config.parent))}"
     return f"{pin} claude mcp remove --scope user -- {shlex.quote(name)}"

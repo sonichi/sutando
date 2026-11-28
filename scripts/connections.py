@@ -67,6 +67,7 @@
   moved-mcp-servers [--mcp-config PATH]
                                one line per Claude Code MCP entry that connects straight to a server
                                that moved, naming the entry, the successor and the remove command
+                               (for a PATH not named .claude.json: the file to edit, no command)
                                (nothing when there is none; always exit 0)
   primary                      the primary row's instance ('' = the legacy bridge); exit 2 when none
   enabled                      each row a bridge serves (neither disabled nor parked), one instance per
@@ -394,8 +395,9 @@ def cmd_moved_mcp_servers(args) -> int:
     for e in connections.moved_mcp_servers(args.mcp_config):
         name = json.dumps(e["name"])
         to = f"{e['successor']} ({e['mcp_url']})" if e["mcp_url"] else e["successor"]
-        print(f"MCP server {name} connects to {e['server']}, which moved to {to}; it will not connect. "
-              f"Remove it with: {connections.mcp_remove_command(e['name'], args.mcp_config)}")
+        command = connections.mcp_remove_command(e["name"], args.mcp_config)
+        fix = f"Remove it with: {command}" if command else f"It is in {json.dumps(str(args.mcp_config))}; edit that file to remove it."
+        print(f"MCP server {name} connects to {e['server']}, which moved to {to}; it will not connect. {fix}")
     return 0
 
 

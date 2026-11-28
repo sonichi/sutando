@@ -699,7 +699,10 @@ only the proxy's descriptor. `scripts/connections.py moved-mcp-servers`
 and the command pinned to the file that was read, `CLAUDE_CONFIG_DIR=<folder>` in front, or
 `env -u CLAUDE_CONFIG_DIR` for `.claude.json` in the home folder itself, which is what Claude Code
 uses with no config folder set and what the check reads by default); only user-scope entries are
-checked. The Claude worker launcher prints one warning per entry when the seat
+checked, and a `--mcp-config` file not named `.claude.json` is named as the file to edit, with no
+command. `env -u` is not POSIX `env`, but macOS and GNU both have it. The check, the proxy-descriptor
+lookup and the lane lookup share one default file (`connections.claude_config_file`):
+`$CLAUDE_CONFIG_DIR/.claude.json`, else `.claude.json` in the home folder. The Claude worker launcher prints one warning per entry when the seat
 starts, and never edits the config.
 
 The proxy decides whom it acts as once, when the seat starts. A worker given its own agent while

@@ -111,6 +111,10 @@ class TheRemoveCommand(Base):
         with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.root / "seat")}):
             self.assertEqual(shlex.split(C.mcp_remove_command("x"))[0], f"CLAUDE_CONFIG_DIR={self.root / 'seat'}")
 
+    def test_a_file_claude_would_not_target_gets_no_command(self):
+        for config in (self.root / "seat" / "mcp.json", self.home / "claude.json", self.root / ".claude.json.bak"):
+            self.assertEqual(C.mcp_remove_command("x", config), "", config)
+
     def test_a_relative_config_is_named_by_its_absolute_folder(self):
         first = shlex.split(C.mcp_remove_command("x", Path("rel") / ".claude.json"))[0]
         self.assertEqual(first, f"CLAUDE_CONFIG_DIR={Path.cwd() / 'rel'}")
@@ -143,6 +147,35 @@ class TheDefaultConfig(Base):
             self.assertEqual(C.claude_config_file(), home / ".claude.json")
             self.assertEqual([e["name"] for e in C.moved_mcp_servers()], ["root"])
 
+    def two_configs(self):
+        """A home with a descriptor named in each candidate file; returns (home, workspace, root's, nested's)."""
+        home, ws = self.root / "home", self.root / "ws"
+        (home / ".claude").mkdir(parents=True)
+        (ws / "state").mkdir(parents=True)
+        named = {}
+        for where, folder in (("root", home), ("nested", home / ".claude")):
+            named[where] = ws / "state" / f"{where}-mcp.json"
+            named[where].write_text("{}")
+            env = {"AG2_MCP_DESCRIPTOR": str(named[where])}
+            if where == "root":
+                env[C.MCP_LANE_CREDENTIAL_ENV] = json.dumps(["python3", "resolver.py"])
+            (folder / ".claude.json").write_text(json.dumps({"mcpServers": {"s-space": {"command": "node", "env": env}}}))
+        return home, ws, named["root"], named["nested"]
+
+    def test_the_proxy_descriptor_lookup_reads_the_home_folders_own_file(self):
+        home, ws, at_root, _ = self.two_configs()
+        with mock.patch.dict(os.environ, {"HOME": str(home), "CLAUDE_HOME": str(home / ".claude")}):
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            self.assertEqual(C.mcp_descriptor_path(ws), at_root)
+
+    def test_the_lane_lookup_reads_the_home_folders_own_file(self):
+        home, _, at_root, nested = self.two_configs()
+        missing = self.root / "no-codex" / "config.toml"
+        with mock.patch.dict(os.environ, {"HOME": str(home), "CLAUDE_HOME": str(home / ".claude")}):
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            self.assertTrue(C._proxy_reads_vault_lanes(at_root, {}, None, missing))
+            self.assertFalse(C._proxy_reads_vault_lanes(nested, {}, None, missing))
+
     def test_with_a_config_folder_it_is_that_folders_file(self):
         self.assertEqual(C.claude_config_file({"CLAUDE_CONFIG_DIR": str(self.root)}), self.root / ".claude.json")
 
@@ -161,6 +194,28 @@ class TheCli(Base):
             f"Remove it with: CLAUDE_CONFIG_DIR={self.root} claude mcp remove --scope user -- 'Old Space'"])
         self.assertNotIn("hush", r.stdout)
         self.assertEqual(self.config.read_bytes(), before, "the config is only read")
+
+    def test_a_config_under_another_file_name_is_warned_about_without_a_command(self):
+        self.config = self.root / "custom mcp.json"
+        self.write({"Old Space": {"type": "http", "url": OLD_MCP}})
+        r = self.cli()
+        self.assertEqual((r.returncode, r.stderr), (0, ""), r.stderr)
+        self.assertEqual(r.stdout.splitlines(), [
+            f'MCP server "Old Space" connects to {OLD}, which moved to {NEW} ({NEW_MCP}); it will not connect. '
+            f'It is in {json.dumps(str(self.config))}; edit that file to remove it.'])
+        self.assertNotIn("claude mcp remove", r.stdout)
+
+    def test_the_home_folders_own_file_gets_the_unset_form(self):
+        home = self.root / "home"
+        home.mkdir()
+        self.config = home / ".claude.json"
+        self.write({"-x": {"type": "http", "url": OLD_MCP}})
+        r = subprocess.run([sys.executable, str(ROOT / "scripts" / "connections.py"), "moved-mcp-servers"],
+                           capture_output=True, text=True, timeout=60,
+                           env={k: v for k, v in {**os.environ, "HOME": str(home)}.items() if k != "CLAUDE_CONFIG_DIR"})
+        self.assertEqual((r.returncode, r.stderr), (0, ""), r.stderr)
+        self.assertTrue(r.stdout.rstrip("\n").endswith(
+            "Remove it with: env -u CLAUDE_CONFIG_DIR claude mcp remove --scope user -- -x"), r.stdout)
 
     def test_nothing_is_printed_when_no_entry_moved_or_there_is_no_config(self):
         r = self.cli()
