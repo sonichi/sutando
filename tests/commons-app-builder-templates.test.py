@@ -53,6 +53,11 @@ check("guide-unknown-outcome-never-a-new-id", "Never resend it with a new id" in
 check("guide-unknown-outcome-reads-back-otherwise", "read the page or rows back before deciding" in actions)
 check("guide-never-sends-the-reader-to-operation-inspect",
       flat.count("operation.inspect") == flat.count("`operation.inspect` does not know these writes") == 1)
+# The hosted-MCP skill states the same rule: its inspect-first line excepts a Commons write.
+mcp = " ".join((_ROOT / "skills" / "ag2-space-mcp" / "SKILL.md").read_text(encoding="utf-8").split())
+check("mcp-skill-excepts-commons-writes-from-inspect-first",
+      "call `operation.inspect` before resending anything, except a `room.commons.*` write, which"
+      " `operation.inspect` does not know: resend that one unchanged with the same `operation_id`" in mcp)
 
 for name in TEMPLATES:
     d = _TPL / name
