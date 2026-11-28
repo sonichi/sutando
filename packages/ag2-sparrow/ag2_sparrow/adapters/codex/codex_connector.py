@@ -9,16 +9,18 @@ daemon, or the stub in this directory. Each `tasks/task-*.txt` becomes one
 which delivers into a thread owned by a running interactive TUI. Stdlib only.
 
 Tier policy is task_io.turn_policy's, from the attested headers only; this module maps its
-capabilities. A durable turn (the owner, and an attested collaborator) runs on the thread kept
-per channel_id (state/threads/<key>) in the configured cwd and sandbox; a restricted turn (any
-other non-owner, unless --no-allow-non-owner) runs on its own ephemeral thread, read-only, in an
-empty temp dir. Every non-owner turn carries the shared NON_OWNER_NOTE; only the owner continues
-the owner's own conversation (--resume-thread, --push); a collaborator joins a channel's kept thread only
-when its file says it is shared, else it gets the channel's separate shared thread. A refused turn gets
-NON_OWNER_REFUSED.
+capabilities. A durable turn (the owner, and an attested collaborator) runs on the agent's ONE shared
+thread, whatever room it came from (state/thread, 0600, resumed after an app-server restart), in the
+configured cwd and sandbox, as local Claude Code keeps one session and the Codex core's seat one thread;
+every such prompt opens with its room, its sender and that the reply goes back to that room
+(shared_thread_lead). A restricted turn (any other non-owner, unless --no-allow-non-owner; an attested
+collaborator too under --no-allow-collaborator, served_policy) runs on its own ephemeral thread,
+read-only, in an empty temp dir. Every non-owner turn carries the shared
+NON_OWNER_NOTE. The owner's own conversation (--resume-thread) goes to an owner-only thread
+(state/owner-thread) that only the owner's DM turns continue, never the shared thread; only the owner
+reaches a TUI thread (--push). A refused turn gets NON_OWNER_REFUSED.
 """
 import argparse
-import hashlib
 import json
 import os
 import queue
@@ -35,10 +37,11 @@ from ... import account_switch, card_desk, connector_cards, held_start, live_vie
 from ...acp_host import quoted
 from ...collaborator_turn import TIER_BLOCK_END, TIER_BLOCK_HEADER, TIER_REWRITES, stage_own_attachments, with_staged_paths
 from ...relay_loop import count_arg
-from ...task_io import (AUDIENCE_RULE, DONE_KEEP, NON_OWNER_NOTE, NON_OWNER_REFUSED, OWNER, OWNER_CAPABILITIES,  # noqa: F401
+from ...task_io import (ALLOW_COLLABORATOR_FLAG, AUDIENCE_RULE,
+                        DONE_KEEP, NON_OWNER_NOTE, NON_OWNER_REFUSED, OWNER, OWNER_CAPABILITIES,  # noqa: F401
                         LockRefused, acquire_lock, attested_headers, exit_on_sigterm, holder_consumer, load_done,
                         make_dirs, non_owner_note, parse_task, pid_alive, exit_code, record_done, refusal_body,
-                        release_lock,
+                        release_lock, COLLABORATOR,
                         root_path, start_time, stop_requested, turn_policy, write_atomic)
 from . import device_login
 
@@ -267,9 +270,10 @@ def usage_state(answer, now=None) -> "dict | None":
     used = [w.get("usedPercent") for w in (snapshot.get(n) for n in ("primary", "secondary")) if isinstance(w, dict)]
     used = [u for u in used if isinstance(u, (int, float)) and not isinstance(u, bool)]
     return {} if used and all(u < 100 for u in used) else None
-OWNER_ONLY, SHARED = "owner-only", "shared"   # third line of a thread file; absent: an older file, unknown
-SHARED_SUFFIX = ".shared"               # a collaborator's thread where the kept thread is not known to be shared
+SHARED_THREAD = "thread"     # under state/: the one shared thread's id (0600), as the Codex core's seat keeps its own
 RESUME_MARKER = "resume-thread-taken"   # under state/: the --resume-thread id already carried over
+OWNER_THREAD = "owner-thread"   # under state/: the owner-only conversation (0600) only the owner's DM turns resume
+LEGACY_OWNER_ONLY = "owner-only"   # third line of an earlier version's state/threads/<key> file
 
 
 def log(*a):
@@ -283,29 +287,60 @@ def child_env():
     return env
 
 
-def channel_key(channel_id):
-    """File name for a channel's thread: a digest, so no id can escape the directory or
-    collide with another; the readable id is kept inside the file."""
-    return hashlib.sha256(channel_id.encode("utf-8")).hexdigest() if channel_id else "default"
-
-
-def bound_thread_id(spec, channel_id):
-    """`--thread-id CHANNEL_ID=THREAD` names the one channel that may resume THREAD."""
-    if not spec or "=" not in spec:
+def thread_seed(spec):
+    """`--thread-id THREAD`: the thread the shared thread resumes when none is saved yet. The older
+    `CHANNEL_ID=THREAD` named one owner channel's own thread; it never seeds the thread every room shares."""
+    if not spec:
         return None
-    channel, thread = spec.split("=", 1)
-    return thread if channel == (channel_id or "") else None
+    if "=" in spec:
+        log("--thread-id %s names one channel's thread (the older form); the shared thread does not resume it"
+            % spec.split("=", 1)[0][:80])
+        return None
+    return spec.strip() or None
 
 
-def saved_thread(path):
-    """(thread id or None, its class: OWNER_ONLY, SHARED, or None when unknown) from a channel's thread file."""
+def saved_shared_thread(path):
+    """The shared thread's id from its file (the first line), or None when there is none."""
     try:
         with open(path, encoding="utf-8") as f:
-            lines = f.read().splitlines()
+            return f.readline().strip() or None
     except FileNotFoundError:
-        return None, None
-    cls = lines[2] if len(lines) > 2 and lines[2] in (OWNER_ONLY, SHARED) else None
-    return (lines[0].strip() or None) if lines else None, cls
+        return None
+
+
+def keep_thread(path, thread_id):
+    """Save the shared thread's id, readable by its owner only, through a sibling temp file and a rename."""
+    tmp = os.path.join(os.path.dirname(path), ".%s.%d.tmp" % (os.path.basename(path), os.getpid()))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(thread_id + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)     # an existing temp file keeps its mode under O_CREAT
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def _one_line(value):
+    return " ".join(str(value).split())[:200]
+
+
+def shared_thread_lead(headers, task_id, kind):
+    """The first paragraph of every prompt on the shared thread: which room the turn is from, who sent it and that
+    its reply goes back to that room, from the attested headers and turn_policy's `kind` for them only. The thread
+    also holds other rooms' turns."""
+    room = _one_line(headers.get("channel_id") or headers.get("source_room_id") or "task:%s" % task_id)
+    sender = headers.get("user_id") or headers.get("sender_name") or (
+        "your owner" if kind == OWNER else "an unknown sender")
+    return ("[shared thread] This turn is from room %s, sent by %s (access_tier=%s, collaborator=%s), as Sparrow's "
+            "attested task headers say. Your reply to this turn goes back to room %s, and only there. This one "
+            "thread also carries earlier turns from your owner and collaborators in other rooms: answer this "
+            "sender, in this room, and never repeat what was said in another room to a sender who is not your owner."
+            % (room, _one_line(sender), _one_line(headers.get("access_tier") or "guest"),
+               "true" if kind == COLLABORATOR else "false", room))
 
 
 class Rpc:
@@ -378,6 +413,15 @@ class Rpc:
             self.p.wait()
         self.p.stdout.close()
         self.err.close()
+
+
+def served_policy(headers, allow_non_owner=True, allow_collaborator=True):
+    """turn_policy, with a collaborator the install withholds (--no-allow-collaborator) served exactly as any
+    other non-owner: restricted under allow_non_owner, else refused; never the shared thread."""
+    policy = turn_policy(headers, allow_non_owner, allow_collaborator)
+    if policy.unlock == ALLOW_COLLABORATOR_FLAG:
+        policy = turn_policy(dict(headers, collaborator="false"), allow_non_owner)
+    return policy
 
 
 def capabilities(headers):
@@ -478,8 +522,8 @@ class Connector:
         self.note = note if note is not None else non_owner_note()
         self.thread_id = None
         self.last_thread = None   # the thread the current task ran on, for its metrics row
-        self.live = {}            # channel key -> owner thread id open on the current server
-        self.owner_only_keys = set()
+        self.shared_open = None   # the shared thread's id once it is open on the current server
+        self.owner_open = None    # the owner-only thread's id once it is open on the current server
         self.scratch_cwd = None
         self.declined = []
         self.turn_id = None       # the turn now running, once turn/start has named it
@@ -795,74 +839,99 @@ class Connector:
         self.thread_id = res["thread"]["id"]
         log("started thread", self.thread_id, caps.workspace, "ephemeral" if ephemeral else "durable")
 
-    def carried_thread(self, kind):
-        """The owner's conversation `--resume-thread` names, for the owner's DM, until it has been taken
-        once (the marker holds the id taken, so a new id given at a reinstall is taken again)."""
-        if not self.args.resume_thread or kind != "dm" or self.args.ephemeral:
+    def carried_thread(self, caps):
+        """The owner's conversation `--resume-thread` names, carried into the owner-only slot by an owner turn
+        (never a collaborator's), until it has been taken once (the marker holds the id taken, so a new id given
+        at a reinstall is taken again)."""
+        if not self.args.resume_thread or not caps.owner_dm or self.args.ephemeral:
             return None
         return None if self.taken_resume() == self.args.resume_thread else self.args.resume_thread
 
     def taken_resume(self):
         """The --resume-thread id already carried over."""
+        return saved_shared_thread(os.path.join(self.args.state, RESUME_MARKER)) or ""
+
+    def owner_slot(self):
+        """The owner-only thread's id: state/owner-thread, else the id an earlier version carried over (the marker)."""
+        return saved_shared_thread(os.path.join(self.args.state, OWNER_THREAD)) or self.taken_resume() or None
+
+    def owner_only_ids(self):
+        """Every id known to hold an owner-only conversation; none of them is ever the shared thread."""
+        ids = {self.args.resume_thread, self.taken_resume(), self.owner_slot()}
+        legacy = os.path.join(self.args.state, "threads")
+        for name in os.listdir(legacy) if os.path.isdir(legacy) else ():
+            try:
+                with open(os.path.join(legacy, name), encoding="utf-8") as f:
+                    lines = f.read().splitlines()
+            except OSError:
+                continue
+            if len(lines) > 2 and lines[2] == LEGACY_OWNER_ONLY:
+                ids.add(lines[0].strip())
+        return {i for i in ids if i}
+
+    def owner_slot_turn(self, headers, caps):
+        """An owner turn in the owner's DM, when there is an owner-only conversation to continue there."""
+        if not caps.owner_dm or self.args.ephemeral or (headers.get("channel_kind") or "").strip().lower() != "dm":
+            return False
+        return bool(self.carried_thread(caps) or self.owner_slot())
+
+    def resume_or_start(self, wanted, caps, what):
         try:
-            with open(os.path.join(self.args.state, RESUME_MARKER), encoding="utf-8") as f:
-                return f.readline().strip()
-        except FileNotFoundError:
-            return ""
+            res = self.rpc.request("thread/resume", dict(self.thread_params(caps), threadId=wanted),
+                                   timeout=self.args.turn_timeout)
+            self.thread_id = res["thread"]["id"]
+            log("resumed the %s" % what, self.thread_id)
+        except (RuntimeError, TimeoutError) as e:
+            log("thread/resume failed for the %s %s; starting a new %s:" % (what, wanted, what), str(e)[:200])
+            self.start_thread(caps, False)
 
-    def not_shared(self, key, path, channel_id):
-        """A channel whose kept thread a collaborator may not join: the owner's own conversation (carried over,
-        or bound by --thread-id), or a thread whose file does not say it is shared."""
-        if key in self.owner_only_keys or bound_thread_id(self.args.thread_id, channel_id):
-            return True
-        return os.path.exists(path) and saved_thread(path)[1] != SHARED
-
-    def open_owner_thread(self, channel_id, kind="", caps=OWNER_CAPABILITIES):
-        """The channel's durable thread: in the owner's DM (an owner turn only), the conversation carried over
-        the first time; else resume the saved id when it is still known, else start one. A collaborator never
-        joins a thread that is the owner's own conversation; it gets the channel's shared thread instead."""
-        key = channel_key(channel_id)
-        path = os.path.join(self.args.state, "threads", key)
-        if not caps.owner_dm and self.not_shared(key, path, channel_id):
-            key += SHARED_SUFFIX
-            path = os.path.join(self.args.state, "threads", key)
-        carried = self.carried_thread(kind) if caps.owner_dm else None
-        if key in self.live and not carried:
-            self.thread_id = self.live[key]
+    def open_owner_thread(self, caps=OWNER_CAPABILITIES):
+        """The owner-only thread, for the owner's DM turns alone (as before the shared thread): the conversation
+        --resume-thread names, carried over once, then the one kept in state/owner-thread. Collaborators and room
+        turns never run on it, and it never becomes the shared thread."""
+        carried = self.carried_thread(caps)
+        if self.owner_open and not carried:
+            self.thread_id = self.owner_open
             return
-        wanted, cls = saved_thread(path)
-        bound = bound_thread_id(self.args.thread_id, channel_id) if caps.owner_dm else None
-        if carried or (bound and not wanted):
-            cls = OWNER_ONLY
-        elif not wanted:
-            cls = SHARED
-        wanted = carried or wanted or bound
         if carried:
             # Taken once whatever the resume answers: a failed one is not retried on every task.
             write_atomic(os.path.join(self.args.state, RESUME_MARKER), carried + "\n")
+            log("carrying the owner's conversation %s over into the owner-only thread" % carried)
+        self.resume_or_start(carried or self.owner_slot(), caps, "owner-only thread")
+        self.owner_open = self.thread_id
+        keep_thread(os.path.join(self.args.state, OWNER_THREAD), self.thread_id)
+
+    def open_shared_thread(self, caps=OWNER_CAPABILITIES):
+        """The agent's one durable thread, for the owner's and attested collaborators' turns from every room:
+        the one open on this server; else the saved one (state/thread) resumed; else started. `--thread-id` seeds
+        it when none is saved. It never resumes an owner-only conversation (--resume-thread, state/owner-thread,
+        an earlier version's owner-only thread): a saved id that is one is replaced by a fresh shared thread. A
+        resume that fails starts a new shared thread, and says so. The per-room thread files of earlier versions
+        (state/threads/) are left as they were, unused."""
+        path = os.path.join(self.args.state, SHARED_THREAD)
+        if self.shared_open:
+            self.thread_id = self.shared_open
+            return
+        wanted = saved_shared_thread(path) or thread_seed(self.args.thread_id)
+        if wanted and wanted in self.owner_only_ids():
+            log("the shared thread %s is an owner-only conversation; starting a fresh shared thread" % wanted)
+            wanted = None
         if wanted and not self.args.ephemeral:
-            try:
-                res = self.rpc.request("thread/resume", dict(self.thread_params(caps), threadId=wanted),
-                                       timeout=self.args.turn_timeout)
-                self.thread_id = res["thread"]["id"]
-                log("resumed thread", self.thread_id, "for", key)
-            except (RuntimeError, TimeoutError) as e:
-                log("thread/resume failed, starting a new thread:", str(e)[:200])
-                self.start_thread(caps, self.args.ephemeral)
-                cls = cls if cls == OWNER_ONLY else SHARED
+            self.resume_or_start(wanted, caps, "shared thread")
         else:
             self.start_thread(caps, self.args.ephemeral)
-        self.live[key] = self.thread_id
-        if cls == OWNER_ONLY:
-            self.owner_only_keys.add(key)
-        write_atomic(path, "%s\n%s\n%s" % (self.thread_id, (channel_id or "")[:80], cls + "\n" if cls else ""))
+        self.shared_open = self.thread_id
+        if not self.args.ephemeral:      # an ephemeral thread cannot be resumed after a restart
+            keep_thread(path, self.thread_id)
 
     def open_for(self, headers, caps=None):
-        """A durable turn: the channel's kept thread. An ephemeral one: a fresh read-only thread in an
-        empty temp dir, so no room's tasks or results are in its cwd."""
+        """A durable turn: the owner-only thread for the owner's DM when there is one, else the shared thread. An
+        ephemeral one: a fresh read-only thread in an empty temp dir, so no room's tasks or results are in its cwd."""
         caps = caps or capabilities(headers)
-        if caps.session == "durable":
-            self.open_owner_thread(headers.get("channel_id"), (headers.get("channel_kind") or "").strip().lower(), caps)
+        if caps.session == "durable" and self.owner_slot_turn(headers, caps):
+            self.open_owner_thread(caps)
+        elif caps.session == "durable":
+            self.open_shared_thread(caps)
         else:
             self.drop_scratch()
             self.scratch_cwd = tempfile.mkdtemp(prefix="codex-nonowner-")
@@ -897,12 +966,12 @@ class Connector:
         return True
 
     def restart_server(self):
-        """Replace the app-server process; owner threads are re-resumed on next use."""
+        """Replace the app-server process; the shared thread is resumed on next use."""
         log("restarting app-server; old pid", self.rpc.p.pid)
         self.rpc.close()
         started = self.signin_mark()         # read before the spawn: what the new server can at least see
         self.rpc = self.rpc_factory()
-        self.live = {}
+        self.shared_open = self.owner_open = None
         self.thread_id = None
         self.signin_started, self.signin_account = started
         self.handshake()
@@ -926,7 +995,7 @@ class Connector:
             except Exception:  # noqa: BLE001 - it never served; the failure that matters is raised below
                 pass
             raise
-        self.live = {}
+        self.shared_open = self.owner_open = None
         self.thread_id = None
         self.signin_started, self.signin_account = started
         try:
@@ -1399,7 +1468,7 @@ class Connector:
             # Read now: the bridge may archive the task file while the turn runs.
             task_text = card_desk.read_task(path)
             self.quota.remember(task_text)     # the owner's DM, where a quota notice goes
-            policy = turn_policy(headers, self.args.allow_non_owner)
+            policy = served_policy(headers, self.args.allow_non_owner, self.args.allow_collaborator)
             if not policy.served:
                 log("refused (non-owner, %s not set) ->" % policy.unlock, task_id, headers["access_tier"])
                 write_atomic(os.path.join(self.args.results, name),
@@ -1433,6 +1502,9 @@ class Connector:
                 seen.discard(task_id)
                 continue
             prompt = wrap_untrusted(task_id, headers, message, operator_lines, self.note, caps=policy.capabilities)
+            if policy.capabilities.session == "durable" and not self.owner_slot_turn(headers, policy.capabilities):
+                # One thread holds every room's durable turns: each says where it is from and where it goes.
+                prompt = shared_thread_lead(headers, task_id, policy.kind) + "\n\n" + prompt
             if headers["access_tier"] == "owner" and self.desk.hint():
                 prompt += "\n\n" + self.desk.hint()
             log("turn ->", task_id, headers["access_tier"], repr(message[:60]))
@@ -1584,10 +1656,18 @@ def build_parser():
                          "room's kept thread with --cwd and --sandbox, framed by the non-owner note.")
     no.add_argument("--no-allow-non-owner", dest="allow_non_owner", action="store_false",
                     help="refuse those senders with a plain line instead")
-    ap.add_argument("--thread-id", default=None, metavar="CHANNEL_ID=THREAD",
-                    help="resume THREAD for exactly this owner channel when it has no saved thread yet")
+    co = ap.add_mutually_exclusive_group()
+    co.add_argument("--allow-collaborator", dest="allow_collaborator", action="store_true", default=True,
+                    help="serve attested collaborators on the shared thread, as the owner (the default)")
+    co.add_argument("--no-allow-collaborator", dest="allow_collaborator", action="store_false",
+                    help="serve attested collaborators as any other non-owner instead: their own ephemeral "
+                         "read-only thread with integrations off, or refused under --no-allow-non-owner")
+    ap.add_argument("--thread-id", default=None, metavar="THREAD",
+                    help="resume THREAD as the shared thread when none is saved yet (the older CHANNEL_ID=THREAD, "
+                         "one owner channel's thread, is accepted and not resumed)")
     ap.add_argument("--resume-thread", default=None, metavar="THREAD",
-                    help="the owner's own Codex conversation to continue in the owner's DM (taken once)")
+                    help="the owner's own Codex conversation to continue in the owner's DM only (taken once), "
+                         "on an owner-only thread; it never becomes the shared thread collaborators use")
     ap.add_argument("--ephemeral", action="store_true", help="owner threads too: do not persist to the Codex home")
     ap.add_argument("--developer-instructions", default=None)
     ap.add_argument("--once", type=count_arg, default=0, help="exit after N tasks")

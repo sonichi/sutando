@@ -155,7 +155,7 @@ class DifferentialTest(unittest.TestCase):
         self.assertEqual(len(routine["429 then ok"]["provider"]), 2, "the 429 is retried once")
         self.assertEqual(len(routine["pre-existing result"]["provider"]), 1, "an answered task is not fired")
         methods = [c["method"] for c in RECORDED["codex"]["restart"]["provider"]]
-        self.assertIn("thread/resume", methods, "a restart resumes the channel's thread")
+        self.assertIn("thread/resume", methods, "a restart resumes the shared thread")
 
 
 if __name__ == "__main__":
