@@ -6,6 +6,7 @@ that calls it, and the literal contract fixtures under contracts/core_recovery.v
 Run: python3 tests/core-recovery-state.test.py
 """
 import importlib.util
+import hashlib
 import json
 import os
 import sys
@@ -23,10 +24,17 @@ os.environ["SUTANDO_TEST_MODE"] = "1"
 
 import cli_wedge
 import core_recovery_state as crs
+from hitl.manager import HitlManager, HitlStore, default_store
 from hitl.replies import REPLY_FIELD
-from hitl.schema import ActionReply
+from hitl.schema import ActionReply, HumanRequirement
 
 FIXTURES = REPO / "contracts" / "core_recovery.v1"
+FIXTURE_HASHES = {
+    "action.json": "2bb978656f9eeb88b8bc9daeee896b84f5e4770d6b8e4ce1409218f34c231199",
+    "heartbeat.codex.json": "bb1dd20d05a61fb4ab79d56811f86d48594d916046ec9d06f7ff4af8992fc57b",
+    "heartbeat.json": "df9d5956c508f7a1f008cddb5d33166811ab038084ccc10d64a6f1496257bdda",
+    "receipt.json": "de156f0aba1a90add064618a228631002562562fbe48153aa545b408c23b1751",
+}
 NOW = 1763730120.0
 # Row tokens of the list core-recovery-actions records (fixed host key and read time).
 OFFERED = ["o4b876be2aaa6", "o5029163bc176", "o4a94f8c4f90b"]
@@ -276,6 +284,16 @@ class Fields(unittest.TestCase):
         for bad in (None, [], {"v": 2, "state": "running"}, {"v": 1, "state": "offline"}):
             self.assertIsNone(crs.coerce(bad), bad)
 
+    def test_a_partial_or_malformed_card_identity_is_dropped_as_a_unit(self):
+        base = {"v": 1, "state": "paused_limit"}
+        good = {"hitl_id": "hitl_recoverycard", "revision": 3,
+                "event_id": "$recovery-card:example.test"}
+        self.assertEqual(crs.coerce({**base, "card": good})["card"], good)
+        for bad in ({}, {**good, "hitl_id": "other"}, {**good, "revision": True},
+                    {**good, "revision": 0}, {**good, "event_id": "recovery-card"},
+                    {**good, "event_id": "$bad\nevent"}):
+            self.assertNotIn("card", crs.coerce({**base, "card": bad}), bad)
+
 
     def test_identifiers_keep_their_documented_shape_on_read_and_write(self):
         good = {"v": 1, "state": "running", "incident": "inc_0123abcd", "model": "sonnet", "account": "acct_3f9a2b"}
@@ -488,6 +506,100 @@ class Writer(unittest.TestCase):
                          ("paused_limit", 2, 0, "claude"))
         self.assertEqual(rec["account"], "acct_3f9a2b")
 
+    def test_gather_names_the_live_recovery_card_projection(self):
+        manager = HitlManager(HitlStore(default_store(self.ws)))
+        prompt = "You've hit your usage limit"
+        supervisor = {"state": "blocked-human", "kind": "usage-limit", "prompt": prompt}
+        req = HumanRequirement(
+            kind="core-blocked", runtime="claude", message="Paused", id="hitl_recoverycard",
+            revision=3, guard=crs._recovery_guard("sutando-core", supervisor),
+            subject={"source": "tui", "session": "sutando-core",
+                     "supervisor_state": "blocked-human", "recovery": True})
+        manager.create(req)
+        manager.record_projection(req.id, req.revision, "$recovery-card:example.test")
+        with mock.patch.object(crs, "_offered", return_value=[]), \
+                mock.patch.object(crs, "runtimes_on_host", return_value=()), \
+                mock.patch.object(crs, "launches_in_window", return_value=[]), \
+                mock.patch.object(crs.core_limit_hold, "read_hold", return_value=None), \
+                mock.patch.object(crs.core_limit_hold, "launch_identity", return_value=(None, None)):
+            rec = crs.gather(self.ws, supervisor, now=NOW, runtime="claude", session="sutando-core")
+        self.assertEqual(rec["card"], {"hitl_id": req.id, "revision": 3,
+                                       "event_id": "$recovery-card:example.test"})
+
+    def _gather(self, supervisor, **patches):
+        with mock.patch.object(crs, "_offered", return_value=[]), \
+                mock.patch.object(crs, "runtimes_on_host", return_value=()), \
+                mock.patch.object(crs, "launches_in_window", return_value=[]), \
+                mock.patch.object(crs.core_limit_hold, "read_hold", return_value=None), \
+                mock.patch.object(crs.core_limit_hold, "launch_identity", return_value=(None, None)):
+            return crs.gather(self.ws, supervisor, now=NOW, runtime="claude", session="sutando-core")
+
+    def test_a_card_projected_at_an_earlier_revision_is_not_named_until_the_new_one_lands(self):
+        manager = HitlManager(HitlStore(default_store(self.ws)))
+        supervisor = {"state": "blocked-human", "kind": "usage-limit", "prompt": "You've hit your usage limit"}
+        req = HumanRequirement(
+            kind="core-blocked", runtime="claude", message="Paused", id="hitl_recoverycard",
+            guard=crs._recovery_guard("sutando-core", supervisor),
+            subject={"source": "tui", "session": "sutando-core",
+                     "supervisor_state": "blocked-human", "recovery": True})
+        manager.create(req)
+        manager.record_projection(req.id, req.revision, "$first:example.test")
+        self.assertEqual(self._gather(supervisor)["card"]["revision"], 1)
+        # The requirement advances (same guard, new revision); the ledger still names revision 1.
+        req = manager.get(req.id)
+        req.revision += 1
+        manager.store.save(req)
+        self.assertEqual(manager.store.projection(req.id)["revision"], 1)
+        self.assertNotIn("card", self._gather(supervisor))
+        manager.record_projection(req.id, req.revision, "$second:example.test")
+        self.assertEqual(self._gather(supervisor)["card"],
+                         {"hitl_id": req.id, "revision": 2, "event_id": "$second:example.test"})
+
+    def _crash_card(self, incident):
+        manager = HitlManager(HitlStore(default_store(self.ws)))
+        req = HumanRequirement(
+            kind="core-crash-loop", runtime="claude", message="Crash loop", id="hitl_crashcard",
+            guard=f"crash-loop:core:{incident}",
+            subject={"source": "crash-loop", "session": "sutando-core", "crash_loop": "core",
+                     "recovery": True, "remind": False, "incident": incident})
+        manager.create(req)
+        manager.record_projection(req.id, req.revision, "$crash:example.test")
+        return req
+
+    def test_the_crash_card_is_named_only_while_the_record_says_crash_loop(self):
+        req = self._crash_card("inc_0123abcd")
+        want = {"hitl_id": req.id, "revision": 1, "event_id": "$crash:example.test"}
+        looping = {"v": 1, "state": "crash_loop", "incident": "inc_0123abcd"}
+        self.assertEqual(crs.recovery_card(self.ws, "sutando-core", {}, looping), want)
+        self.assertIsNone(crs.recovery_card(self.ws, "sutando-core", {}, {**looping, "incident": "inc_ffffffff"}))
+        # A hold-based incident id outlives the crash loop: the same id in another state names no crash card.
+        self.assertIsNone(crs.recovery_card(self.ws, "sutando-core", {}, {**looping, "state": "paused_limit"}))
+
+    def test_the_card_is_read_without_the_store_lock_so_a_stalled_holder_cannot_stop_the_tick(self):
+        req = self._crash_card("inc_0123abcd")
+        looping = {"v": 1, "state": "crash_loop", "incident": "inc_0123abcd"}
+        with mock.patch("hitl.manager.HitlStore.locked", side_effect=AssertionError("the tick took the lock")):
+            card = crs.recovery_card(self.ws, "sutando-core", {}, looping)
+        self.assertEqual(card, {"hitl_id": req.id, "revision": 1, "event_id": "$crash:example.test"})
+
+    def test_a_record_archived_or_closed_between_the_listing_and_its_read_names_no_card(self):
+        req = self._crash_card("inc_0123abcd")
+        looping = {"v": 1, "state": "crash_loop", "incident": "inc_0123abcd"}
+        with mock.patch("hitl.manager.HitlStore.snapshot", return_value=None):
+            self.assertIsNone(crs.recovery_card(self.ws, "sutando-core", {}, looping))
+        self.assertIsNone(HitlStore(default_store(self.ws)).snapshot("hitl_missing"))
+        closed = HitlManager(HitlStore(default_store(self.ws))).get(req.id)
+        closed.status = "resolved"
+        with mock.patch("hitl.manager.HitlStore.snapshot", return_value=(closed, {"revision": 1, "event_id": "$crash:example.test"})):
+            self.assertIsNone(crs.recovery_card(self.ws, "sutando-core", {}, looping))
+
+    def test_an_unreadable_hitl_store_names_no_card_and_keeps_the_record(self):
+        self._crash_card("inc_0123abcd")
+        looping = {"v": 1, "state": "crash_loop", "incident": "inc_0123abcd"}
+        with mock.patch("hitl.manager.HitlStore.all", side_effect=OSError("unreadable")):
+            self.assertIsNone(crs.recovery_card(self.ws, "sutando-core", {}, looping))
+            self.assertEqual(self._gather({"state": "crashed"})["v"], 1)
+
 
 class Monitor(unittest.TestCase):
     """The monitor tick is the caller: the core's monitor writes the record, a worker seat's does not."""
@@ -536,10 +648,17 @@ class Contract(unittest.TestCase):
         want = fixture("heartbeat.json")["health"]["recovery"]
         got = derive({"state": "crashed"}, HOLD, runtime="claude", model="opus", waiting_tasks=2, restarts_10m=0,
                      runtimes_available=("claude", "codex"), models_offered=OFFERED, model_labels=OFFERED_LABELS)
+        got["card"] = want["card"]
+        got = crs.coerce(got)
         self.assertEqual(got, want)
         with tempfile.TemporaryDirectory() as tmp:
             crs.publish(Path(tmp), got, now=time.time())
             self.assertEqual(json.loads((Path(tmp) / "state" / crs.RECORD_FILE).read_text()), want)
+
+    def test_every_shared_fixture_is_sha256_pinned(self):
+        actual = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                  for path in sorted(FIXTURES.glob("*.json"))}
+        self.assertEqual(actual, FIXTURE_HASHES)
 
     def test_the_writer_produces_the_codex_fixtures_recovery_block(self):
         want = fixture("heartbeat.codex.json")["health"]["recovery"]

@@ -1469,7 +1469,7 @@ def main():
         # The core's own recovery record; a worker seat's state is the pool's to report.
         if not a.seat:
             core_recovery_state.update(workspace, {"state": state, "kind": kind, "prompt": prompt},
-                                       runtime=runtime, pane=pane)
+                                       runtime=runtime, pane=pane, session=a.session)
 
         # The Manager owns per-episode dedup; leaving the blocked set resolves
         # the card, so the owner sees it close without clicking anything.

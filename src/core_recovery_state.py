@@ -101,6 +101,8 @@ _SHAPES = {"incident": re.compile(r"inc_[0-9a-f]{8}"), "account": re.compile(r"a
 MAX_INT = 2 ** 53
 # A model switch names an opaque row token (runtime_models.record), never a model or a label.
 _MODEL_KEY = re.compile(r"o[0-9a-f]{12}")
+_HITL_ID = re.compile(r"hitl_[A-Za-z0-9_-]{1,80}")
+_EVENT_ID = re.compile(r"\$[!-~]{1,255}")
 
 
 # ---- the vocabulary other modules share -------------------------------------------------
@@ -135,6 +137,19 @@ def _int(value: Any) -> Optional[int]:
     return int(value) if 0 <= value <= MAX_INT else None
 
 
+def _card(value: Any) -> Optional[dict]:
+    """A complete live-card pointer, or None. Partial identity is never useful to a reader."""
+    if not isinstance(value, dict):
+        return None
+    hitl_id, revision, event_id = value.get("hitl_id"), value.get("revision"), value.get("event_id")
+    revision = _int(revision)
+    if (not isinstance(hitl_id, str) or not _HITL_ID.fullmatch(hitl_id)
+            or revision is None or revision < 1
+            or not isinstance(event_id, str) or not _EVENT_ID.fullmatch(event_id)):
+        return None
+    return {"hitl_id": hitl_id, "revision": revision, "event_id": event_id}
+
+
 def coerce(record: Any) -> Optional[dict]:
     """The record with every field inside its bounds, else None. Unknown fields are dropped."""
     if not isinstance(record, dict) or record.get("v") != VERSION or record.get("state") not in STATES:
@@ -150,6 +165,9 @@ def coerce(record: Any) -> Optional[dict]:
         value = _int(record.get(key))
         if value is not None:
             out[key] = value
+    card = _card(record.get("card"))
+    if card:
+        out["card"] = card
     acts = record.get("actions")
     if isinstance(acts, list):
         out["actions"] = [a for a in acts if a in ACTIONS][:MAX_ACTIONS]
@@ -167,7 +185,8 @@ def coerce(record: Any) -> Optional[dict]:
 
 
 _ORDER = ("v", "incident", "state", "since", "reset_at", "runtime", "model", "account",
-          "waiting_tasks", "restarts_10m", "actions", "switch_models", "model_labels", "switch_runtimes", "menu")
+          "waiting_tasks", "restarts_10m", "card", "actions", "switch_models", "model_labels",
+          "switch_runtimes", "menu")
 #: A label is the runtime's own words for a choice: printable, bounded, never a purchase.
 _LABEL_MAX = 80
 _PURCHASE = re.compile(r"fund|credit|pay|purchase|upgrade|buy|billing|extra usage", re.I)
@@ -491,8 +510,56 @@ def runtimes_on_host() -> tuple:
     return tuple(r for r in RUNTIMES if shutil.which(r))
 
 
+def _recovery_guard(session: str, supervisor: dict) -> str:
+    from hitl.core_card import episode_guard
+    return episode_guard(session, supervisor.get("state"), supervisor.get("kind"), supervisor.get("prompt"))
+
+
+def recovery_card(workspace: Path, session: Optional[str], supervisor: dict, record: dict) -> Optional[dict]:
+    """The projected card for this exact recovery episode. An unreadable store names no card."""
+    if not session or record.get("state") not in ("paused_limit", "out_of_credits", "signed_out",
+                                                   "blocked_prompt", "crash_loop"):
+        return None
+    try:
+        from hitl.manager import POLICY_DECIDER, HitlManager, HitlStore, default_store
+        from hitl.schema import TERMINAL_STATUSES
+        root = default_store(workspace)
+        if not root.is_dir():
+            return None
+        store = HitlStore(root)
+        guard = _recovery_guard(session, supervisor)
+        crash_loop = record.get("state") == "crash_loop"
+        matches = []
+        for listed in HitlManager(store).active():
+            # One lock-free read gives the requirement with its own ledger: a card is named only
+            # at the requirement's revision, and a held store lock never stalls the monitor tick.
+            snap = store.snapshot(listed.id)
+            if snap is None:
+                continue
+            req, ledger = snap
+            subject = req.subject or {}
+            if (req.status in TERMINAL_STATUSES or ledger.get("revision") != req.revision
+                    or subject.get("session") != session or subject.get("seat")
+                    or subject.get("recovery") is not True or req.decided_by == POLICY_DECIDER):
+                continue
+            source = subject.get("source")
+            if source == "tui":
+                current = not crash_loop and req.guard == guard
+            else:
+                current = (crash_loop and source == "crash-loop" and subject.get("crash_loop") == "core"
+                           and subject.get("incident") == record.get("incident"))
+            if not current:
+                continue
+            identity = _card({"hitl_id": req.id, **ledger})
+            if identity:
+                matches.append((req.updated_at, req.id, identity))
+        return max(matches)[2] if matches else None
+    except Exception:  # noqa: BLE001 -- a recovery record remains useful without its optional card pointer
+        return None
+
+
 def gather(workspace: Path, supervisor: Optional[dict], *, now: float, runtime: Optional[str] = None,
-           pane: Optional[str] = None) -> dict:
+           pane: Optional[str] = None, session: Optional[str] = None) -> dict:
     """The record for this tick, from the files the other modules keep. Read-only."""
     workspace = Path(workspace)
     runtime = runtime if runtime in RUNTIMES else recorded_runtime(workspace)
@@ -507,7 +574,7 @@ def gather(workspace: Path, supervisor: Optional[dict], *, now: float, runtime: 
     hold = core_limit_hold.read_hold(workspace)
     offered = _offered(workspace, runtime, model, hold)
     launches = launches_in_window(workspace, now)
-    return derive(
+    record = derive(
         supervisor, hold,
         _read_json(status_read_path("supervisor-status.json", workspace)),
         qa.record_for_account(qa.trusted_record(_read_json(status_read_path("quota-state.json", workspace))), account),
@@ -517,6 +584,10 @@ def gather(workspace: Path, supervisor: Optional[dict], *, now: float, runtime: 
         restarts_10m=None if launches is None else len(launches), runtimes_available=runtimes_on_host(),
         crash_since=crash_loop_start(workspace, now) if launches else None,
         models_offered=[e["key"] for e in offered], model_labels=[e["label"] for e in offered])
+    card = recovery_card(workspace, session, supervisor or {}, record)
+    if card:
+        record["card"] = card
+    return coerce(record)
 
 
 def _offered(workspace: Path, runtime: Optional[str], model: Optional[str], hold: Optional[dict]) -> list:
@@ -526,11 +597,12 @@ def _offered(workspace: Path, runtime: Optional[str], model: Optional[str], hold
 
 
 def update(workspace: Path, supervisor: Optional[dict], *, runtime: Optional[str] = None,
-           pane: Optional[str] = None, now: Optional[float] = None) -> bool:
+           pane: Optional[str] = None, session: Optional[str] = None, now: Optional[float] = None) -> bool:
     """One monitor tick: gather, derive and publish. Never raises: the monitor must keep ticking."""
     at = time.time() if now is None else now
     try:
-        return publish(workspace, gather(workspace, supervisor, now=at, runtime=runtime, pane=pane), at)
+        return publish(workspace, gather(workspace, supervisor, now=at, runtime=runtime, pane=pane,
+                                         session=session), at)
     except Exception as exc:  # noqa: BLE001
         print(f"core-recovery record not written: {type(exc).__name__}: {exc}", file=sys.stderr)
         return False

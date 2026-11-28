@@ -275,6 +275,14 @@ class HitlStore:
         raw = self._load_raw(req_id)
         return raw.get("projection") or {"revision": 0, "event_id": None}
 
+    def snapshot(self, req_id: str) -> Optional[Tuple[HumanRequirement, Dict]]:
+        """The requirement and its projection ledger from one read of the record (a save replaces
+        the file whole, so the pair is consistent without the lock); None when there is no record."""
+        raw = self._load_raw(req_id)
+        if not raw:
+            return None
+        return _req_from_dict(raw["requirement"]), raw.get("projection") or {"revision": 0, "event_id": None}
+
     def all(self) -> List[HumanRequirement]:
         out, skipped = [], []
         for p in sorted(self.root.glob("hitl_*.json")):

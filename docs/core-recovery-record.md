@@ -16,6 +16,7 @@ does not write it. `derive()` is pure and folds records other modules already ke
 | `state/core-limit-hold.json` | `core_limit_hold.py` |
 | `state/supervisor-status.json` | the desktop's backend supervisor |
 | `state/quota-state.json` | the credential proxy |
+| `state/hitl/requirements/` | the HITL manager's live requirement and projection ledger |
 | the pane's abnormal text | `cli_wedge.frame_abnormal` |
 | `state/session-starts.log` | the core launchers (launches on this host in the last 10 minutes) |
 
@@ -29,6 +30,8 @@ older than 5 minutes, larger than 4 KiB or outside the schema as absent.
 {"v": 1, "incident": "inc_1026786a", "state": "paused_limit", "since": 1763730000,
  "reset_at": 1763737200, "runtime": "claude", "model": "opus", "account": "acct_3f9a2b",
  "waiting_tasks": 2, "restarts_10m": 0,
+ "card": {"hitl_id": "hitl_recoverycard", "revision": 3,
+          "event_id": "$recovery-card:example.test"},
  "actions": ["retry_now", "switch_model", "switch_runtime", "restart_core"],
  "switch_models": ["sonnet", "haiku"], "switch_runtimes": ["codex"]}
 ```
@@ -55,6 +58,11 @@ older than 5 minutes, larger than 4 KiB or outside the schema as absent.
   2^53; anything else (NaN, infinities, booleans) is dropped.
 - A field the inputs cannot supply is left out, never defaulted (`reset_at` only when the provider
   gave one).
+- `card`, when the current recovery episode has reached s.space, names that live HITL projection:
+  its requirement id, projected revision and Matrix event id. The complete object is omitted while
+  projection is pending (a card projected at an earlier revision of the requirement is not named)
+  or when any member is malformed; readers need not scan room history. The crash-loop card is
+  named only while `state` is `crash_loop`.
 - `actions` come from a fixed set (`retry_now`, `switch_model`, `switch_runtime`, `restart_core`,
   `escape_prompt`, `refresh_options`), filtered to what the core's runtime can carry out (below).
   `switch_models` are keys of the runtime's own model list (with `model_labels`, its words), the

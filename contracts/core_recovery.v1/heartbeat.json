@@ -30,6 +30,11 @@
       "account": "acct_3f9a2b",
       "waiting_tasks": 2,
       "restarts_10m": 0,
+      "card": {
+        "hitl_id": "hitl_recoverycard",
+        "revision": 3,
+        "event_id": "$recovery-card:example.test"
+      },
       "actions": [
         "retry_now",
         "switch_model",
