@@ -42,7 +42,7 @@ sys.path.insert(0, str(REPO / "src"))
 
 from delivery.task_dispatch import (  # noqa: E402
     clear_inflight, inflight_is_live, mark_inflight,
-    mark_partial_paste, partial_paste_leftover,
+    mark_partial_paste, partial_paste_leftover, partial_paste_owner,
     _main,
     _INBOX_PRIORITY_LIMIT,
     find_ready_result,
@@ -1424,6 +1424,45 @@ class PartialPasteLeftoverTest(unittest.TestCase):
                           "no text given is not-found, not an empty match")
         self.assertEqual(2, run("partial-mark", str(self.dir), "task-c.txt").returncode, "arity is checked")
         self.assertEqual(2, run("partial-mark", str(self.dir), "../x.txt", "1", stdin_text="x").returncode)
+
+    def test_the_owner_of_a_recorded_leftover_is_found_whatever_task_is_asking(self):
+        mark_partial_paste(self.dir, "task-a.txt", "4242", "first 256 bytes\nof task a")
+        mark_partial_paste(self.dir, "task-b.txt", "4242", "another leftover")
+        self.assertEqual("task-a.txt", partial_paste_owner(self.dir, "4242", "  first 256 bytes of task a  "))
+        self.assertEqual("task-b.txt", partial_paste_owner(self.dir, "4242", "another leftover"))
+
+    def test_text_no_record_holds_has_no_owner(self):
+        mark_partial_paste(self.dir, "task-a.txt", "4242", "our leftover")
+        self.assertIsNone(partial_paste_owner(self.dir, "4242", "the owner's own draft"))
+        self.assertIsNone(partial_paste_owner(self.dir, "4242", "our leftover plus more"), "a superset is not ours")
+
+    def test_another_incarnations_leftover_has_no_owner_and_is_removed(self):
+        mark_partial_paste(self.dir, "task-a.txt", "4242", "our leftover")
+        self.assertIsNone(partial_paste_owner(self.dir, "9999", "our leftover"))
+        self.assertFalse((self.dir / "task-a.txt").exists())
+
+    def test_nothing_to_match_has_no_owner(self):
+        mark_partial_paste(self.dir, "task-a.txt", "4242")
+        self.assertIsNone(partial_paste_owner(self.dir, "4242", ""), "an empty composer")
+        self.assertIsNone(partial_paste_owner(self.dir, "4242", " \n "), "a composer of whitespace")
+        self.assertIsNone(partial_paste_owner(self.dir, "", "x"), "an unreadable incarnation")
+        self.assertIsNone(partial_paste_owner(self.dir, "4242", "anything"), "a record without text")
+        self.assertIsNone(partial_paste_owner(Path(self.tmp.name) / "missing", "4242", "x"), "no records at all")
+
+    def test_a_temp_file_from_a_mark_in_progress_is_not_a_record(self):
+        self.dir.mkdir(parents=True)
+        (self.dir / ".task-a.txt.tmp").write_text("4242\nour leftover")
+        self.assertIsNone(partial_paste_owner(self.dir, "4242", "our leftover"))
+
+    def test_partial_owner_cli(self):
+        mark_partial_paste(self.dir, "task-a.txt", "4242", "our leftover")
+        self.assertEqual((0, "task-a.txt\n", ""), self._run_main(["partial-owner", str(self.dir), "4242"], "our leftover"))
+        self.assertEqual(1, self._run_main(["partial-owner", str(self.dir), "4242"], "a draft")[0])
+        self.assertEqual(2, self._run_main(["partial-owner", str(self.dir), "4242", "extra"])[0], "arity is checked")
+        with mock.patch("delivery.task_dispatch.partial_paste_owner", side_effect=PermissionError("denied")):
+            rc, _out, err = self._run_main(["partial-owner", str(self.dir), "4242"], "our leftover")
+        self.assertEqual(2, rc, "cannot read the records is not an answer")
+        self.assertIn("cannot read the records", err)
 
     def _run_main(self, argv, stdin_text=""):
         out, err = StringIO(), StringIO()

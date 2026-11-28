@@ -448,6 +448,17 @@ composer_matches_own_leftover() {
   [ "$(printf '%s' "$c" | squeeze)" = "$(printf '%s' "$recorded" | squeeze)" ]
 }
 
+# Prints the task whose recorded leftover the whole composer holds now, in this incarnation: a
+# paste given up on for another task, or one answered another way since (#6346).
+composer_abandoned_leftover_owner() {
+  local incarnation="$1" raw="$2" c
+  pane_frame_is_cut "$raw" && return 1
+  [ -n "$incarnation" ] || return 1
+  c="$(composer_text "$raw")"
+  [ -n "$c" ] || return 1
+  printf '%s' "$c" | "$NOTIFIER_PY" "$DISPATCH_PY" partial-owner "$PARTIAL_DIR" "$incarnation"
+}
+
 # Delete exactly the composer's own current content, one character at a time (never a
 # line-kill or select-all: those are terminal-dependent and some would reach past the
 # composer). Verifies empty afterward; a caller that got here already proved via
@@ -532,7 +543,7 @@ deliver_prompt() {
 
 deliver_prompt_grown() {
   local filename="$1" prompt="$2" type_tries=0 staged=0 resume=0
-  local baseline_esc baseline_raw staged_raw="" incarnation="" leftover_now
+  local baseline_esc baseline_raw staged_raw="" incarnation="" leftover_now owner
   if ! wait_for_core_healthy; then
     log_notifier "core did not become healthy for $filename; leaving it queued"
     return 1
@@ -566,6 +577,10 @@ deliver_prompt_grown() {
       elif composer_matches_own_leftover "$filename" "$incarnation" "$baseline_raw" \
            && clear_own_leftover "$filename" "$baseline_raw"; then
         log_notifier "composer held $filename's own garbled, non-boundary leftover from a failed chunk; cleared it, retyping from the start"
+      elif owner="$(composer_abandoned_leftover_owner "$incarnation" "$baseline_raw")" \
+           && clear_own_leftover "$owner" "$baseline_raw"; then
+        clear_partial_paste "$owner"
+        log_notifier "composer held the paste this notifier abandoned for $owner; cleared it before delivering $filename"
       else
         warn_if_capture_truncated "$baseline_raw" "$filename"
         log_notifier "composer not empty for $filename; leaving it queued (failing closed, not typing over a draft)"
