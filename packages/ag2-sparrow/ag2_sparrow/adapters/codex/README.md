@@ -23,7 +23,7 @@ occupancy and the holder record attribution, never readiness.
 ```bash
 ag2-sparrow-codex-local install --agent <@agent:server> --token-stdin   # paste the relay token when asked
 ag2-sparrow-codex-local install --work <dir> [--codex-home <dir>] [--sandbox read-only|workspace-write] \
-    [--no-allow-non-owner] [--model <m>] [--codex <path>] [--resume-thread <uuid>]
+    [--no-allow-non-owner] [--no-allow-collaborator] [--model <m>] [--codex <path>] [--resume-thread <uuid>]
 ag2-sparrow-codex-local install --token-env-file <the agent's .env> [the same options]   # the alternative to --token-stdin
 ag2-sparrow-codex-local verify [--agent <@agent:server>]
 ag2-sparrow-codex-local uninstall [--agent <@agent:server>]
@@ -109,7 +109,7 @@ launcher-side shape shares: take the work root's lock for the launcher's own lif
 make `tasks`, `results`, `state` and `state/threads` under the held root inode, start the connector
 as the direct child, `python -m …codex_connector --work <dir> --held --root-fd <the held root's
 descriptor> --codex <the configured executable> --server stdio --sandbox <s> [--no-allow-non-owner]
-[--model <m>]`, with an environment of
+[--no-allow-collaborator] [--model <m>]`, with an environment of
 only `PATH` (the configured `codex` first), `HOME`, `USER`, `PYTHONPATH` (this package) and
 `CODEX_HOME` when one was recorded (the connector passes it on to its app-server), and attach it as
 the consumer whose liveness fences the root (`holder_lock.attach_consumer`). The app-server is
@@ -168,7 +168,15 @@ with "This agent only answers its owner here." as their result — no thread sta
 `refused (non-owner, --allow-non-owner not set)`. `--allow-non-owner` is still accepted and is the default;
 an older install that recorded the key empty serves them too.
 
-| | owner, and an attested collaborator | restricted: any other non-owner, unless `--no-allow-non-owner` |
+Sharing is the default and can be turned off: `install --no-allow-collaborator` (recorded as
+`ALLOW_COLLABORATOR=0`, shown by `verify`) serves an attested collaborator exactly as any other non-owner:
+its own ephemeral read-only thread with integrations off, never the shared thread, the owner's history or
+`--resume-thread` (and refused under `--no-allow-non-owner`). A repair (`install --agent`, as the desktop runs
+after an update) and a reinstall that does not name the flag keep the recorded opt-out; only
+`--allow-collaborator` turns sharing back on. `uninstall` removes the config, so a setup after it starts
+from the default.
+
+| | owner, and an attested collaborator (unless `--no-allow-collaborator`) | restricted: any other non-owner, unless `--no-allow-non-owner` |
 |---|---|---|
 | thread | durable, **one shared thread** for every room (its id in `state/thread`, mode 0600), resumed with `thread/resume` after an app-server restart; a resume that fails starts a new shared thread and logs it; `--thread-id THREAD` seeds it while none is saved (the older `CHANNEL_ID=THREAD`, one owner channel's own thread, is never resumed as the shared thread: a fresh one starts and the channel is logged); `install --resume-thread <uuid>` (a conversation saved under `--codex-home`'s `sessions/`, as `codex resume <id>` takes it) becomes the shared thread at the first owner turn in any room, recorded in `state/resume-thread-taken` (a new id at a reinstall replaces the saved shared thread); everything in that conversation becomes the agent's context for every room and for collaborators; `--ephemeral` keeps the shared thread for the server's life only, unsaved | a fresh **ephemeral** thread per task, never reused, never saved |
 | cwd | `--cwd` (default `--work`) | an empty temp dir, removed after the turn, so no room's `tasks/` or `results/` is in reach. The files this task's sender attached (its `attachments:` header, under the bridge's `remote-media`, `--media-root`) are copied in and the prompt names the copies; nothing else from that folder is |

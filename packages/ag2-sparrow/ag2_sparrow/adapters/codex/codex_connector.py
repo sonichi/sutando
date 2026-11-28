@@ -13,8 +13,9 @@ capabilities. A durable turn (the owner, and an attested collaborator) runs on t
 thread, whatever room it came from (state/thread, 0600, resumed after an app-server restart), in the
 configured cwd and sandbox, as local Claude Code keeps one session and the Codex core's seat one thread;
 every such prompt opens with its room, its sender and that the reply goes back to that room
-(shared_thread_lead). A restricted turn (any other non-owner, unless --no-allow-non-owner) runs on its
-own ephemeral thread, read-only, in an empty temp dir. Every non-owner turn carries the shared
+(shared_thread_lead). A restricted turn (any other non-owner, unless --no-allow-non-owner; an attested
+collaborator too under --no-allow-collaborator, served_policy) runs on its own ephemeral thread,
+read-only, in an empty temp dir. Every non-owner turn carries the shared
 NON_OWNER_NOTE; only an owner turn carries the owner's own conversation over into the shared thread
 (--resume-thread), and only the owner reaches a TUI thread (--push). A refused turn gets NON_OWNER_REFUSED.
 """
@@ -35,7 +36,8 @@ from ... import account_switch, card_desk, connector_cards, held_start, live_vie
 from ...acp_host import quoted
 from ...collaborator_turn import TIER_BLOCK_END, TIER_BLOCK_HEADER, TIER_REWRITES, stage_own_attachments, with_staged_paths
 from ...relay_loop import count_arg
-from ...task_io import (AUDIENCE_RULE, DONE_KEEP, NON_OWNER_NOTE, NON_OWNER_REFUSED, OWNER, OWNER_CAPABILITIES,  # noqa: F401
+from ...task_io import (ALLOW_COLLABORATOR_FLAG, AUDIENCE_RULE,
+                        DONE_KEEP, NON_OWNER_NOTE, NON_OWNER_REFUSED, OWNER, OWNER_CAPABILITIES,  # noqa: F401
                         LockRefused, acquire_lock, attested_headers, exit_on_sigterm, holder_consumer, load_done,
                         make_dirs, non_owner_note, parse_task, pid_alive, exit_code, record_done, refusal_body,
                         release_lock, COLLABORATOR,
@@ -408,6 +410,15 @@ class Rpc:
             self.p.wait()
         self.p.stdout.close()
         self.err.close()
+
+
+def served_policy(headers, allow_non_owner=True, allow_collaborator=True):
+    """turn_policy, with a collaborator the install withholds (--no-allow-collaborator) served exactly as any
+    other non-owner: restricted under allow_non_owner, else refused; never the shared thread."""
+    policy = turn_policy(headers, allow_non_owner, allow_collaborator)
+    if policy.unlock == ALLOW_COLLABORATOR_FLAG:
+        policy = turn_policy(dict(headers, collaborator="false"), allow_non_owner)
+    return policy
 
 
 def capabilities(headers):
@@ -1416,7 +1427,7 @@ class Connector:
             # Read now: the bridge may archive the task file while the turn runs.
             task_text = card_desk.read_task(path)
             self.quota.remember(task_text)     # the owner's DM, where a quota notice goes
-            policy = turn_policy(headers, self.args.allow_non_owner)
+            policy = served_policy(headers, self.args.allow_non_owner, self.args.allow_collaborator)
             if not policy.served:
                 log("refused (non-owner, %s not set) ->" % policy.unlock, task_id, headers["access_tier"])
                 write_atomic(os.path.join(self.args.results, name),
@@ -1604,6 +1615,12 @@ def build_parser():
                          "room's kept thread with --cwd and --sandbox, framed by the non-owner note.")
     no.add_argument("--no-allow-non-owner", dest="allow_non_owner", action="store_false",
                     help="refuse those senders with a plain line instead")
+    co = ap.add_mutually_exclusive_group()
+    co.add_argument("--allow-collaborator", dest="allow_collaborator", action="store_true", default=True,
+                    help="serve attested collaborators on the shared thread, as the owner (the default)")
+    co.add_argument("--no-allow-collaborator", dest="allow_collaborator", action="store_false",
+                    help="serve attested collaborators as any other non-owner instead: their own ephemeral "
+                         "read-only thread with integrations off, or refused under --no-allow-non-owner")
     ap.add_argument("--thread-id", default=None, metavar="THREAD",
                     help="resume THREAD as the shared thread when none is saved yet (the older CHANNEL_ID=THREAD, "
                          "one owner channel's thread, is accepted and not resumed)")

@@ -1871,6 +1871,41 @@ class ConnectCode(UndoSeams, Base):
                 unhold(p)
         self.assertEqual(len(late), 1)
 
+    def test_the_collaborator_opt_out_survives_repair_and_reinstall_until_turned_back_on(self):
+        seed_seat(cb.bridge_home(self.root), BEARER)
+        seat, fake = ("--token-env-file", cb.seat_file(self.root), "--codex-home", str(self.codex_home)), self.fake()
+
+        def recorded(*argv):
+            rc, out, err = self._main_with(fake, "install", *argv)
+            self.assertEqual(rc, 0, out + err)
+            cfg = cm.read_config(cli.config_path(LA))
+            flagged = "--no-allow-collaborator" in cli.connector_argv(cfg, str(self.root), 7)
+            self.assertEqual(flagged, cfg["ALLOW_COLLABORATOR"] == "0")
+            return cfg["ALLOW_COLLABORATOR"]
+        self.assertEqual(recorded(*seat), "1", "shared by default")
+        self.assertEqual(recorded(*seat, "--no-allow-collaborator"), "0")
+        # The desktop's move after an update (install --agent [--replace-install]), and a reinstall with the
+        # agent's own token, as its setup and a printed repair line run it: neither names the flag.
+        self.assertEqual(recorded("--agent", AGENT, "--replace-install"), "0", "the selector repair keeps it")
+        self.assertEqual(recorded(*seat), "0", "a full reinstall keeps it")
+        self.assertEqual(recorded(*seat, "--allow-collaborator"), "1", "only the explicit flag turns it back on")
+        self.assertEqual(recorded("--agent", AGENT), "1")
+
+    def test_install_help_lists_the_collaborator_flags(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+            cli.main(["install", "--help"])
+        for flag in ("--allow-collaborator", "--no-allow-collaborator"):
+            self.assertIn(flag, out.getvalue())
+        self.assertEqual(cb.session_flags(argparse.Namespace(parser=self.parsed_install(), collaborator="0")),
+                         ["--no-allow-collaborator"], "a repair line carries the one flag set, with no value")
+
+    def parsed_install(self):
+        with mock.patch.object(cli, "install", side_effect=lambda a: got.append(a.parser) or 0):
+            got = []
+            cli.main(["install", "--work", str(self.root)])
+        return got[0]
+
     def test_a_failed_install_after_the_seat_says_the_seat_recovers_the_spent_code(self):
         a = self.home / "agent-a"
         a.mkdir()

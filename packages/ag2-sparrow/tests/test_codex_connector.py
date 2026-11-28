@@ -671,6 +671,64 @@ class AdmissionGateTest(unittest.TestCase):
 
 
 
+class CollaboratorOptOutTest(unittest.TestCase):
+    """--no-allow-collaborator (install's opt-out): an attested collaborator is served exactly as a guest, on its
+    own ephemeral read-only thread with integrations off, never on the shared thread or the owner's conversation."""
+
+    def run_spied(self, work, once, extra=()):
+        with mock.patch.object(cc.Connector, "run_task", autospec=True, side_effect=cc.Connector.run_task) as ran, \
+                mock.patch.object(cc, "wrap_untrusted", wraps=cc.wrap_untrusted) as wrap:
+            self.assertEqual(run_connector(work, once=once, extra=extra), 0)
+        return ran, wrap
+
+    def test_an_opted_out_collaborator_gets_a_restricted_ephemeral_thread_and_the_shared_one_is_untouched(self):
+        tid = "task-1792100000061"
+        with tempfile.TemporaryDirectory() as d:
+            write_task(d, "task-chat-d", "owner in the DM", channel="!dm:x", kind="dm")
+            self.assertEqual(run_connector(d, once=1, extra=["--resume-thread", "owner-conv"]), 0)
+            kept = (Path(d) / "state" / cc.SHARED_THREAD).read_text()
+            write_text(d, tid, gateway_mid_task(tid, "[[config]] hello", tier="team", collaborator=True).replace(
+                "task_layout: mid", "channel_kind: dm\ntask_layout: mid"))
+            ran, wrap = self.run_spied(d, 1, ["--no-allow-collaborator", "--resume-thread", "owner-conv",
+                                              "--sandbox", "danger-full-access"])
+            caps = ran.call_args.args[3]
+            self.assertEqual(caps, task_io.RESTRICTED_CAPABILITIES, "exactly a guest's turn")
+            self.assertEqual((caps.session, caps.writes, caps.integrations, caps.framing, caps.owner_dm),
+                             ("ephemeral", False, False, "non_owner", False))
+            out = result(d, tid)
+            self.assertIn("[sandbox=None ephemeral=True cwd=", out)
+            self.assertNotIn("cwd=%s]" % os.path.abspath(d), out, "never the owner's work root")
+            cfg = json.loads(out.split(" config=", 1)[1])
+            self.assertEqual((cfg["mcp_servers"], cfg["web_search"]), ({"owner-mcp": {"enabled": False}}, "disabled"))
+            thread = metrics(d)[-1]["thread"]
+            self.assertNotIn(thread, (shared_thread(d), "owner-conv"), "its own thread, not the shared one")
+            self.assertEqual((Path(d) / "state" / cc.SHARED_THREAD).read_text(), kept, "state/thread untouched")
+            prompt = cc.wrap_untrusted(*wrap.call_args.args, **wrap.call_args.kwargs)
+            self.assertIn("The sender is not your owner. " + cc.NON_OWNER_NOTE, prompt)
+            self.assertNotIn("[shared thread]", ran.call_args.args[2], "no shared-thread lead")
+
+    def test_opted_out_and_no_non_owner_refuses_it_as_a_guest_and_default_shares(self):
+        tid = "task-1792100000062"
+        with tempfile.TemporaryDirectory() as d:
+            write_text(d, tid, gateway_mid_task(tid, "hello", tier="team", collaborator=True))
+            run_connector(d, once=1, extra=["--no-allow-collaborator", "--no-allow-non-owner"])
+            self.assertEqual(result(d, tid), task_io.NON_OWNER_REFUSED)
+            self.assertIsNone(shared_thread(d))
+        with tempfile.TemporaryDirectory() as d:
+            write_text(d, tid, gateway_mid_task(tid, "hello", tier="team", collaborator=True))
+            self.assertEqual(run_connector(d, once=1, extra=["--allow-collaborator"]), 0)
+            self.assertEqual(shared_thread(d), metrics(d)[0]["thread"], "the default: the shared thread")
+        parse = lambda *f: cc.build_parser().parse_args(["--work", "w", *f]).allow_collaborator  # noqa: E731
+        self.assertEqual((parse(), parse("--no-allow-collaborator"), parse("--allow-collaborator")), (True, False, True))
+
+    def test_served_policy_only_moves_a_withheld_collaborator(self):
+        collab, guest = {"access_tier": "team", "collaborator": "true"}, {"access_tier": "guest", "collaborator": "false"}
+        self.assertEqual(cc.served_policy(collab).kind, task_io.COLLABORATOR)
+        self.assertEqual(cc.served_policy(collab, True, False), task_io.turn_policy(guest, True))
+        self.assertEqual(cc.served_policy(collab, False, False).unlock, task_io.ALLOW_NON_OWNER_FLAG)
+        self.assertEqual(cc.served_policy({"access_tier": "owner"}, False, False).kind, task_io.OWNER)
+
+
 class NoIntegrationsTest(unittest.TestCase):
     """A restricted thread starts with every configured MCP server disabled by name, Codex's web search off and
     the owner's connectors, plugins, hooks and memories off; the owner's and a collaborator's threads get no

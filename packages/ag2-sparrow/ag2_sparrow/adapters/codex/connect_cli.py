@@ -38,7 +38,7 @@ SANDBOXES = ("read-only", "workspace-write")
 ENV_KEEP = ("PATH", "HOME", "USER")
 REQUIRED_KEYS = ("CODEX", "INBOX_DIR", "RESULTS_DIR")
 CONFIG_KEYS = ("CODEX", "INBOX_DIR", "RESULTS_DIR", "CODEX_HOME", "SANDBOX", "ALLOW_NON_OWNER", "MODEL",
-               "RESUME_THREAD") + cb.CONFIG_KEYS
+               "RESUME_THREAD", "ALLOW_COLLABORATOR") + cb.CONFIG_KEYS
 THREAD_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 LOCAL = Shape(name=SHAPE, command=COMMAND, description="the Codex connector as an s.space agent",
               cli="Codex CLI", min_version=MIN_CODEX, version_anchor=r"^codex",
@@ -89,6 +89,8 @@ def connector_argv(cfg: dict, root: str, root_fd: int) -> list:
             "--media-root", str(cb.bridge_state(cfg) / "remote-media")]
     if cfg.get("ALLOW_NON_OWNER") == "0":
         argv.append("--no-allow-non-owner")
+    if cfg.get("ALLOW_COLLABORATOR") == "0":
+        argv.append("--no-allow-collaborator")
     if cfg.get("MODEL"):
         argv += ["--model", cfg["MODEL"]]
     if cfg.get("RESUME_THREAD"):
@@ -159,7 +161,18 @@ def resolve_root(args) -> "tuple[dict, str]":
 # What a repair `install <selector>` takes from the job's recorded config: (key, option, value).
 RECORDED = (("CODEX", "codex", str), ("CODEX_HOME", "codex_home", str), ("SANDBOX", "sandbox", str),
             ("ALLOW_NON_OWNER", "non_owner", lambda v: "0" if v == "0" else ""), ("MODEL", "model", str),
-            ("RESUME_THREAD", "resume_thread", str))
+            ("RESUME_THREAD", "resume_thread", str),
+            ("ALLOW_COLLABORATOR", "collaborator", lambda v: "0" if v == "0" else ""))
+
+
+def kept_collaborator(collaborator):
+    """install's revise: an explicit --[no-]allow-collaborator wins; else the recorded opt-out is kept, so a
+    repair, the desktop's move or a reinstall with the agent's own token never turns collaborators back on."""
+    def revise(old: dict, values: dict) -> dict:
+        if collaborator in ("0", "1"):
+            return dict(values, ALLOW_COLLABORATOR=collaborator)
+        return dict(values, ALLOW_COLLABORATOR="0" if (old or {}).get("ALLOW_COLLABORATOR") == "0" else "1")
+    return revise
 
 
 def install(args) -> int:
@@ -201,14 +214,17 @@ def install(args) -> int:
               "RESULTS_DIR": str(Path(root) / "results"),
               "CODEX_HOME": str(Path(args.codex_home).expanduser().resolve()) if args.codex_home else "",
               "SANDBOX": args.sandbox, "ALLOW_NON_OWNER": "0" if args.non_owner == "0" else "1",
-              "MODEL": args.model or "", "RESUME_THREAD": resume, "AGENT_ID": where["agent_id"], "BRIDGE": mode if mode != EXTERNAL else "",
+              "MODEL": args.model or "", "RESUME_THREAD": resume,
+              "ALLOW_COLLABORATOR": "0" if getattr(args, "collaborator", None) == "0" else "1",
+              "AGENT_ID": where["agent_id"], "BRIDGE": mode if mode != EXTERNAL else "",
               "TOKEN_ENV_FILE": where["token_file"], "TOKEN_VAULT_KEY": "",
               "BRIDGE_STATE_DIR": str(cb.bridge_home(root) / "state") if mode != EXTERNAL else ""}
     if args.sandbox == "workspace-write":
         print("NOTE sandbox: workspace-write lets an owner turn write under the work root; a turn retried after "
               "the app-server dies can repeat side effects the first attempt already made")
     def installed() -> int:
-        rc = cm.install(local, values, root, root_id=getattr(args, "root_identity", None), holder=holder_words)
+        rc = cm.install(local, values, root, root_id=getattr(args, "root_identity", None), holder=holder_words,
+                        revise=kept_collaborator(getattr(args, "collaborator", None)))
         if rc != 0 or mode == EXTERNAL:
             return rc
         problem = cb.wire_bridge_bound(dict(values, ROOT=root), COMMAND, bridge, local,
@@ -377,6 +393,9 @@ def verify(args) -> int:
         cm.check(results, Path(cfg[key]).is_dir(), key.lower().replace("_dir", ""), cfg[key])
     print(f"INFO sandbox: {cfg.get('SANDBOX') or 'read-only'} for owner turns; non-owner turns are always read-only")
     print(f"INFO non-owner: {'refused unless attested collaborator (--no-allow-non-owner)' if cfg.get('ALLOW_NON_OWNER') == '0' else 'served read-only, ephemeral, in an empty temp dir (the default; --no-allow-non-owner opts out)'}")
+    print("INFO collaborators: " + ("each on its own ephemeral read-only thread, as a guest "
+                                    "(--no-allow-collaborator)" if cfg.get("ALLOW_COLLABORATOR") == "0" else
+                                    "on the agent's one shared thread (the default; --no-allow-collaborator opts out)"))
     if cb.bridge_mode(cfg) != EXTERNAL:
         print(f"INFO agent: {cfg.get('AGENT_ID')}")
         problem = cb.bridge_problem(cfg, COMMAND, bridge)
@@ -426,12 +445,19 @@ def session_options(p) -> None:
                          "(the default; kept so older install lines still work)")
     no.add_argument("--no-allow-non-owner", dest="non_owner", action="store_const", const="0",
                     help="refuse those senders with a plain line instead")
+    co = p.add_mutually_exclusive_group()
+    co.add_argument("--allow-collaborator", dest="collaborator", action="store_const", const="1",
+                    help="serve attested collaborators on the agent's one shared thread, with the owner's history "
+                         "(the default; turns a recorded --no-allow-collaborator back on)")
+    co.add_argument("--no-allow-collaborator", dest="collaborator", action="store_const", const="0",
+                    help="serve attested collaborators as guests instead: each turn on its own ephemeral read-only "
+                         "thread with integrations off, never the shared one; a repair or reinstall keeps it")
     p.add_argument("--model", help="the model for every turn (default: the connector's)")
     # Codex names its rollouts in lowercase: the id is matched and resumed as such.
     p.add_argument("--resume-thread", metavar="UUID", type=str.lower,
                    help="continue this Codex conversation (saved under --codex-home's sessions/) as the agent's "
                         "one shared thread, from the owner's first message in any room, as `codex resume <id>` "
-                        "does; collaborators' turns then share it too")
+                        "does; collaborators' turns then share it too, unless --no-allow-collaborator")
 
 
 def agent_option(p):
