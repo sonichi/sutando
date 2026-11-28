@@ -34,6 +34,7 @@ from ...connect_bridge import (DECLARATION, EXTERNAL, SEAT_ENV_KEEP, STATUS_MAX_
                                seat_child_env, seat_env, seat_file, served_elsewhere, statuses, url_vault_key,
                                vault_key, worker_name)
 from ...connect_common import EXIT_CHILD_HELD, EXIT_HELD, EXIT_UNUSABLE, Shape, _v  # noqa: F401
+from ...mcp_stdio import mcp_proxy_command
 from ... import claude_local_accepter as accepter, claude_local_card as card, claude_local_records as records
 from . import account as accounts, detector, hmac_policy, hold, inbox, launcher, trust
 from .shape import AUTOARM_VAR, BRIDGE, HITL_ROOT_NAME, LOCAL, PLUGIN, SESSION_NAME, resolve_plugin_dir  # noqa: F401
@@ -203,7 +204,8 @@ RECORDED = (("CLAUDE", "claude", str), ("PLUGIN_DIR", "plugin_dir", lambda v: v 
             ("HMAC_KEY_FILE", "hmac_key_file", str), ("PERMISSION_MODE", "permission_mode", str), ("TMUX", "tmux", str),
             ("HMAC_STRICT", "no_hmac_strict", lambda v: v == hmac_policy.OPT_OUT),
             (inbox.ALLOW_NON_OWNER, "non_owner", lambda v: "0" if v == "0" else ""),
-            (inbox.ALLOW_COLLABORATOR, "collaborator", lambda v: "0" if v == "0" else ""))
+            (inbox.ALLOW_COLLABORATOR, "collaborator", lambda v: "0" if v == "0" else ""),
+            ("MCP_PROXY_COMMAND", "mcp_proxy_command", str))
 
 
 # Install and connect ran, but a kept session id stayed instead of --resume-session's.
@@ -234,6 +236,10 @@ def _install(args) -> int:
         return cb.install_token_stdin(args, LOCAL, lambda: connect_preflight(args, login=False), _install, COMMAND,
                                       work=None, inbox=None, bridge_state_dir=None)
     problem = cb.recorded_install_args(args, LOCAL, RECORDED)
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return EXIT_UNUSABLE
+    proxy, problem = mcp_proxy_command(getattr(args, "mcp_proxy_command", None))
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
@@ -290,7 +296,10 @@ def _install(args) -> int:
               inbox.ALLOW_COLLABORATOR: "0" if args.collaborator == "0" else "1", "AGENT_ID": agent_id, "BRIDGE": mode,
               "TOKEN_ENV_FILE": where["token_file"],
               "TOKEN_VAULT_KEY": vault_key(segment) if mode not in (UNIT, EXTERNAL) and not where["token_file"] else "",
-              "BRIDGE_STATE_DIR": str(state), "TMUX": tmux}
+              "BRIDGE_STATE_DIR": str(state), "TMUX": tmux, "MCP_PROXY_COMMAND": proxy}
+    if proxy and not where["token_file"]:
+        print("NOTE mcp: --mcp-proxy-command acts as the agent through its own token file; this install has none "
+              "(--token-env-file), so the session gets no AG2 Space tools")
     resume = resume_session_arg(args)
     problem = resume_problem(values["CLAUDE_CONFIG_DIR"], resume, kept_session_id(local)) if resume else ""
     if problem:
@@ -870,6 +879,10 @@ def session_options(p) -> None:
     ses.add_argument("--resume-session", metavar="UUID", help="host this existing Claude Code conversation (its "
                      "transcript must be under the config dir's projects/, and no other process may have it open) "
                      "instead of a new one; replaces a kept id only once the old session is proven gone")
+    p.add_argument("--mcp-proxy-command", help="the stdio ag2-mcp-proxy command line ('<node> <the desktop app's "
+                   "engine/ag2-mcp-proxy.mjs>'), each path quoted when it has a space: the session (the owner's and "
+                   "attested collaborators' turns) gets the AG2 Space tools as this agent, through --mcp-config; "
+                   "needs the agent's own token file (default: none, no AG2 Space tools)")
     p.add_argument("--claude", default="claude", help="the claude executable (default: claude on PATH)")
     p.add_argument("--tmux", help="the tmux executable, 3.2 or newer, recorded for every later command (default: the "
                    "recorded one, else PATH, the desktop app's engine/bin, %s)" % ", ".join(launcher.TMUX_DIRS))

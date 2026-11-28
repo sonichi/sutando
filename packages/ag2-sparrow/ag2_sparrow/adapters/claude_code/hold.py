@@ -16,9 +16,11 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
-from ... import claude_local_records as records, claude_model_switch, connect_common as cm, task_io
+from ... import claude_local_records as records, claude_model_switch, connect_common as cm, mcp_auth, mcp_stdio, task_io
+from ...bounded_file_read import read_regular
 from ...file_lock import locked_file
 from . import inbox
 from .shape import LOCAL, resolve_plugin_dir
@@ -171,6 +173,99 @@ def claude_argv(cfg: dict, session_id: str) -> list:
             cfg.get("PERMISSION_MODE") or "bypassPermissions", flag, session_id] + (["--model", model] if model else [])
 
 
+# The AG2 Space room tools as this agent (MCP_PROXY_COMMAND): the shim, the descriptor, the proxy's log and the
+# `--mcp-config` file live in one directory of the root's state (task_lifecycle.STATE_OPTIONAL_DIRS names it).
+ROOM_TOOLS_DIR = ("state", "room-tools")
+MCP_CONFIG_NAME = "ag2-mcp-config.json"
+# What the shim grants the session: the owner and attested collaborators share it (restricted senders never
+# reach it, inbox.admit), and Claude Code keeps a session's MCP servers for its life, as Codex keeps a thread's.
+ROOM_TOOLS = mcp_auth.OWNER_TOOLS
+# The descriptor's token exchange runs before the session starts: well inside the launcher's wait for its
+# consumer (launcher.CONSUMER_WAIT_S, 30 s), so a slow relay costs the tools, never the session.
+ROOM_TOOLS_EXCHANGE_S = 12.0
+CLAUDE_JSON_MAX = 64 << 20
+
+
+def exchange_run(argv, **kw):
+    """subprocess.run for the descriptor exchange, bounded by ROOM_TOOLS_EXCHANGE_S."""
+    return subprocess.run(argv, **dict(kw, timeout=min(kw.get("timeout") or ROOM_TOOLS_EXCHANGE_S,
+                                                        ROOM_TOOLS_EXCHANGE_S)))
+
+
+def _servers_of(path, *keys) -> set:
+    """The names under `keys` (a path into the JSON object at `path`, ending at an mcpServers mapping); an empty
+    set when the file or the path is not there. ValueError for a file Claude Code could not read either."""
+    text, why = read_regular(path, CLAUDE_JSON_MAX)
+    if text is None:
+        if why:
+            raise ValueError("%s was refused (%s)" % (path, why))
+        return set()
+    node = json.loads(text)
+    for key in keys:
+        node = node.get(key) if isinstance(node, dict) else None
+    return set(node) if isinstance(node, dict) else set()
+
+
+def configured_servers(cfg: dict, cwd: str) -> set:
+    """The MCP servers the session's Claude Code already loads by name, without --strict-mcp-config: the user
+    scope (`mcpServers` of <CLAUDE_CONFIG_DIR, else ~>/.claude.json), the local scope (its
+    `projects[<cwd>].mcpServers`) and the project scope (<cwd>/.mcp.json). A plugin's servers are named
+    `plugin:<plugin>:<name>` and never collide. ValueError when one of them cannot be read."""
+    config_dir = cfg.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~")
+    claude_json = os.path.join(config_dir, ".claude.json")
+    names = _servers_of(claude_json, "mcpServers")
+    for project in {cwd, os.path.realpath(cwd)}:
+        names |= _servers_of(claude_json, "projects", project, "mcpServers")
+    return names | _servers_of(os.path.join(cwd, ".mcp.json"), "mcpServers")
+
+
+def write_mcp_config(state: str, entry: dict) -> str:
+    """`<state>/ag2-mcp-config.json` (0600): Claude Code's `--mcp-config` with the one stdio server `entry`
+    (mcp_stdio.stdio_entry's: the shim, the proxy's command line, the descriptor's path). No secret is in it."""
+    path = os.path.join(state, MCP_CONFIG_NAME)
+    server = {"type": "stdio", "command": entry["command"], "args": list(entry["args"]),
+              "env": {e["name"]: e["value"] for e in entry["env"]}}
+    cm._write(Path(path), json.dumps({"mcpServers": {entry["name"]: server}}, indent=2) + "\n", 0o600)
+    return path
+
+
+def room_tools_argv(cfg: dict, root: str, cwd: str, entry=None, log=None) -> list:
+    """`--mcp-config <file>` adding the ag2-space MCP server as this agent to the session, or []: with no
+    MCP_PROXY_COMMAND (an install from before it, or the desktop passed none), no TOKEN_ENV_FILE of the agent's
+    own, an `ag2-space` server the agent's Claude Code config already has (kept; ours would shadow or merge
+    into it), a config that cannot be read, or a failed token exchange. Each is one line in `log`; none stops
+    the session, which then starts without the tools. Rebuilt at every start (a restart is a new hold)."""
+    log = log or (lambda line: print("hold: " + line, file=sys.stderr))
+    proxy, token_file = cfg.get("MCP_PROXY_COMMAND") or "", cfg.get("TOKEN_ENV_FILE") or ""
+    if not proxy:
+        return []
+    if not token_file:
+        log("ag2-space MCP tools not offered: no TOKEN_ENV_FILE (the agent's own token file)")
+        return []
+    try:
+        names = configured_servers(cfg, cwd)
+        if mcp_auth.SERVER_NAME in names:
+            log("ag2-space MCP tools not offered: the agent's Claude Code config already has an %s server"
+                % mcp_auth.SERVER_NAME)
+            return []
+        state = os.path.join(root, *ROOM_TOOLS_DIR)
+        os.makedirs(state, mode=0o700, exist_ok=True)
+        if os.path.islink(state) or not os.path.isdir(state):
+            log("ag2-space MCP tools not offered: %s is not a directory" % state)
+            return []
+        got, why = (entry or mcp_stdio.stdio_entry)(proxy, token_file, cfg.get("AGENT_ID") or "", state,
+                                                    run=exchange_run, turn=uuid.uuid4().hex, tools=ROOM_TOOLS)
+        if got is None:
+            log("ag2-space MCP tools not offered: " + why)
+            return []
+        path = write_mcp_config(state, got)
+    except Exception as e:     # the tools never cost the session its start
+        log("ag2-space MCP tools not offered: %s: %s" % (type(e).__name__, str(e)[:200]))
+        return []
+    log("ag2-space MCP tools offered (%d tools granted)" % len(ROOM_TOOLS))
+    return ["--mcp-config", path]
+
+
 TITLE_OFF_VAR = "CLAUDE_CODE_DISABLE_TERMINAL_TITLE"
 
 
@@ -268,7 +363,9 @@ def _held(root, cfg, session_id, nonce, env, popen, state) -> int:
         picked = settle_wanted(cfg.get("ROOT"))
         if picked:
             print("hold: starting on %s, the model picked while the session could not switch" % picked, file=sys.stderr)
-        child, pipe["go_w"] = spawn_shim(claude_argv(cfg, session_id), child_env(env, inode), popen)
+        # Last: --mcp-config takes every word after it, and nothing positional follows.
+        argv = claude_argv(cfg, session_id) + room_tools_argv(cfg, root, os.path.join(root, "tasks"))
+        child, pipe["go_w"] = spawn_shim(argv, child_env(env, inode), popen)
         return child
 
     def started(child):
