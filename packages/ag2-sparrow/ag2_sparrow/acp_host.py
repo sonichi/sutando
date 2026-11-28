@@ -920,9 +920,10 @@ class AcpHost:
     the same working directory under the same authentication, else (or when the load is refused) a new one is
     opened with `session/new` and saved; `mcp_servers(init)` names its MCP servers, attached once, when it opens.
     `on_models(models)` gets the ACP `models` of each Session opened. Before a turn the process is restarted when it
-    exited, or when `auth_probe()` no longer gives what it gave at start (the adapter's authentication changed); a
-    request that timed out, or a sign-in error, closes it so the next turn starts clean. A turn whose prompt was not
-    sent yet when the process went away is tried once more on a fresh one. With `turn_cap`, a Session that has had
+    exited, or when `auth_probe()` gives another marker than the last known one (the adapter's authentication
+    changed; None, the probe could not tell, changes nothing); a request that timed out, or a sign-in error, closes
+    it so the next turn starts clean. A turn whose prompt was not sent yet when the process went away is tried once
+    more on a fresh one. With `turn_cap`, a Session that has had
     that many turns is left for a new one (0: never). `media_root` is a folder given to the Session as an
     additional directory (when the agent declares them), inside which each turn's attachments are copied."""
 
@@ -970,16 +971,23 @@ class AcpHost:
             return "not started"
         if not self.alive():
             return "the agent process exited"
-        if self.auth_probe is not None and self._probe() != self.probed:
-            return "the authentication changed"
+        if self.auth_probe is not None:
+            probed = self._probe()
+            if probed is not None and probed != self.probed:
+                return "the authentication changed"
         return ""
 
     def _probe(self):
+        """auth_probe()'s marker, or None when it could not tell: neither a change nor a removal, and the last
+        known marker stays the one the next read is compared with."""
         try:
-            return self.auth_probe()
-        except Exception as e:  # noqa: BLE001 - an unreadable probe reads as unchanged
+            probed = self.auth_probe()
+        except Exception as e:  # noqa: BLE001 - an unreadable probe reads as unknown
             self.log("authentication not checked:", type(e).__name__)
-            return self.probed
+            return None
+        if probed is None:
+            self.log("authentication not checked: the probe could not tell")
+        return probed
 
     def start(self):
         """Spawn, `initialize`, authenticate. Raises OSError (not started) or AcpError."""
@@ -992,7 +1000,7 @@ class AcpHost:
         self.init = self.client.initialize(self.args.rpc_timeout)
         self.auth = self.on_initialized(self.client, self.init, self.args.acp_argv) \
             if self.on_initialized is not None else None
-        self.probed = probed
+        self.probed = probed if probed is not None else self.probed
         self.log("agent started (pid %s), auth %s" % (self.pid, self.auth or "none"))
 
     def close(self, grace=None):

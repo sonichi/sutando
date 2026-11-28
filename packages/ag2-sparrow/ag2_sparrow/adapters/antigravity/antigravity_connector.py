@@ -33,7 +33,8 @@ directory, no command is granted; with --allow-owner-shell-web the owner's turns
 may also run commands and fetch or search the web (SHELL_AND_WEB_KINDS; never plain team or a guest).
 The tier is task_io.turn_policy's alone, mapped by TURNS: the owner and an attested collaborator (Team) get
 the owner's turn (the working directory, agy's own home, the owner's permission policy, the shared Session); a
-restricted sender (a guest, plain team, any unknown tier) is always served, as Sutando
+restricted sender (a guest, plain team, any unknown tier; an attested collaborator too when the install opted
+out with --no-allow-collaborator) is always served, as Sutando
 answers every non-owner in a read-only sandbox, in an isolated turn: a fresh temporary directory per task
 holds its working directory and its own agy home (`--gemini-dir`, with deny-all permission rules and no
 global context), run by a short `agy acp` process of its own (never the long-lived one: agy's permission rules,
@@ -69,9 +70,9 @@ from ...relay_loop import count_arg
 from .gemini_key import API_KEY_AUTH, authenticate_with_app_key
 from . import agy_account, agy_usage
 from ...team_guardrail import SANDBOXED_DELEGATION_CODEX
-from ...task_io import (COLLABORATOR, NON_OWNER_NOTE, NON_OWNER_REFUSED, OWNER, RESTRICTED, LockRefused,
-                        acquire_lock, exit_code, exit_on_sigterm, holder_consumer, load_done, make_dirs, parse_task,
-                        record_done, release_lock, root_path, stop_requested, turn_policy)
+from ...task_io import (ALLOW_COLLABORATOR_FLAG, COLLABORATOR, NON_OWNER_NOTE, NON_OWNER_REFUSED, OWNER, RESTRICTED,
+                        LockRefused, acquire_lock, exit_code, exit_on_sigterm, holder_consumer, load_done, make_dirs,
+                        parse_task, record_done, release_lock, root_path, stop_requested, turn_policy)
 
 NAME = "Antigravity"
 LIMITED_NO_SEND = "[no-send] Antigravity is at its usage limit; the owner was sent the account card\n"
@@ -439,10 +440,12 @@ def guest_turn(args, headers=None, message=""):
         shutil.rmtree(base, ignore_errors=True)
 
 
-def turn_for(headers):
+def turn_for(headers, allow_collaborator=True):
     """(turn_policy's kind, the turn to run: OWNER_TURN, ISOLATED_TURN or None for refused), from the attested
-    headers only. Every non-owner who is not a collaborator is served restricted (allow_non_owner=True)."""
-    kind = turn_policy(headers, allow_non_owner=True).kind
+    headers only. Every non-owner who is not a collaborator is served restricted (allow_non_owner=True); with
+    the install's opt-out (allow_collaborator False) an attested collaborator is too, never the shared Session."""
+    policy = turn_policy(headers, allow_non_owner=True, allow_collaborator=allow_collaborator)
+    kind = RESTRICTED if policy.unlock == ALLOW_COLLABORATOR_FLAG else policy.kind
     return kind, TURNS.get(kind)
 
 
@@ -904,7 +907,7 @@ class Connector:
         headers, message, operator_lines = parse_task(path)
         self.quota.remember(path=path)     # the owner's DM, where a quota notice goes
         task_text = card_desk.read_task(path)   # read now: the bridge may archive the file while the turn runs
-        kind, turn_kind = turn_for(headers)
+        kind, turn_kind = turn_for(headers, not getattr(self.args, "no_allow_collaborator", False))
         if turn_kind is None:
             log("refused (non-owner) ->", task_id, headers["access_tier"])
             publish(result_file, NON_OWNER_REFUSED)
@@ -1077,6 +1080,8 @@ def build_parser():
     ap.add_argument("--allow-non-owner", action="store_true",
                     help="no effect, kept so existing configs parse: an attested collaborator always gets the "
                          "owner's turn, any other non-owner an isolated read-only one (all on the owner's agy sign-in)")
+    ap.add_argument("--no-allow-collaborator", action="store_true",
+                    help="serve an attested collaborator as a guest is (isolated, read-only), never the shared Session")
     ap.add_argument("--allow-owner-shell-web", action="store_true",
                     help="let the owner's turns, and an attested collaborator's, run shell commands and fetch or "
                          "search the web (never plain Team's or a guest's; default: off)")

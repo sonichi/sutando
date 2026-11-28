@@ -105,11 +105,18 @@ message body changes nothing); the adapter only maps its verdict to a turn (`TUR
 | `turn_policy` verdict | Who | Turn |
 | --- | --- | --- |
 | owner | the owner | the owner's turn |
-| collaborator | an attested collaborator (Team: `team` + the broker's `collaborator: true`) | the owner's turn, on the shared Session |
+| collaborator | an attested collaborator (Team: `team` + the broker's `collaborator: true`) | the owner's turn, on the shared Session; with `--no-allow-collaborator`, the isolated read-only turn below |
 | restricted | a guest, plain team (no collaborator stamp), any unknown tier | the isolated read-only turn below |
 | refused | (not reached here: every non-owner who is not a collaborator is served restricted, as Sutando answers them) | one refusal line, agy not started |
 
 No flag is needed for any of them; `--allow-non-owner` still parses and changes nothing.
+
+**Opting collaborators out.** Collaborators share the owner's Session by default (`--allow-collaborator`).
+`install --no-allow-collaborator` records `ALLOW_COLLABORATOR=0`: an attested collaborator is then served
+exactly as a guest is (the isolated read-only turn, its own throwaway Session and agy home, no AG2 Space tools),
+never the owner's Session, history, tools or key. Every reinstall keeps the recorded choice unless one of the
+two flags is given again: a repair by selector, an `install` with the agent's token file or `--token-stdin`,
+and the app's own reinstall after an update (`--replace-install`). `verify` says which is in force.
 
 Every turn runs on the owner's agy sign-in (the Google account and quota in the Keychain): giving someone
 Collaborator access to this agent lets them spend that quota, and their turns may read and edit the
@@ -258,8 +265,13 @@ into that request on agy's stdin: never argv, environment or logs. Each saved Se
 (`auth`: `sign-in` or `gemini-api-key`, none = `sign-in`); a Session opened under the other mode is not
 resumed (resuming a sign-in Session still bills the Google account's quota), a new one is opened. Saving,
 replacing (A to B) or removing the key restarts the long-lived agy before the next turn, which then resumes
-the shared Session: the change is seen in this agent's own item's creation and modification dates, read with
-`security find-generic-password` without `-w`/`-g` (never the key, and no other agent's item).
+the shared Session. The change is seen in this agent's own item's attributes, read before each owner or
+collaborator turn with one `security find-generic-password` without `-w`/`-g` (never the key, and no other
+agent's item; a bounded subprocess, no Keychain prompt): the item version the app sets in its generic attribute
+(`gena`, `ag2v1-` and 32 random hex digits, new on every paste, saved-key pick or write), or, for an item an older
+app wrote with no version, its creation and modification dates. A dates-only marker misses a replacement in the
+same second; that case is covered once the app that sets the version ships. A query that fails other than "not
+found" is unknown: no restart, and the next good read is compared with the last known marker.
 `AG2_AGY_GEMINI_KEY=0` in the connector's environment turns this off. See `gemini_key.py`.
 
 ## The account card

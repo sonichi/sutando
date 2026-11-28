@@ -35,6 +35,8 @@ OPT_OUT_ENV = "AG2_AGY_GEMINI_KEY"
 SECURITY = "/usr/bin/security"
 READ_TIMEOUT_S = 10.0
 GUEST_FLAG = "--gemini-dir"
+NOT_FOUND = 44   # `security`'s exit when the item does not exist
+VERSION_PREFIX = "ag2v1-"   # the app's item version: this and 32 random hex digits, set anew on every write
 
 
 class AuthUnconfirmed(AcpError):
@@ -152,30 +154,40 @@ def key_saved(agent_id: str = "", run=None, platform: str = None, environ=None,
     return getattr(done, "returncode", 1) == 0
 
 
-# Only the item's creation and modification dates (14 digits + Z) are kept: nothing else it prints.
+# Only the item's version (its generic attribute, which the app sets fresh on each write) or, from an app that
+# writes none, its creation and modification dates (14 digits + Z) are kept: nothing else it prints.
 _ITEM_DATE = re.compile(r'"(cdat|mdat)"<timedate>=\S*\s*"(\d{14}Z)')
+_ITEM_VERSION = re.compile(r'"gena"<blob>="(%s[0-9a-f]{32})"' % re.escape(VERSION_PREFIX))
+UNKNOWN = None   # key_marker: the query failed, so whether the key changed is not known
 
 
 def key_marker(agent_id: str = "", run=None, platform: str = None, environ=None,
-               timeout: float = READ_TIMEOUT_S) -> str:
-    """A change marker for this agent's own saved key, with no secret in it: '' when none is saved (or off
-    macOS, without the agent id, opted out, on any failure), else "saved cdat=<date> mdat=<date>" from the
-    item's attributes (no `-w`/`-g`). Saving another key into the item, or deleting and adding it, changes it."""
+               timeout: float = READ_TIMEOUT_S) -> "str | None":
+    """A change marker for this agent's own saved key, with no secret in it, from the item's attributes (no
+    `-w`/`-g`): "saved v=<version>" when the app set one, else "saved cdat=<date> mdat=<date>" (an older app);
+    '' when none is saved (`security` said not found; also off macOS, without the agent id, opted out); UNKNOWN
+    (None) on any other failure (no answer, another exit, output with neither), which is never read as removed."""
     if not agent_id or (platform or sys.platform) != "darwin" or opted_out(environ):
         return ""
     try:
         done = (run or subprocess.run)([SECURITY, "find-generic-password", "-a", ACCOUNT, "-s", agent_service(agent_id)],
                                        capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
+        return UNKNOWN
+    code = getattr(done, "returncode", 1)
+    if code == NOT_FOUND:
         return ""
-    if getattr(done, "returncode", 1) != 0:
-        return ""
-    dates = dict(_ITEM_DATE.findall(getattr(done, "stdout", "") or ""))
+    out = getattr(done, "stdout", "") or ""
+    version = _ITEM_VERSION.search(out) if code == 0 else None
+    if version:
+        return "saved v=%s" % version.group(1)
+    dates = dict(_ITEM_DATE.findall(out)) if code == 0 else {}
+    if not dates:
+        return UNKNOWN
     return " ".join(["saved"] + ["%s=%s" % (k, dates[k]) for k in ("cdat", "mdat") if k in dates])
 
 
 REMOVED, ABSENT, FAILED = "removed", "absent", "failed"
-NOT_FOUND = 44   # `security`'s exit when the item does not exist
 
 
 def clear_key(agent_id: str, run=None, platform: str = None, timeout: float = READ_TIMEOUT_S) -> str:

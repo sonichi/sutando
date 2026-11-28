@@ -1647,7 +1647,7 @@ IO_ALLOWED = {("remote_gateway_bridge.py", "_read_env_file"), ("remote_gateway_b
               # Antigravity's own Gemini API key, which the owner saved for that agent in the app (its
               # Keychain item, never a gateway credential): read here and sent only in ACP authenticate.
               ("adapters/antigravity/gemini_key.py", "_read_item"),
-              # The same item asked for by its attributes only (no key printed; key_marker keeps only its dates), and
+              # The same item asked for by its attributes only (no key printed; key_marker keeps a version/dates), and
               # deleted on "Stop using the key".
               ("adapters/antigravity/gemini_key.py", "key_saved"), ("adapters/antigravity/gemini_key.py", "key_marker"),
               ("adapters/antigravity/gemini_key.py", "clear_key")}

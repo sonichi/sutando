@@ -180,6 +180,33 @@ class SharedSessionTest(unittest.TestCase):
         self.assertIn("room=!g:s.space", guest_prompt)
         self.assertIn("sender=@eve:s.space", guest_prompt)
 
+    def test_an_opted_out_collaborator_is_served_as_a_guest_and_never_reaches_the_shared_session(self):
+        self.w.task("task-1", "STUB:TEXT hi")
+        self.w.task("task-2", "STUB:ROOM hi", channel="!c:s.space", tier="team", user="@bob:s.space",
+                    collaborator=True)
+        self.w.task("task-3", "STUB:TEXT back")
+        _, err = self.w.serve(3, "--no-allow-collaborator", tools=True)
+        boots = self.w.boots()
+        self.assertEqual(["--gemini-dir" in b["argv"] for b in boots], [False, True],
+                         "the collaborator's turn runs in a short agy of its own, with its own home")
+        shared = self.w.shared()["session_id"]
+        sids = [r["sessionId"] for r in self.w.prompts()]
+        self.assertEqual((sids[0], sids[2]), (shared, shared))
+        self.assertNotEqual(sids[1], shared, "never the shared Session id")
+        self.assertEqual(self.w.calls("session/load"), [], "the shared Session is never loaded for them")
+        news = self.w.calls("session/new")
+        self.assertEqual([r["params"]["mcpServers"] for r in news], [[ENTRY], []], "no owner tools")
+        self.assertEqual(self.w.minted, [gc.mcp_auth.OWNER_TOOLS], "minted once, for the owner's Session only")
+        self.assertEqual(self.w.shared()["turns"], 2)
+        self.assertEqual(self.w.result("task-2"), "no room lead\n", "a throwaway prompt, no shared-session lead")
+        self.assertEqual([(m["policy"], m["isolated"]) for m in self.w.metrics()],
+                         [(task_io.OWNER, False), (task_io.RESTRICTED, True), (task_io.OWNER, False)])
+        self.assertEqual(gc.turn_for({"access_tier": "team", "collaborator": "true"}, False),
+                         (task_io.RESTRICTED, gc.ISOLATED_TURN))
+        self.assertEqual(gc.turn_for({"access_tier": "team", "collaborator": "true"}),
+                         (task_io.COLLABORATOR, gc.OWNER_TURN), "the default: shared, as before")
+        self.assertEqual(gc.turn_for({"access_tier": "owner"}, False), (task_io.OWNER, gc.OWNER_TURN))
+
     def test_an_agy_that_died_while_idle_is_restarted_and_the_shared_session_reloaded(self):
         self.w.task("task-1", "STUB:DIE bye")
         self.w.task("task-2", "STUB:ROOM again", channel="!b:s.space")
@@ -501,6 +528,23 @@ class HostTest(unittest.TestCase):
             raise RuntimeError("keychain")
         host.auth_probe = broken
         self.assertEqual(host.restart_reason(), "", "an unreadable probe reads as unchanged")
+
+    def test_an_unknown_marker_neither_restarts_nor_moves_the_baseline(self):
+        marker = ["saved v=1"]
+        host = self.host(self.OK, auth_probe=lambda: marker[0])
+        self.run_turn(host)
+        marker[0] = None
+        self.assertEqual(host.restart_reason(), "", "unknown is not a removal")
+        self.run_turn(host)
+        self.assertEqual((len(self.spawned), host.probed), (1, "saved v=1"))
+        self.assertIn("authentication not checked: the probe could not tell", self.said)
+        host.close()
+        self.run_turn(host)      # started while unknown: the last known marker is kept
+        self.assertEqual((len(self.spawned), host.probed), (2, "saved v=1"))
+        marker[0] = "saved v=2"
+        self.assertEqual(host.restart_reason(), "the authentication changed")
+        marker[0] = ""
+        self.assertEqual(host.restart_reason(), "the authentication changed", "removed is a change")
 
     def test_a_changed_key_marker_closes_the_old_process_and_an_unchanged_one_keeps_it(self):
         marker = ["saved mdat=1"]

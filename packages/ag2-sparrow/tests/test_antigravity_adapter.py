@@ -2249,6 +2249,56 @@ class InstallVerifyTest(unittest.TestCase):
                       out)
         self.assertNotIn("collaborators refused", out)
 
+    def test_the_collaborator_opt_out_is_recorded_kept_on_every_reinstall_and_undone_only_by_the_flag(self):
+        rc, seen, out = self.install()
+        self.assertEqual((rc, seen["values"]["ALLOW_COLLABORATOR"]), (0, "1"), "the default: shared")
+        rc, seen, out = self.install("--no-allow-collaborator")
+        self.assertEqual((rc, seen["values"]["ALLOW_COLLABORATOR"]), (0, "0"), out)
+        self.write_config(ALLOW_COLLABORATOR="0")
+        for extra in ((), ("--replace-install",)):    # a repair by its selector, and an updated app's reinstall
+            rc, seen, out = self.install(*extra)
+            self.assertEqual((rc, seen["values"]["ALLOW_COLLABORATOR"]), (0, "0"), (extra, out))
+        rc, seen, out = self.install("--allow-collaborator")
+        self.assertEqual((rc, seen["values"]["ALLOW_COLLABORATOR"]), (0, "1"), "only the flag re-enables")
+        self.write_config(ALLOW_COLLABORATOR="1")
+        self.assertEqual(self.install()[1]["values"]["ALLOW_COLLABORATOR"], "1")
+        self.write_config()                        # an older config with no such key: the default
+        self.assertEqual(self.install()[1]["values"]["ALLOW_COLLABORATOR"], "1")
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            self.install("--allow-collaborator", "--no-allow-collaborator")   # one or the other
+
+    def test_an_agents_own_job_keeps_its_opt_out_on_a_token_reinstall(self):
+        # The app's update reinstalls with the agent's token file or --token-stdin: both read the job's own config.
+        job, why = cm.agent_job(cli.LOCAL, "@agy:s.space")
+        self.assertEqual(why, "")
+        path = cli.config_path(job)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(cm.render_config(job, {"ACP_COMMAND": "agy acp", "CWD": "/c", "INBOX_DIR": "/i",
+                                               "RESULTS_DIR": "/r", "ROOT": "/w", "ALLOW_COLLABORATOR": "0"}))
+        given = lambda **kw: argparse.Namespace(**kw)  # noqa: E731
+        self.assertEqual(cli.collaborator_choice(given(), job), "0")
+        self.assertEqual(cli.collaborator_choice(given(allow_collaborator=True), job), "1")
+        self.assertEqual(cli.collaborator_choice(given(no_allow_collaborator=True), cli.LOCAL), "0")
+        self.assertEqual(cli.collaborator_choice(given(), cli.LOCAL), "1", "another job's config is not read")
+
+    def test_the_connector_gets_the_opt_out_and_help_and_verify_name_it(self):
+        cfg = {"ACP_COMMAND": "%s acp" % self.agy, "CWD": str(self.cwd), "ALLOW_COLLABORATOR": "0"}
+        self.assertIn("--no-allow-collaborator", cli.connector_argv(cfg, str(self.work), 7))
+        for value in ("1", ""):
+            self.assertNotIn("--no-allow-collaborator", cli.connector_argv(dict(cfg, ALLOW_COLLABORATOR=value),
+                                                                           str(self.work), 7))
+        self.assertIn("ALLOW_COLLABORATOR", cli.CONFIG_KEYS)
+        self.assertTrue(gc.build_parser().parse_args(["--work", "/w", "--no-allow-collaborator"]).no_allow_collaborator)
+        out = io.StringIO()
+        with self.assertRaises(SystemExit), contextlib.redirect_stdout(out):
+            cli.main(["install", "--help"])
+        out = out.getvalue()
+        for flag in ("--allow-collaborator", "--no-allow-collaborator"):
+            self.assertIn(flag, out)
+        self.write_config(ALLOW_COLLABORATOR="0")
+        _rc, out = self.verify("--no-probe")
+        self.assertIn("INFO team (attested collaborator): opted out (--no-allow-collaborator)", out)
+
     def test_verify_fails_when_agy_does_not_start_or_answer(self):
         self.write_config()
         self.agy.write_text("#!/bin/sh\nexit 3\n")
