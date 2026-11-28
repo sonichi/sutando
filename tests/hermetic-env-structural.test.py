@@ -130,9 +130,9 @@ CANONICAL = {"_helpers.hermetic_env": "isolate_os_environ", "_helpers.hermetic_g
 # Anything else fails closed there; add it here when a test needs it.
 STDLIB_FALLBACK = frozenset({
     "__future__", "argparse", "ast", "atexit", "base64", "builtins", "concurrent", "contextlib", "ctypes",
-    "datetime", "errno", "functools", "glob", "hashlib", "hmac", "http", "importlib", "inspect", "io", "json",
-    "multiprocessing", "os", "pathlib", "plistlib", "random", "re", "runpy", "secrets", "select", "shlex",
-    "shutil", "signal", "socket", "sqlite3", "stat", "struct", "subprocess", "sys", "sysconfig", "tarfile",
+    "datetime", "errno", "functools", "glob", "hashlib", "hmac", "http", "importlib", "inspect", "io", "itertools",
+    "json", "multiprocessing", "os", "pathlib", "plistlib", "queue", "random", "re", "runpy", "secrets", "select",
+    "shlex", "shutil", "signal", "socket", "sqlite3", "stat", "struct", "subprocess", "sys", "sysconfig", "tarfile",
     "tempfile", "textwrap", "threading", "time", "types", "unittest", "urllib", "venv", "zipfile"})
 STDLIB = getattr(sys, "stdlib_module_names", None) or STDLIB_FALLBACK
 
