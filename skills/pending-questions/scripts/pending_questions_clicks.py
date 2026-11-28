@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -52,6 +53,29 @@ def manager_for(workspace):
 def clicks_lock(manager):
     from file_lock import locked_file  # noqa: PLC0415
     return locked_file(Path(manager.store.root).parent / LOCK_NAME, create_mode=0o600)
+
+
+class ClicksBusy(RuntimeError):
+    """A clicks pass holds the lock; the probe does not wait for it."""
+
+
+@contextmanager
+def clicks_lock_nowait(manager):
+    """The clicks lock, or ClicksBusy at once when a pass holds it: a pass can hold it for minutes,
+    and the health check's probe must never queue behind it."""
+    from file_lock import try_lock_fd, unlock_fd  # noqa: PLC0415
+    path = Path(manager.store.root).parent / LOCK_NAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        if not try_lock_fd(fd):
+            raise ClicksBusy("a decision-card clicks pass is running")
+        try:
+            yield fd
+        finally:
+            unlock_fd(fd)
+    finally:
+        os.close(fd)
 
 
 def answered_cards(manager) -> list:
@@ -176,11 +200,12 @@ def due_clicks(workspace: Path, manager=None, now: Optional[float] = None) -> li
     processed, a claim left `claiming` (deferred, or its pass died), or a handed claim whose lease
     expired (to be re-offered, or listed NEEDS ATTENTION once its re-offer is used). Its only write
     is crediting this pass to each handed lease, under the clicks lock, so a host whose clicks pass
-    runs only on demand still ages its leases on the health check's cadence."""
+    runs only on demand still ages its leases on the health check's cadence. ClicksBusy while a
+    pass holds the lock."""
     manager = manager or manager_for(workspace)
     clock = time.time if now is None else (lambda: now)
     out = []
-    with clicks_lock(manager):
+    with clicks_lock_nowait(manager):
         for c in answered_cards(manager):
             claim = c["claim"]
             if claim.get("state") != HANDED:

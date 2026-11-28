@@ -408,6 +408,23 @@ class Wakeup(_Room):
         warn, out = self.loop_pass()
         self.assertIn(f"[{self.ask_id}] chose approve 'Approve' -> merge it", out)
 
+    def test_the_due_probe_never_waits_for_a_running_clicks_pass(self):
+        # A pass can hold the clicks lock for minutes; the health probe must not queue behind it.
+        import fcntl
+        import time
+        click(self.m, self.card, "option-1")
+        lock = Path(self.m.store.root).parent / cards.LOCK_NAME
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        with open(lock, "a+") as held:
+            fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+            started = time.monotonic()
+            with self.assertRaises(cards.ClicksBusy):
+                room_db.due_clicks(self.ws, self.m)
+            self.assertIsNone(HC.check_decision_card_clicks(self.ws), "a running pass is not a click owed")
+            self.assertLess(time.monotonic() - started, 5, "the probe returned at once")
+            fcntl.flock(held.fileno(), fcntl.LOCK_UN)
+        self.assertEqual(room_db.due_clicks(self.ws, self.m), [self.ask_id], "free again: the probe reads it")
+
     def test_an_unreadable_store_raises_no_warn(self):
         with mock.patch.object(reader, "due_clicks", side_effect=OSError("store gone")):
             self.assertIsNone(HC.check_decision_card_clicks(self.ws))
