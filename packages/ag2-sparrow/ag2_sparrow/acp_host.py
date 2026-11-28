@@ -864,6 +864,7 @@ def _set_mode(client, session_id, modes, isolated, timeout):
 
 SHARED_NAME = "shared-session.json"
 MEDIA_ROOT_NAME = "acp-media"
+UNREAD_BACKOFF_S, UNREAD_BACKOFF_CAP_S = 60, 30 * 60   # AcpHost: the wait after a start that was not settled
 REFUSED = {"outcome": {"outcome": "cancelled"}}
 
 
@@ -923,21 +924,26 @@ class AcpHost:
     exited, or when `auth_probe()` gives another marker than the last known one (the adapter's authentication
     changed; None, the probe could not tell, changes nothing). The last known marker is the one read just before and
     after `on_initialized` in the start that authenticated, when both reads agree and `auth_settled()` (when given)
-    says that start read what the marker watches; else it is unknown and the next
-    marker read restarts the process once, so the one running is proven on it. A request that timed out, or a
-    sign-in error, closes it so the next turn starts clean. A turn whose prompt was not sent yet when the process
-    went away is tried once more on a fresh one. With `turn_cap`, a Session that has had that many turns is left
-    for a new one (0: never). `media_root` is a folder given to the Session as an additional directory (when the
-    agent declares them), inside which each turn's attachments are copied."""
+    says that start read what the marker watches; else it is unknown and the next marker read restarts the process
+    once, so the one running is proven on it. After a start that was not settled, that restart waits until the
+    marker moves from the one that start read, or a backoff ends (UNREAD_BACKOFF_S, doubling to
+    UNREAD_BACKOFF_CAP_S on each start still not settled, reset by a settled one; `clock` gives seconds). A request
+    that timed out, or a sign-in error, closes it so the next turn starts clean. A turn whose prompt was not sent
+    yet when the process went away is tried once more on a fresh one. With `turn_cap`, a Session that has had that
+    many turns is left for a new one (0: never). `media_root` is a folder given to the Session as an additional
+    directory (when the agent declares them), inside which each turn's attachments are copied."""
 
     def __init__(self, client_factory, args, stderr_name, not_signed_in, log, shared_path, on_initialized=None,
-                 mcp_servers=None, on_models=None, auth_probe=None, turn_cap=0, media_root=None, auth_settled=None):
+                 mcp_servers=None, on_models=None, auth_probe=None, turn_cap=0, media_root=None, auth_settled=None,
+                 clock=time.monotonic):
         self.client_factory, self.args, self.stderr_name = client_factory, args, stderr_name
         self.not_signed_in, self.log = not_signed_in, log
         self.file = SharedSessionFile(shared_path)
         self.on_initialized, self.mcp_servers, self.on_models = on_initialized, mcp_servers, on_models
         self.auth_probe, self.turn_cap, self.media_root = auth_probe, int(turn_cap or 0), media_root
-        self.auth_settled = auth_settled
+        self.auth_settled, self.clock = auth_settled, clock
+        # after a start that was not settled: (marker it read, until when its retry waits, logged)
+        self.unread_hold, self.unread_backoff = None, 0
         self.client = None
         self.init, self.auth, self.probed = {}, None, None
         self.session_id, self.turns, self.models, self.model = None, 0, {}, ""
@@ -977,9 +983,21 @@ class AcpHost:
             return "the agent process exited"
         if self.auth_probe is not None:
             probed = self._probe()
-            if probed is not None and probed != self.probed:
+            if probed is not None and probed != self.probed and not self._unread_held(probed):
                 return "the authentication changed"
         return ""
+
+    def _unread_held(self, probed):
+        """True while the restart for an unknown baseline waits: the last start was not settled, `probed` is the
+        marker it read, and its backoff has not ended. A moved marker (a real key change) is never held."""
+        hold = self.unread_hold
+        if self.probed is not None or hold is None or probed != hold[0] or self.clock() >= hold[1]:
+            return False
+        if not hold[2]:
+            self.unread_hold = hold[:2] + (True,)
+            self.log("the last start could not read what the authentication watches; not restarting for it "
+                     "for %d s more, unless it changes" % max(0, round(hold[1] - self.clock())))
+        return True
 
     def _probe(self):
         """auth_probe()'s marker, or None when it could not tell: neither a change nor a removal, and the last
@@ -1009,8 +1027,13 @@ class AcpHost:
         # The baseline is a marker read on both sides of this start's authenticate; else unknown, and restarts once.
         settled = self.auth_settled is None or self.auth_settled()
         self.probed = before if before is not None and before == after and settled else None
-        if not settled:
+        if settled:
+            self.unread_hold, self.unread_backoff = None, 0
+        else:
             self.log("this start could not read what the authentication watches; it restarts once it reads")
+            self.unread_backoff = min(self.unread_backoff * 2, UNREAD_BACKOFF_CAP_S) or UNREAD_BACKOFF_S
+            seen = after if before is None or before == after else None   # moved during the start: not held
+            self.unread_hold = None if seen is None else (seen, self.clock() + self.unread_backoff, False)
         if before is not None and after is not None and before != after:
             self.log("the authentication changed while the agent started; it restarts before the next turn")
         self.log("agent started (pid %s), auth %s" % (self.pid, self.auth or "none"))

@@ -476,22 +476,34 @@ class BaselineTest(ChainCase):
         self.assertEqual(len(boots), 2)
         self.assertEqual(self.auths(), [(boots[1]["pid"], len(self.KEY_B))])
 
+    def clocked(self):
+        """A connector whose host reads `self.now` as its clock."""
+        conn, self.now = gc.Connector(self.w.args("--agent-id", self.AGENT)), 0.0
+        conn.shared_host().clock = lambda: self.now
+        return conn
+
     def test_a_key_that_could_not_be_read_leaves_the_baseline_unknown_and_restarts_once_on_the_key(self):
         self.chain.items[self.service] = (self.KEY_A, self.V1)
         self.chain.fail_read = True
-        conn = gc.Connector(self.w.args("--agent-id", self.AGENT))
+        conn = self.clocked()
         with contextlib.redirect_stderr(io.StringIO()) as out:
             self.turn(conn, "task-1")
             self.assertEqual((conn.key_outcome, conn.host.probed), (gk.UNREAD, None), "the markers agree, unproven")
             self.chain.fail_read = False
+            self.now = 59.0
             self.turn(conn, "task-2")
-            self.assertEqual((conn.key_outcome, conn.host.probed), (gk.USED, "saved v=%s%s" % (gk.VERSION_PREFIX, self.V1)))
+            self.assertEqual(conn.key_outcome, gk.UNREAD, "the same marker inside the backoff: no restart yet")
+            self.now = 60.0
             self.turn(conn, "task-3")
+            self.assertEqual((conn.key_outcome, conn.host.probed), 
+                             (gk.USED, "saved v=%s%s" % (gk.VERSION_PREFIX, self.V1)))
+            self.assertEqual((conn.host.unread_hold, conn.host.unread_backoff), (None, 0), "a settled start resets")
+            self.turn(conn, "task-4")
             conn.host.close()
         boots = self.w.boots()
         self.assertEqual(len(boots), 2, "one restart once the key reads, then none")
         self.assertEqual(self.auths(), [(boots[1]["pid"], len(self.KEY_A))], "the first agy was sent no key")
-        self.assertEqual([r["pid"] for r in self.w.prompts()], [boots[0]["pid"]] + [boots[1]["pid"]] * 2)
+        self.assertEqual([r["pid"] for r in self.w.prompts()], [boots[0]["pid"]] * 2 + [boots[1]["pid"]] * 2)
         self.assertIn("it could not be read; staying on the Google sign-in", out.getvalue())
         self.assertEqual(out.getvalue().count("restarting the agent: the authentication changed"), 1)
 
@@ -511,6 +523,46 @@ class BaselineTest(ChainCase):
         self.assertEqual(self.w.shared()["auth"], acp_host.SIGNED_IN_AUTH)
         self.assertEqual([r["pid"] for r in self.w.prompts()], [boots[0]["pid"]] * 2)
         self.assertIn("not accepted (AcpError); staying on the Google sign-in", out.getvalue())
+        self.assertEqual((conn.host.unread_hold, conn.host.unread_backoff), (None, 0))
+
+    def test_a_key_that_stays_unreadable_restarts_at_most_once_per_window_and_the_window_doubles_to_its_cap(self):
+        self.chain.items[self.service] = (self.KEY_A, self.V1)
+        self.chain.fail_read = True
+        conn, until, windows = self.clocked(), acp_host.UNREAD_BACKOFF_S, []
+        with contextlib.redirect_stderr(io.StringIO()) as out:
+            self.turn(conn, "task-0")
+            for i in range(7):
+                for j, back in enumerate((30, 1)):   # two turns inside the window, the last just before its end
+                    self.now = until - back
+                    self.turn(conn, "task-%d-%d" % (i, j))
+                self.now = until
+                self.turn(conn, "task-%d-end" % i)
+                windows.append(conn.host.unread_backoff)
+                until = self.now + conn.host.unread_backoff
+            conn.host.close()
+        self.assertEqual(windows, [120, 240, 480, 960, 1800, 1800, 1800])
+        self.assertEqual(len(self.w.boots()), 8, "one start, then one restart per window")
+        self.assertEqual(self.auths(), [], "no key was ever read, so none was sent")
+        self.assertEqual(out.getvalue().count("not restarting for it for"), 7, "one line per window held")
+        self.assertNotIn(self.KEY_A, out.getvalue())
+
+    def test_a_key_change_inside_the_backoff_restarts_at_once(self):
+        self.chain.items[self.service] = (self.KEY_A, self.V1)
+        self.chain.fail_read = True
+        conn = self.clocked()
+        with contextlib.redirect_stderr(io.StringIO()) as out:
+            self.turn(conn, "task-1")
+            self.now = 10.0
+            self.chain.items[self.service] = (self.KEY_B, self.V2)
+            self.chain.fail_read = False
+            self.turn(conn, "task-2")
+            self.assertEqual((conn.key_outcome, conn.host.probed), 
+                             (gk.USED, "saved v=%s%s" % (gk.VERSION_PREFIX, self.V2)))
+            conn.host.close()
+        boots = self.w.boots()
+        self.assertEqual(len(boots), 2)
+        self.assertEqual(self.auths(), [(boots[1]["pid"], len(self.KEY_B))])
+        self.assertNotIn("not restarting for it for", out.getvalue())
 
 
 def gk_service_other(agent):
@@ -626,6 +678,13 @@ class HostTest(unittest.TestCase):
         host = self.host(dict(self.OK, **{"session/new": {}}))
         self.assertEqual(self.run_turn(host)[:3:2], ("failed", "session/new returned no sessionId"))
         self.assertIsNone(host.client, "a Session that would not open closes it")
+
+    def test_a_marker_that_moved_during_a_start_not_settled_is_not_held(self):
+        marks = iter(["m1", "m2", "m2", "m2"])
+        host = self.host(self.OK, auth_probe=lambda: next(marks), auth_settled=lambda: False, clock=lambda: 0.0)
+        self.assertEqual(self.run_turn(host)[0], "completed")
+        self.assertEqual((host.probed, host.unread_hold, host.unread_backoff), (None, None, acp_host.UNREAD_BACKOFF_S))
+        self.assertEqual(host.restart_reason(), "the authentication changed", "no marker to hold on: restarts")
 
     def test_a_command_that_does_not_start_fails_the_turn(self):
         host = self.host(OSError("no such file"))
