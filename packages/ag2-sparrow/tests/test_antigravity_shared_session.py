@@ -325,16 +325,16 @@ class KeyChain:
                                                     '    "mdat"<timedate>=0x00  "%s\\000"\n' % got[1], "")
 
 
-class KeySwapTest(unittest.TestCase):
-    """A Gemini API key replaced in the app (A -> B) restarts the long-lived agy, which signs in on B and resumes
-    the shared Session; the same key keeps it; another agent's item never touches it."""
+class ChainCase(unittest.TestCase):
+    """The connector on a mocked `security` (CHAIN) and the stub agy."""
     AGENT, KEY_A, KEY_B = "@agy:s.space", "AIzaDUMMY-key-A-0123456789", "AIzaDUMMY-key-B-9876543210abcdef"
+    CHAIN = KeyChain
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.w = Work(self.tmp.name)
-        self.chain = KeyChain()
+        self.chain = self.CHAIN()
         for name in ("gemini_api_key_from_app", "key_marker"):
             real = getattr(gk, name)
             patcher = mock.patch.object(gk, name, lambda agent_id="", real=real: real(
@@ -346,6 +346,11 @@ class KeySwapTest(unittest.TestCase):
     def turn(self, conn, tid):
         self.w.task(tid, "STUB:TEXT " + tid)
         conn.handle(tid + ".txt")
+
+
+class KeySwapTest(ChainCase):
+    """A Gemini API key replaced in the app (A -> B) restarts the long-lived agy, which signs in on B and resumes
+    the shared Session; the same key keeps it; another agent's item never touches it."""
 
     def test_a_to_b_restarts_on_b_and_resumes_and_the_same_key_does_not(self):
         self.chain.items[self.service] = (self.KEY_A, "20261127000000Z")
@@ -390,6 +395,83 @@ class KeySwapTest(unittest.TestCase):
         self.assertEqual(len(self.w.calls("authenticate")), 1, "the new agy is not sent a key")
         self.assertIn("not resuming shared session s-1", out.getvalue())
         self.assertEqual(self.w.shared()["auth"], acp_host.SIGNED_IN_AUTH)
+
+
+class VersionChain(KeyChain):
+    """KeyChain whose items carry the app's version (gena); `fail` makes attribute reads unknown, and `after_read`
+    runs once right after the next key read (-w), to change the item before authenticate."""
+
+    def __init__(self):
+        super().__init__()
+        self.fail, self.after_read = False, None
+
+    def __call__(self, argv, **kw):
+        got = self.items.get(argv[argv.index("-s") + 1])
+        if got is None:
+            return subprocess.CompletedProcess(argv, 44, "", "not found\n")
+        if "-w" in argv:
+            hook, self.after_read = self.after_read, None
+            if hook:
+                hook()
+            return subprocess.CompletedProcess(argv, 0, got[0] + "\n", "")
+        if self.fail:
+            return subprocess.CompletedProcess(argv, 1, "", "interaction not allowed\n")
+        return subprocess.CompletedProcess(argv, 0, '    "gena"<blob>="%s%s"\n' % (gk.VERSION_PREFIX, got[1]), "")
+
+
+class BaselineTest(ChainCase):
+    """The marker kept for the running agy is read around that start's own authenticate, and kept only when it
+    is proven: an unknown or a moved marker restarts once, on the key now saved."""
+    V1, V2, CHAIN = "1" * 32, "2" * 32, VersionChain
+
+    def auths(self):
+        return [(a["pid"], a["params"]["key_len"]) for a in self.w.calls("authenticate")]
+
+    def test_an_unknown_marker_at_start_restarts_once_when_it_reads_again(self):
+        self.chain.items[self.service] = (self.KEY_A, self.V1)
+        self.chain.fail = True
+        conn = gc.Connector(self.w.args("--agent-id", self.AGENT))
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.turn(conn, "task-1")
+            self.assertIsNone(conn.host.probed)
+            self.chain.fail = False
+            self.turn(conn, "task-2")
+            self.assertEqual(conn.host.probed, "saved v=%s%s" % (gk.VERSION_PREFIX, self.V1))
+            self.turn(conn, "task-3")
+            conn.host.close()
+        boots = self.w.boots()
+        self.assertEqual(len(boots), 2, "one restart, then none on the same marker")
+        self.assertNotEqual(boots[0]["pid"], boots[1]["pid"])
+        self.assertEqual(self.auths(), [(boots[0]["pid"], len(self.KEY_A)), (boots[1]["pid"], len(self.KEY_A))])
+        self.assertEqual([r["pid"] for r in self.w.prompts()], [boots[0]["pid"]] + [boots[1]["pid"]] * 2)
+
+    def test_a_key_changed_between_the_marker_read_and_authenticate_restarts_on_the_new_key(self):
+        self.chain.items[self.service] = (self.KEY_A, self.V1)
+        self.chain.after_read = lambda: self.chain.items.update({self.service: (self.KEY_B, self.V2)})
+        conn = gc.Connector(self.w.args("--agent-id", self.AGENT))
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.turn(conn, "task-1")
+            self.assertIsNone(conn.host.probed, "never v1: that process may not be on the key saved now")
+            self.turn(conn, "task-2")
+            self.assertEqual(conn.host.probed, "saved v=%s%s" % (gk.VERSION_PREFIX, self.V2))
+            self.turn(conn, "task-3")
+            conn.host.close()
+        boots = self.w.boots()
+        self.assertEqual(len(boots), 2)
+        self.assertEqual(self.auths(), [(boots[0]["pid"], len(self.KEY_A)), (boots[1]["pid"], len(self.KEY_B))])
+
+    def test_a_start_without_the_key_keeps_absent_and_a_key_saved_later_restarts(self):
+        conn = gc.Connector(self.w.args("--agent-id", self.AGENT))
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.turn(conn, "task-1")
+            self.assertEqual(conn.host.probed, "")
+            self.chain.items[self.service] = (self.KEY_B, self.V2)
+            self.turn(conn, "task-2")
+            self.assertEqual(conn.host.probed, "saved v=%s%s" % (gk.VERSION_PREFIX, self.V2))
+            conn.host.close()
+        boots = self.w.boots()
+        self.assertEqual(len(boots), 2)
+        self.assertEqual(self.auths(), [(boots[1]["pid"], len(self.KEY_B))])
 
 
 def gk_service_other(agent):
@@ -539,12 +621,46 @@ class HostTest(unittest.TestCase):
         self.assertEqual((len(self.spawned), host.probed), (1, "saved v=1"))
         self.assertIn("authentication not checked: the probe could not tell", self.said)
         host.close()
-        self.run_turn(host)      # started while unknown: the last known marker is kept
-        self.assertEqual((len(self.spawned), host.probed), (2, "saved v=1"))
+        self.run_turn(host)      # started while unknown: no stale marker is kept for this process
+        self.assertEqual((len(self.spawned), host.probed), (2, None))
+        marker[0] = "saved v=1"
+        self.assertEqual(host.restart_reason(), "the authentication changed", "the same marker, but unproven")
+        self.run_turn(host)
+        self.assertEqual((len(self.spawned), host.probed), (3, "saved v=1"))
         marker[0] = "saved v=2"
         self.assertEqual(host.restart_reason(), "the authentication changed")
         marker[0] = ""
         self.assertEqual(host.restart_reason(), "the authentication changed", "removed is a change")
+
+    def test_the_baseline_is_read_around_authenticate_and_only_kept_when_both_reads_agree(self):
+        reads, order = iter(["saved v=1", "saved v=2", "saved v=2", "saved v=2", "saved v=2", "saved v=2"]), []
+
+        def probe():
+            order.append("probe")
+            return next(reads)
+
+        def on_initialized(client, init, argv):
+            order.append("authenticate")
+            return "gemini-api-key"
+        host = self.host(self.OK, auth_probe=probe, on_initialized=on_initialized)
+        self.run_turn(host)
+        self.assertEqual(order, ["probe", "authenticate", "probe"])
+        self.assertEqual((len(self.spawned), host.probed), (1, None), "v1 before, v2 after: neither is proven")
+        self.assertIn("the authentication changed while the agent started; it restarts before the next turn", self.said)
+        self.run_turn(host)
+        self.assertEqual((len(self.spawned), host.probed), (2, "saved v=2"))
+        self.run_turn(host)
+        self.assertEqual(len(self.spawned), 2, "proven on v2: no further restart")
+
+    def test_a_start_that_fails_to_authenticate_leaves_the_baseline_unknown(self):
+        def on_initialized(client, init, argv):
+            raise acp_client.AcpError("authenticate: no answer")
+        host = self.host(self.OK, auth_probe=lambda: "saved v=1")
+        self.run_turn(host)
+        host.on_initialized = on_initialized
+        host.close()
+        self.assertEqual(self.run_turn(host)[0], "failed")
+        self.assertIsNone(host.probed)
 
     def test_a_changed_key_marker_closes_the_old_process_and_an_unchanged_one_keeps_it(self):
         marker = ["saved mdat=1"]

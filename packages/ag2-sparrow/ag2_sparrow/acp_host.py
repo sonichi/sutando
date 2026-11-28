@@ -921,11 +921,13 @@ class AcpHost:
     opened with `session/new` and saved; `mcp_servers(init)` names its MCP servers, attached once, when it opens.
     `on_models(models)` gets the ACP `models` of each Session opened. Before a turn the process is restarted when it
     exited, or when `auth_probe()` gives another marker than the last known one (the adapter's authentication
-    changed; None, the probe could not tell, changes nothing); a request that timed out, or a sign-in error, closes
-    it so the next turn starts clean. A turn whose prompt was not sent yet when the process went away is tried once
-    more on a fresh one. With `turn_cap`, a Session that has had
-    that many turns is left for a new one (0: never). `media_root` is a folder given to the Session as an
-    additional directory (when the agent declares them), inside which each turn's attachments are copied."""
+    changed; None, the probe could not tell, changes nothing). The last known marker is the one read just before and
+    after `on_initialized` in the start that authenticated, when both reads agree; else it is unknown and the next
+    marker read restarts the process once, so the one running is proven on it. A request that timed out, or a
+    sign-in error, closes it so the next turn starts clean. A turn whose prompt was not sent yet when the process
+    went away is tried once more on a fresh one. With `turn_cap`, a Session that has had that many turns is left
+    for a new one (0: never). `media_root` is a folder given to the Session as an additional directory (when the
+    agent declares them), inside which each turn's attachments are copied."""
 
     def __init__(self, client_factory, args, stderr_name, not_signed_in, log, shared_path, on_initialized=None,
                  mcp_servers=None, on_models=None, auth_probe=None, turn_cap=0, media_root=None):
@@ -992,15 +994,20 @@ class AcpHost:
     def start(self):
         """Spawn, `initialize`, authenticate. Raises OSError (not started) or AcpError."""
         self.close()
-        probed = self._probe() if self.auth_probe is not None else None
+        self.probed = None   # unknown until this start shows which marker it authenticated under
         self.client = self.client_factory(self.args.acp_argv, cwd=self.args.cwd, env=self.args.child_env,
                                           stderr_path=os.path.join(self.args.state, self.stderr_name),
                                           on_permission=self._on_permission, on_update=self._on_update)
         self.spawns += 1
         self.init = self.client.initialize(self.args.rpc_timeout)
+        before = self._probe() if self.auth_probe is not None else None
         self.auth = self.on_initialized(self.client, self.init, self.args.acp_argv) \
             if self.on_initialized is not None else None
-        self.probed = probed if probed is not None else self.probed
+        after = self._probe() if self.auth_probe is not None else None
+        # The baseline is a marker read on both sides of this start's authenticate; else unknown, and restarts once.
+        self.probed = before if before is not None and before == after else None
+        if before is not None and after is not None and before != after:
+            self.log("the authentication changed while the agent started; it restarts before the next turn")
         self.log("agent started (pid %s), auth %s" % (self.pid, self.auth or "none"))
 
     def close(self, grace=None):
