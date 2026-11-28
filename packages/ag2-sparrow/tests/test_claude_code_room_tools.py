@@ -171,9 +171,23 @@ class RoomToolsArgv(unittest.TestCase):
         for kept in (old_id, ""):
             self.assertEqual(decide({"SESSION_ID": old_id}, quiet, old_id, kept),
                              ({"ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": ""}, ""), kept)
-        # Turning the preview off again leaves the tools' conversation as the session, without the tools.
+        # Turning the preview off goes back to the conversation from before it, without the tools.
         was_on = {"SESSION_ID": new_id, "ROOM_TOOLS_SESSION": new_id, "EARLIER_SESSION_ID": old_id}
-        self.assertEqual(decide(was_on, quiet, new_id, new_id)[0], {"ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": old_id})
+        got, said = decide(was_on, quiet, new_id, new_id)
+        self.assertEqual(got, {"SESSION_ID": old_id, "ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": ""})
+        self.assertIn("back to the earlier conversation (%s), without the tools" % old_id, said)
+        # While the session that had the tools is not proven gone, it runs on without them, and the way back
+        # is said; the install after it is stopped then goes back.
+        got, said = decide(was_on, quiet, new_id, new_id, live=4242)
+        self.assertEqual(got, {"ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": old_id})
+        self.assertIn("stop it", said)
+        waiting = {"SESSION_ID": new_id, "ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": old_id}
+        self.assertEqual(decide(waiting, quiet, new_id, new_id)[0],
+                         {"SESSION_ID": old_id, "ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": ""})
+        # A conversation the owner names to resume is theirs to pick: it is not replaced by the earlier one.
+        self.assertEqual(decide(was_on, quiet, old_id, "33333333-2222-4333-8444-555555555555",
+                                resume="33333333-2222-4333-8444-555555555555")[0],
+                         {"ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": old_id})
         # A first install: the conversation it minted is the tools'.
         self.assertEqual(decide({}, on, old_id, "")[0], {"ROOM_TOOLS_SESSION": old_id, "EARLIER_SESSION_ID": ""})
         # The tools turned on for an agent that already has a conversation: a new one, the earlier kept.
@@ -658,6 +672,18 @@ class PreviewThroughInstall(AgentRootBase):
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(self.cfg()["SESSION_ID"], on["SESSION_ID"])
         self.assertEqual(self.cfg()["ROOM_TOOLS_SESSION"], on["SESSION_ID"])
+
+        # The preview turned off (what the app's next update passes): the original conversation is the session
+        # again, and it has no tools.
+        rc, out, err = self.install_default(fake, "--mcp-proxy-command", proxy)
+        self.assertEqual(rc, 0, out + err)
+        off = self.cfg()
+        self.assertEqual((off["SESSION_ID"], off["ROOM_TOOLS_SESSION"], off["EARLIER_SESSION_ID"], off["ROOM_TOOLS_PREVIEW"]),
+                         (first["SESSION_ID"], "", "", ""))
+        self.assertIn("back to the earlier conversation (%s)" % first["SESSION_ID"], out)
+        self.assertFalse(hold_mod.tools_session(off))
+        self.assertEqual(hold_mod.room_tools_argv(off, off["ROOT"], str(Path(off["ROOT"]) / "tasks"),
+                                                  log=lambda line: None), [], "started again, it gets no tools")
 
 
 if __name__ == "__main__":

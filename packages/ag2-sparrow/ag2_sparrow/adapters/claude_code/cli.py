@@ -237,12 +237,21 @@ def room_tools_session(old: dict, values: dict, session_id: str, kept: str, resu
     sender in it. {SESSION_ID?, ROOM_TOOLS_SESSION, EARLIER_SESSION_ID}: an install that turns the tools on
     starts a new conversation (the earlier one stays on disk, named by EARLIER_SESSION_ID, and is never given
     the tools); while the old session is not proven gone, or when the owner names a conversation to resume,
-    the tools stay off and the command says so."""
+    the tools stay off and the command says so. Turning the preview off goes back to the earlier conversation."""
     earlier = old.get("EARLIER_SESSION_ID") or ""
     # A preview the owner turns on (--room-tools-preview): the proxy command alone, which the desktop app
     # records at every install and update, changes nothing.
     if not (values.get("ROOM_TOOLS_PREVIEW") == "1" and values.get("MCP_PROXY_COMMAND") and values.get("TOKEN_ENV_FILE")):
-        return {"ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": earlier}
+        if not (earlier and kept and kept != earlier and not resume):
+            return {"ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": earlier}
+        # The preview is turned off: back to the conversation from before it, once the tools' one is gone.
+        if live_server():
+            print(f"NOTE mcp: the room tools preview is off, and the session that had the tools ({kept}) is not "
+                  f"proven gone: it runs on without them; stop the job ({stop_cmd}), then install again to go "
+                  f"back to the earlier conversation ({earlier})")
+            return {"ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": earlier}
+        print(f"the room tools preview is off: back to the earlier conversation ({earlier}), without the tools")
+        return {"SESSION_ID": earlier, "ROOM_TOOLS_SESSION": "", "EARLIER_SESSION_ID": ""}
     if kept and kept == (old.get("ROOM_TOOLS_SESSION") or ""):
         return {"ROOM_TOOLS_SESSION": kept, "EARLIER_SESSION_ID": earlier}
     print(PREVIEW_NOTE)
