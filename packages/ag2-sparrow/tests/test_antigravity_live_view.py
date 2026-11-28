@@ -145,9 +145,8 @@ class SlowLog(unittest.TestCase):
         notices = [ln for ln in lines if "not shown" in ln]
         shown = [ln for ln in lines if "not shown" not in ln]
         self.assertTrue(notices, lines[-3:])
-        # One line can be in the writer's hands while the queue is full. Whether the writer took its first
-        # line before or after the first drop decides if the drops are reported in one notice or two, so
-        # count the lines, not the notices: every line is either shown or counted as not shown.
+        # The drops can be reported in one notice or two (did the writer take its first line before the
+        # first drop?), so count lines, not notices: each is shown or counted as not shown.
         self.assertLessEqual(len(shown), live_view.QUEUE_MAX + 1)
         left_out = sum(int(ln.split()[1]) for ln in notices)
         self.assertEqual(len(shown) + left_out, live_view.QUEUE_MAX + 50)
